@@ -104,6 +104,10 @@ impl SetupWizard {
                                     );
                                 }
                             });
+                        ui.horizontal(|ui| {
+                            ui.label("Or type model ID:");
+                            ui.text_edit_singleline(&mut self.default_model);
+                        });
                     }
                     4 => {
                         ui.label("Set your workspace directory:");
