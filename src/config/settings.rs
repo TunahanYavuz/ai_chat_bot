@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 
 pub const DEFAULT_MODEL_ID: &str = "gpt-4o";
+const OLD_HUGGINGFACE_BASE_URL: &str = "https://api-inference.huggingface.co/v1";
 
 // ─── API Provider ─────────────────────────────────────────────────────────────
 
@@ -270,9 +271,8 @@ pub fn load_settings() -> Settings {
         if let Ok(content) = std::fs::read_to_string(&path) {
             if let Ok(mut s) = serde_json::from_str::<Settings>(&content) {
                 // Migrate deprecated Hugging Face endpoint to the new router endpoint.
-                let old_hf_url = "https://api-inference.huggingface.co/v1";
                 if let Some(cfg) = s.provider_configs.get_mut(ApiProvider::HuggingFace.key()) {
-                    if cfg.base_url.trim_end_matches('/') == old_hf_url {
+                    if cfg.base_url.trim_end_matches('/') == OLD_HUGGINGFACE_BASE_URL {
                         cfg.base_url = ApiProvider::HuggingFace.default_base_url().to_string();
                     }
                 }
