@@ -397,8 +397,8 @@ impl ChatApp {
         }
 
         // Spawn async task
-        let api_key = self.settings.openai_api_key.clone();
-        let base_url = self.settings.openai_base_url.clone();
+        let api_key = self.settings.active_api_key();
+        let base_url = self.settings.active_base_url();
         let model_id = self.current_model().id.clone();
         let thinking_level = if self.thinking_enabled && self.current_model().supports_thinking() {
             Some(self.selected_thinking_level.clone())
@@ -624,9 +624,28 @@ impl eframe::App for ChatApp {
                         .num_columns(2)
                         .spacing([10.0, 8.0])
                         .show(ui, |ui| {
+                            ui.label("Provider:");
+                            let provider_name = self.settings.selected_provider.display_name();
+                            egui::ComboBox::from_id_salt("provider_sel")
+                                .selected_text(provider_name)
+                                .width(280.0)
+                                .show_ui(ui, |ui| {
+                                    for p in crate::config::ApiProvider::all() {
+                                        let label = p.display_name();
+                                        let mut cur = self.settings.selected_provider.clone();
+                                        if ui.selectable_value(&mut cur, p.clone(), label).clicked() {
+                                            self.settings.selected_provider = p;
+                                        }
+                                    }
+                                });
+                            ui.end_row();
+
+                            let provider = self.settings.selected_provider.clone();
+                            let cfg = self.settings.provider_config_mut(&provider);
+
                             ui.label("API Key:");
                             ui.add(
-                                TextEdit::singleline(&mut self.settings.openai_api_key)
+                                TextEdit::singleline(&mut cfg.api_key)
                                     .password(true)
                                     .desired_width(280.0),
                             );
@@ -634,7 +653,7 @@ impl eframe::App for ChatApp {
 
                             ui.label("Base URL:");
                             ui.add(
-                                TextEdit::singleline(&mut self.settings.openai_base_url)
+                                TextEdit::singleline(&mut cfg.base_url)
                                     .desired_width(280.0),
                             );
                             ui.end_row();
@@ -665,7 +684,7 @@ impl eframe::App for ChatApp {
             .resizable(true)
             .default_width(230.0)
             .min_width(160.0)
-            .frame(egui::Frame::none().fill(SKY_BLUE).inner_margin(8.0))
+            .frame(egui::Frame::new().fill(SKY_BLUE).inner_margin(egui::Margin::same(8_i8)))
             .show(ctx, |ui| {
                 ui.visuals_mut().override_text_color = Some(DARK_TEXT);
 
@@ -821,12 +840,12 @@ impl eframe::App for ChatApp {
 
         // ─── Main chat area ────────────────────────────────────────────────────
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(BURGUNDY).inner_margin(0.0))
+            .frame(egui::Frame::new().fill(BURGUNDY).inner_margin(egui::Margin::same(0_i8)))
             .show(ctx, |ui| {
                 // Header bar
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(BURGUNDY_DARK)
-                    .inner_margin(8.0)
+                    .inner_margin(egui::Margin::same(8_i8))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             let session_name = self
@@ -861,9 +880,9 @@ impl eframe::App for ChatApp {
                 let input_height = 90.0;
                 let msg_height = ui.available_height() - input_height;
 
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(BURGUNDY)
-                    .inner_margin(egui::Margin { left: 12.0, right: 12.0, top: 8.0, bottom: 4.0 })
+                    .inner_margin(egui::Margin { left: 12_i8, right: 12_i8, top: 8_i8, bottom: 4_i8 })
                     .show(ui, |ui| {
                         ScrollArea::vertical()
                             .id_salt("messages_scroll")
@@ -893,9 +912,9 @@ impl eframe::App for ChatApp {
                     });
 
                 // Input area
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(BURGUNDY_DARK)
-                    .inner_margin(8.0)
+                    .inner_margin(egui::Margin::same(8_i8))
                     .show(ui, |ui| {
                         ui.set_height(input_height);
 
@@ -995,10 +1014,10 @@ impl ChatApp {
                     (BURGUNDY_DARK, WHITE)
                 };
 
-                egui::Frame::none()
+                egui::Frame::new()
                     .fill(bg_color)
-                    .rounding(8.0)
-                    .inner_margin(10.0)
+                    .corner_radius(8.0_f32)
+                    .inner_margin(egui::Margin::same(10_i8))
                     .show(ui, |ui| {
                         ui.set_max_width(max_bubble - 20.0);
 
