@@ -3,6 +3,8 @@ use anyhow::Result;
 use std::path::PathBuf;
 use std::collections::HashMap;
 
+pub const DEFAULT_MODEL_ID: &str = "gpt-4o";
+
 // ─── API Provider ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
@@ -133,7 +135,11 @@ pub struct Settings {
     /// Set to true once the setup wizard has been completed.
     #[serde(default)]
     pub setup_complete: bool,
+    #[serde(default = "default_dark_mode")]
+    pub dark_mode: bool,
 }
+
+fn default_dark_mode() -> bool { true }
 
 impl Settings {
     /// API key for the currently selected provider.
@@ -242,8 +248,9 @@ impl Default for Settings {
                 .to_string_lossy()
                 .to_string(),
             shell_execution_enabled: false,
-            default_model: "gpt-4o".to_string(),
+            default_model: DEFAULT_MODEL_ID.to_string(),
             setup_complete: false,
+            dark_mode: true,
         }
     }
 }

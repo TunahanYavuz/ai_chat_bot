@@ -3,17 +3,22 @@ mod app;
 mod config;
 mod db;
 mod files;
+mod setup;
 mod shell;
 
 use std::sync::Arc;
 
 fn main() -> eframe::Result<()> {
-    let rt = Arc::new(
-        tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to build Tokio runtime"),
-    );
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => Arc::new(rt),
+        Err(e) => {
+            eprintln!("Failed to build Tokio runtime: {e}");
+            return Ok(());
+        }
+    };
 
     let rt_clone = rt.clone();
 

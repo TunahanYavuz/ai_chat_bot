@@ -3,18 +3,21 @@ use anyhow::{Result, anyhow};
 use reqwest::Client;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ThinkingLevel {
+pub enum ThinkingMode {
+    Disabled,
+    Auto,
     Low,
     Medium,
     High,
 }
 
-impl ThinkingLevel {
-    pub fn as_str(&self) -> &'static str {
+impl ThinkingMode {
+    pub fn as_reasoning_effort(&self) -> Option<&'static str> {
         match self {
-            ThinkingLevel::Low => "low",
-            ThinkingLevel::Medium => "medium",
-            ThinkingLevel::High => "high",
+            ThinkingMode::Disabled | ThinkingMode::Auto => None,
+            ThinkingMode::Low => Some("low"),
+            ThinkingMode::Medium => Some("medium"),
+            ThinkingMode::High => Some("high"),
         }
     }
 }
@@ -23,66 +26,117 @@ impl ThinkingLevel {
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
-    pub thinking_levels: Vec<ThinkingLevel>,
+    pub thinking_modes: Vec<ThinkingMode>,
 }
 
 impl ModelInfo {
     pub fn supports_thinking(&self) -> bool {
-        !self.thinking_levels.is_empty()
+        !self.thinking_modes.is_empty()
     }
 }
 
 pub fn builtin_models() -> Vec<ModelInfo> {
+    provider_models("openai")
+}
+
+pub fn provider_models(provider: &str) -> Vec<ModelInfo> {
+    let p = provider.to_lowercase();
+    if p == "nvidia" {
+        return vec![
+            ModelInfo {
+                id: "meta/llama-3.1-70b-instruct".to_string(),
+                name: "Llama 3.1 70B Instruct".to_string(),
+                thinking_modes: vec![],
+            },
+            ModelInfo {
+                id: "mistralai/mixtral-8x7b-instruct-v0.1".to_string(),
+                name: "Mixtral 8x7B Instruct".to_string(),
+                thinking_modes: vec![],
+            },
+        ];
+    }
+    if p == "openrouter" {
+        return vec![
+            ModelInfo {
+                id: "openai/gpt-4o".to_string(),
+                name: "OpenRouter GPT-4o".to_string(),
+                thinking_modes: vec![],
+            },
+            ModelInfo {
+                id: "anthropic/claude-3.5-sonnet".to_string(),
+                name: "Claude 3.5 Sonnet".to_string(),
+                thinking_modes: vec![],
+            },
+        ];
+    }
+    if p == "huggingface" {
+        return vec![
+            ModelInfo {
+                id: "meta-llama/Llama-3.1-8B-Instruct".to_string(),
+                name: "Llama 3.1 8B Instruct".to_string(),
+                thinking_modes: vec![],
+            },
+        ];
+    }
+
     vec![
         ModelInfo {
             id: "gpt-4o".to_string(),
             name: "GPT-4o".to_string(),
-            thinking_levels: vec![],
+            thinking_modes: vec![],
         },
         ModelInfo {
             id: "gpt-4o-mini".to_string(),
             name: "GPT-4o Mini".to_string(),
-            thinking_levels: vec![],
+            thinking_modes: vec![],
         },
         ModelInfo {
             id: "gpt-3.5-turbo".to_string(),
             name: "GPT-3.5 Turbo".to_string(),
-            thinking_levels: vec![],
+            thinking_modes: vec![],
         },
         ModelInfo {
             id: "o1".to_string(),
             name: "O1".to_string(),
-            thinking_levels: vec![
-                ThinkingLevel::Low,
-                ThinkingLevel::Medium,
-                ThinkingLevel::High,
+            thinking_modes: vec![
+                ThinkingMode::Disabled,
+                ThinkingMode::Auto,
+                ThinkingMode::Low,
+                ThinkingMode::Medium,
+                ThinkingMode::High,
             ],
         },
         ModelInfo {
             id: "o1-mini".to_string(),
             name: "O1 Mini".to_string(),
-            thinking_levels: vec![
-                ThinkingLevel::Low,
-                ThinkingLevel::Medium,
-                ThinkingLevel::High,
+            thinking_modes: vec![
+                ThinkingMode::Disabled,
+                ThinkingMode::Auto,
+                ThinkingMode::Low,
+                ThinkingMode::Medium,
+                ThinkingMode::High,
             ],
         },
         ModelInfo {
             id: "o1-preview".to_string(),
             name: "O1 Preview".to_string(),
-            thinking_levels: vec![
-                ThinkingLevel::Low,
-                ThinkingLevel::Medium,
-                ThinkingLevel::High,
+            thinking_modes: vec![
+                ThinkingMode::Disabled,
+                ThinkingMode::Auto,
+                ThinkingMode::Low,
+                ThinkingMode::Medium,
+                ThinkingMode::High,
             ],
         },
         ModelInfo {
             id: "o3-mini".to_string(),
             name: "O3 Mini".to_string(),
-            thinking_levels: vec![
-                ThinkingLevel::Low,
-                ThinkingLevel::Medium,
-                ThinkingLevel::High,
+            thinking_modes: vec![
+                ThinkingMode::Disabled,
+                ThinkingMode::Auto,
+                ThinkingMode::Low,
+                ThinkingMode::Medium,
+                ThinkingMode::High,
             ],
         },
     ]
@@ -195,7 +249,7 @@ impl OpenAIClient {
         &self,
         model: &str,
         messages: Vec<ChatMessage>,
-        thinking_level: Option<&ThinkingLevel>,
+        thinking_mode: Option<&ThinkingMode>,
         on_chunk: impl Fn(String) + Send + 'static,
     ) -> Result<String> {
         use futures_util::StreamExt;
@@ -206,7 +260,9 @@ impl OpenAIClient {
             model: model.to_string(),
             messages,
             reasoning_effort: if is_thinking_model {
-                thinking_level.map(|l| l.as_str().to_string())
+                thinking_mode
+                    .and_then(|m| m.as_reasoning_effort())
+                    .map(|s| s.to_string())
             } else {
                 None
             },

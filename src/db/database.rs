@@ -28,6 +28,14 @@ pub struct DbAttachment {
     pub mime_type: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbFileSnapshot {
+    pub id: String,
+    pub file_path: String,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
 pub struct Database {
     conn: Connection,
 }
@@ -65,6 +73,12 @@ impl Database {
                 data BLOB NOT NULL,
                 mime_type TEXT NOT NULL,
                 FOREIGN KEY (message_id) REFERENCES messages(id)
+            );
+            CREATE TABLE IF NOT EXISTS file_snapshots (
+                id TEXT PRIMARY KEY,
+                file_path TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );",
         )?;
         Ok(())
@@ -98,17 +112,11 @@ impl Database {
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
-        self.conn.execute("BEGIN", [])?;
-        let result = (|| -> Result<()> {
-            self.conn.execute("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)", params![session_id])?;
-            self.conn.execute("DELETE FROM messages WHERE session_id = ?1", params![session_id])?;
-            self.conn.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
-            Ok(())
-        })();
-        match result {
-            Ok(_) => { self.conn.execute("COMMIT", [])?; }
-            Err(e) => { let _ = self.conn.execute("ROLLBACK", []); return Err(e); }
-        }
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)", params![session_id])?;
+        tx.execute("DELETE FROM messages WHERE session_id = ?1", params![session_id])?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -165,5 +173,51 @@ impl Database {
         .filter_map(|r| r.ok())
         .collect();
         Ok(atts)
+    }
+
+    pub fn save_file_snapshot(&self, snapshot: &DbFileSnapshot) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO file_snapshots (id, file_path, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                snapshot.id,
+                snapshot.file_path,
+                snapshot.content,
+                snapshot.created_at.to_rfc3339()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_file_snapshots(&self, limit: usize) -> Result<Vec<DbFileSnapshot>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_path, content, created_at FROM file_snapshots ORDER BY created_at DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            let created_str: String = row.get(3)?;
+            Ok(DbFileSnapshot {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                content: row.get(2)?,
+                created_at: created_str.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn get_file_snapshot(&self, snapshot_id: &str) -> Result<Option<DbFileSnapshot>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, file_path, content, created_at FROM file_snapshots WHERE id = ?1 LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![snapshot_id])?;
+        if let Some(row) = rows.next()? {
+            let created_str: String = row.get(3)?;
+            return Ok(Some(DbFileSnapshot {
+                id: row.get(0)?,
+                file_path: row.get(1)?,
+                content: row.get(2)?,
+                created_at: created_str.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
+            }));
+        }
+        Ok(None)
     }
 }
