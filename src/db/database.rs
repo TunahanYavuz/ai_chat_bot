@@ -32,7 +32,7 @@ pub struct DbAttachment {
 pub struct DbFileSnapshot {
     pub id: String,
     pub file_path: String,
-    pub content: String,
+    pub content: Vec<u8>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -77,7 +77,7 @@ impl Database {
             CREATE TABLE IF NOT EXISTS file_snapshots (
                 id TEXT PRIMARY KEY,
                 file_path TEXT NOT NULL,
-                content TEXT NOT NULL,
+                content BLOB NOT NULL,
                 created_at TEXT NOT NULL
             );",
         )?;

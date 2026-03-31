@@ -299,7 +299,10 @@ impl ChatApp {
         let tx = self.event_tx.clone();
         self.tokio_rt.spawn(async move {
             let client = crate::api::OpenAIClient::new(&api_key, &base_url);
-            let model_ids = client.list_models().await.unwrap_or_default();
+            let model_ids = match client.list_models().await {
+                Ok(ids) => ids,
+                Err(_) => vec![],
+            };
             let _ = tx.send(AppEvent::ModelsLoaded(model_ids));
         });
     }
@@ -387,13 +390,17 @@ impl ChatApp {
         }
     }
 
-    fn save_snapshot_if_exists(&self, path: &str) {
+    fn save_snapshot_if_exists(&mut self, path: &str) {
         let full_path = std::path::Path::new(path);
         if !full_path.exists() {
             return;
         }
-        let Ok(content) = std::fs::read_to_string(full_path) else {
-            return;
+        let content = match std::fs::read(full_path) {
+            Ok(content) => content,
+            Err(e) => {
+                self.notify(format!("Could not snapshot file before write: {e}"), NotificationKind::Error);
+                return;
+            }
         };
         let snapshot = DbFileSnapshot {
             id: Uuid::new_v4().to_string(),
@@ -401,30 +408,46 @@ impl ChatApp {
             content,
             created_at: Utc::now(),
         };
-        if let Ok(guard) = self.db.lock() {
+        let db_err = if let Ok(guard) = self.db.lock() {
             if let Some(database) = guard.as_ref() {
-                let _ = database.save_file_snapshot(&snapshot);
+                database.save_file_snapshot(&snapshot).err().map(|e| e.to_string())
+            } else {
+                None
             }
+        } else {
+            Some("Database lock poisoned".to_string())
+        };
+        if let Some(err) = db_err {
+            self.notify(format!("Failed to persist file snapshot: {err}"), NotificationKind::Error);
         }
     }
 
     fn refresh_snapshots(&mut self) {
-        self.snapshots = if let Ok(guard) = self.db.lock() {
+        let result = if let Ok(guard) = self.db.lock() {
             if let Some(database) = guard.as_ref() {
-                database.list_file_snapshots(50).unwrap_or_default()
+                database.list_file_snapshots(50)
             } else {
-                vec![]
+                Ok(vec![])
             }
         } else {
-            vec![]
+            Err(anyhow::anyhow!("Database lock poisoned"))
         };
+        match result {
+            Ok(list) => {
+                self.snapshots = list;
+            }
+            Err(e) => {
+                self.snapshots.clear();
+                self.notify(format!("Failed to load snapshots: {e}"), NotificationKind::Error);
+            }
+        }
     }
 
     fn send_message(&mut self) {
         let text = self.input_text.trim().to_string();
         if text.is_empty() && self.pending_attachments.is_empty() {
             return;
-        }
+        };
 
         if self.current_session_idx.is_none() {
             self.new_session();
@@ -720,10 +743,7 @@ impl ChatApp {
                             ui.label(RichText::new(&snap.file_path).strong());
                             ui.label(snap.created_at.format("%Y-%m-%d %H:%M:%S UTC").to_string());
                             if ui.button("Restore this snapshot").clicked() {
-                                match crate::files::write_text_file(
-                                    std::path::Path::new(&snap.file_path),
-                                    &snap.content,
-                                ) {
+                                match std::fs::write(std::path::Path::new(&snap.file_path), &snap.content) {
                                     Ok(_) => self.notify(format!("Restored {}", snap.file_path), NotificationKind::Info),
                                     Err(e) => self.notify(format!("Restore failed: {e}"), NotificationKind::Error),
                                 }

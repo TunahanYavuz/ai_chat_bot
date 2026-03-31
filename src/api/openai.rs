@@ -20,6 +20,10 @@ impl ThinkingMode {
             ThinkingMode::High => Some("high"),
         }
     }
+
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, ThinkingMode::Disabled)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -44,13 +48,18 @@ pub fn provider_models(provider: &str) -> Vec<ModelInfo> {
     if p == "nvidia" {
         return vec![
             ModelInfo {
-                id: "meta/llama-3.1-70b-instruct".to_string(),
-                name: "Llama 3.1 70B Instruct".to_string(),
+                id: "meta/llama-3.3-70b-instruct".to_string(),
+                name: "Llama 3.3 70B Instruct".to_string(),
                 thinking_modes: vec![],
             },
             ModelInfo {
-                id: "mistralai/mixtral-8x7b-instruct-v0.1".to_string(),
-                name: "Mixtral 8x7B Instruct".to_string(),
+                id: "nvidia/llama-3.1-nemotron-70b-instruct".to_string(),
+                name: "Nemotron 70B Instruct".to_string(),
+                thinking_modes: vec![],
+            },
+            ModelInfo {
+                id: "mistralai/mistral-large-2-instruct".to_string(),
+                name: "Mistral Large 2 Instruct".to_string(),
                 thinking_modes: vec![],
             },
         ];
@@ -63,9 +72,31 @@ pub fn provider_models(provider: &str) -> Vec<ModelInfo> {
                 thinking_modes: vec![],
             },
             ModelInfo {
+                id: "openai/o1".to_string(),
+                name: "OpenAI O1 (OpenRouter)".to_string(),
+                thinking_modes: vec![
+                    ThinkingMode::Disabled,
+                    ThinkingMode::Auto,
+                    ThinkingMode::Low,
+                    ThinkingMode::Medium,
+                    ThinkingMode::High,
+                ],
+            },
+            ModelInfo {
+                id: "openai/o3-mini".to_string(),
+                name: "OpenAI O3 Mini (OpenRouter)".to_string(),
+                thinking_modes: vec![
+                    ThinkingMode::Disabled,
+                    ThinkingMode::Auto,
+                    ThinkingMode::Low,
+                    ThinkingMode::Medium,
+                    ThinkingMode::High,
+                ],
+            },
+            ModelInfo {
                 id: "anthropic/claude-3.5-sonnet".to_string(),
                 name: "Claude 3.5 Sonnet".to_string(),
-                thinking_modes: vec![],
+                thinking_modes: vec![ThinkingMode::Disabled, ThinkingMode::Auto],
             },
         ];
     }
@@ -254,15 +285,13 @@ impl OpenAIClient {
     ) -> Result<String> {
         use futures_util::StreamExt;
 
-        let is_thinking_model = model.starts_with("o1") || model.starts_with("o3");
+        let is_thinking_model = model.contains("o1") || model.contains("o3");
 
         let request = ChatRequest {
             model: model.to_string(),
             messages,
             reasoning_effort: if is_thinking_model {
-                thinking_mode
-                    .and_then(|m| m.as_reasoning_effort())
-                    .map(|s| s.to_string())
+                thinking_mode.and_then(|m| m.as_reasoning_effort()).map(str::to_string)
             } else {
                 None
             },
