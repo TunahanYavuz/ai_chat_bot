@@ -24,6 +24,7 @@ const LIGHT_TEXT: Color32 = Color32::from_rgb(235, 242, 250);
 const CUSTOM_MODEL_INPUT_RESERVED_WIDTH: f32 = 132.0;
 const DELETE_CHAT_BUTTON_WIDTH: f32 = 36.0;
 const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
+const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -31,6 +32,12 @@ pub enum AppEvent {
     ResponseComplete(String),
     ResponseError(String, String),
     ModelsLoaded(Vec<String>),
+    TerminalFinished {
+        terminal_id: String,
+        stdout: String,
+        stderr: String,
+        exit_code: i32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +120,29 @@ pub struct AgentProfile {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalOwner {
+    AI,
+    User,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalSession {
+    pub id: String,
+    pub name: String,
+    pub owner: TerminalOwner,
+    pub command: String,
+    pub working_dir: String,
+    pub output: String,
+    pub running: bool,
+    pub terminated: bool,
+    pub exit_code: Option<i32>,
+    pub pid: Option<u32>,
+    pub linked_session_idx: Option<usize>,
+    pub auto_continue_agent: bool,
+    pub input_buffer: String,
+}
+
 #[derive(Debug, Clone)]
 struct ActiveRequest {
     session_idx: usize,
@@ -154,6 +184,11 @@ pub struct ChatApp {
     snapshots: Vec<DbFileSnapshot>,
 
     agents: Vec<AgentProfile>,
+    terminals: Vec<TerminalSession>,
+    active_terminal_id: Option<String>,
+    changed_files: Vec<String>,
+    opened_files: Vec<String>,
+    active_open_file: Option<String>,
 }
 
 impl ChatApp {
@@ -209,6 +244,128 @@ impl ChatApp {
         } else {
             std::path::Path::new(&self.settings.working_directory).join(path)
         }
+    }
+
+    fn ensure_changed_file_tracked(&mut self, path: String) {
+        if !self.changed_files.iter().any(|p| p == &path) {
+            self.changed_files.push(path);
+        }
+    }
+
+    fn open_file_in_workspace(&mut self, path: String) {
+        if !self.opened_files.iter().any(|p| p == &path) {
+            self.opened_files.push(path.clone());
+        }
+        self.active_open_file = Some(path);
+    }
+
+    fn close_file_in_workspace(&mut self, path: &str) {
+        self.opened_files.retain(|p| p != path);
+        if self.active_open_file.as_deref() == Some(path) {
+            self.active_open_file = self.opened_files.last().cloned();
+        }
+    }
+
+    fn create_terminal(
+        &mut self,
+        name: String,
+        owner: TerminalOwner,
+        command: String,
+        linked_session_idx: Option<usize>,
+        auto_continue_agent: bool,
+    ) -> String {
+        let id = Uuid::new_v4().to_string();
+        let term = TerminalSession {
+            id: id.clone(),
+            name,
+            owner,
+            command,
+            working_dir: self.settings.working_directory.clone(),
+            output: String::new(),
+            running: false,
+            terminated: false,
+            exit_code: None,
+            pid: None,
+            linked_session_idx,
+            auto_continue_agent,
+            input_buffer: String::new(),
+        };
+        self.terminals.push(term);
+        self.active_terminal_id = Some(id.clone());
+        id
+    }
+
+    fn active_terminal_index(&self) -> Option<usize> {
+        let active = self.active_terminal_id.as_ref()?;
+        self.terminals.iter().position(|t| &t.id == active)
+    }
+
+    fn remove_terminal(&mut self, terminal_id: &str) {
+        self.terminals.retain(|t| t.id != terminal_id);
+        if self.active_terminal_id.as_deref() == Some(terminal_id) {
+            self.active_terminal_id = self.terminals.last().map(|t| t.id.clone());
+        }
+    }
+
+    fn terminate_terminal(&mut self, terminal_id: &str) {
+        if let Some(term) = self.terminals.iter_mut().find(|t| t.id == terminal_id) {
+            if let Some(pid) = term.pid {
+                #[cfg(unix)]
+                {
+                    let _ = std::process::Command::new("kill")
+                        .arg(pid.to_string())
+                        .output();
+                }
+                #[cfg(windows)]
+                {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .output();
+                }
+            }
+            term.terminated = true;
+            term.running = false;
+            term.output.push_str("\n\n[terminated by user]\n");
+        }
+    }
+
+    fn spawn_terminal_command(&mut self, terminal_id: &str, command: String) {
+        let Some(idx) = self.terminals.iter().position(|t| t.id == terminal_id) else {
+            return;
+        };
+        if self.terminals[idx].running || self.terminals[idx].terminated {
+            return;
+        }
+        self.terminals[idx].command = command.clone();
+        self.terminals[idx].running = true;
+        self.terminals[idx].exit_code = None;
+        self.terminals[idx]
+            .output
+            .push_str(&format!("$ {}\n", command));
+        let wd = self.settings.working_directory.clone();
+        let tx = self.event_tx.clone();
+        let tid = terminal_id.to_string();
+        self.tokio_rt.spawn(async move {
+            let out = crate::shell::execute_command(&command, &wd);
+            match out {
+                Ok(r) => {
+                    let _ = tx.send(AppEvent::TerminalFinished {
+                        terminal_id: tid,
+                        stdout: r.stdout,
+                        stderr: r.stderr,
+                        exit_code: r.exit_code,
+                    });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::TerminalFinished {
+                        terminal_id: tid,
+                        stdout: String::new(),
+                        stderr: e.to_string(),
+                        exit_code: -1,
+                    });
+                }
+            }
+        });
     }
 
     fn append_system_message(&mut self, session_idx: Option<usize>, content: String) {
@@ -315,6 +472,11 @@ impl ChatApp {
                     enabled: false,
                 },
             ],
+            terminals: vec![],
+            active_terminal_id: None,
+            changed_files: vec![],
+            opened_files: vec![],
+            active_open_file: None,
         };
 
         if let Some(idx) = app
@@ -780,6 +942,61 @@ Do not fabricate directory listings, command outputs, or success messages.",
                 AppEvent::ModelsLoaded(model_ids) => {
                     self.remote_models = model_ids;
                 }
+                AppEvent::TerminalFinished {
+                    terminal_id,
+                    stdout,
+                    stderr,
+                    exit_code,
+                } => {
+                    let mut continue_session: Option<usize> = None;
+                    let mut system_result: Option<(usize, String)> = None;
+                    if let Some(term) = self.terminals.iter_mut().find(|t| t.id == terminal_id) {
+                        term.running = false;
+                        term.exit_code = Some(exit_code);
+                        if !stdout.trim().is_empty() {
+                            term.output.push_str(&stdout);
+                            if !stdout.ends_with('\n') {
+                                term.output.push('\n');
+                            }
+                        }
+                        if !stderr.trim().is_empty() {
+                            term.output.push_str("\n[stderr]\n");
+                            term.output.push_str(&stderr);
+                            if !stderr.ends_with('\n') {
+                                term.output.push('\n');
+                            }
+                        }
+                        term.output.push_str(&format!("\n[exit code: {}]\n", exit_code));
+                        if term.owner == TerminalOwner::AI {
+                            if let Some(session_idx) = term.linked_session_idx {
+                                let mut result = format!(
+                                    "✅ Command executed (approved)\nCommand: `{}`\nWorking directory: `{}`\nExit code: {}",
+                                    term.command, term.working_dir, exit_code
+                                );
+                                if !stdout.trim().is_empty() {
+                                    result.push_str("\n\nstdout:\n```text\n");
+                                    result.push_str(&stdout);
+                                    result.push_str("\n```");
+                                }
+                                if !stderr.trim().is_empty() {
+                                    result.push_str("\n\nstderr:\n```text\n");
+                                    result.push_str(&stderr);
+                                    result.push_str("\n```");
+                                }
+                                system_result = Some((session_idx, result));
+                                if term.auto_continue_agent {
+                                    continue_session = Some(session_idx);
+                                }
+                            }
+                        }
+                    }
+                    if let Some((session_idx, result)) = system_result {
+                        self.append_system_message(Some(session_idx), result);
+                    }
+                    if let Some(session_idx) = continue_session {
+                        self.dispatch_agent_requests(session_idx);
+                    }
+                }
             }
         }
     }
@@ -891,6 +1108,173 @@ Do not fabricate directory listings, command outputs, or success messages.",
                 });
             });
         self.show_snapshots = open;
+    }
+
+    fn render_file_workspace_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("file_workspace")
+            .resizable(true)
+            .default_width(280.0)
+            .min_width(200.0)
+            .frame(egui::Frame::new().fill(BURGUNDY_DARK).inner_margin(egui::Margin::same(8)))
+            .show(ctx, |ui| {
+                ui.label(RichText::new("Changed Files").color(GOLD).strong());
+                ui.separator();
+                ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
+                    let changed = self.changed_files.clone();
+                    for path in changed {
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Open").clicked() {
+                                self.open_file_in_workspace(path.clone());
+                            }
+                            ui.label(RichText::new(path.clone()).small().color(LIGHT_TEXT));
+                        });
+                    }
+                    if self.changed_files.is_empty() {
+                        ui.label(RichText::new("No changed files yet").small().color(SKY_BLUE));
+                    }
+                });
+                ui.separator();
+
+                if self.opened_files.is_empty() {
+                    ui.label(RichText::new("No file opened").small().color(SKY_BLUE));
+                    return;
+                }
+
+                ui.horizontal_wrapped(|ui| {
+                    let opened = self.opened_files.clone();
+                    for path in opened {
+                        let selected = self.active_open_file.as_deref() == Some(path.as_str());
+                        let button = egui::Button::new(
+                            RichText::new(
+                                std::path::Path::new(&path)
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or(&path),
+                            )
+                            .small()
+                            .color(if selected { DARK_TEXT } else { LIGHT_TEXT }),
+                        )
+                        .fill(if selected { GOLD } else { SKY_BLUE_DARK });
+                        if ui.add(button).clicked() {
+                            self.active_open_file = Some(path.clone());
+                        }
+                        if ui.small_button("✕").clicked() {
+                            self.close_file_in_workspace(&path);
+                        }
+                    }
+                });
+                ui.separator();
+
+                if let Some(path) = self.active_open_file.clone() {
+                    ui.label(RichText::new(path.clone()).small().color(SKY_BLUE));
+                    let content = match std::fs::read_to_string(&path) {
+                        Ok(c) => c,
+                        Err(e) => format!("Could not open file: {e}"),
+                    };
+                    ScrollArea::vertical().show(ui, |ui| {
+                        ui.add(
+                            TextEdit::multiline(&mut content.clone())
+                                .desired_width(ui.available_width())
+                                .desired_rows(24)
+                                .interactive(false),
+                        );
+                    });
+                }
+            });
+    }
+
+    fn render_bottom_terminal_panel(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("terminal_workspace")
+            .resizable(true)
+            .default_height(220.0)
+            .min_height(120.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Terminals").strong().color(GOLD));
+                    if ui.button("➕ New Terminal").clicked() {
+                        let id = self.create_terminal(
+                            "User Terminal".to_string(),
+                            TerminalOwner::User,
+                            String::new(),
+                            None,
+                            false,
+                        );
+                        self.active_terminal_id = Some(id);
+                    }
+                    if let Some(active_id) = self.active_terminal_id.clone() {
+                        if ui.button("🛑 Terminate").clicked() {
+                            self.terminate_terminal(&active_id);
+                        }
+                        if ui.button("✕ Close").clicked() {
+                            self.remove_terminal(&active_id);
+                        }
+                    }
+                });
+                ui.separator();
+
+                ui.horizontal_wrapped(|ui| {
+                    for term in self.terminals.clone() {
+                        let selected = self.active_terminal_id.as_deref() == Some(term.id.as_str());
+                        let label = format!(
+                            "{} {}",
+                            if term.owner == TerminalOwner::AI { "🤖" } else { "👤" },
+                            term.name
+                        );
+                        let button = egui::Button::new(
+                            RichText::new(label)
+                                .small()
+                                .color(if selected { DARK_TEXT } else { LIGHT_TEXT }),
+                        )
+                        .fill(if selected { GOLD } else { SKY_BLUE_DARK });
+                        if ui.add(button).clicked() {
+                            self.active_terminal_id = Some(term.id.clone());
+                        }
+                    }
+                });
+                ui.separator();
+
+                if let Some(idx) = self.active_terminal_index() {
+                    let mut run_cmd: Option<String> = None;
+                    let term = &mut self.terminals[idx];
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "{}  |  wd: {}  |  {}",
+                                term.command,
+                                term.working_dir,
+                                if term.running { "running" } else { "idle" }
+                            ))
+                            .small()
+                            .color(SKY_BLUE),
+                        );
+                    });
+                    ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                        ui.add(
+                            TextEdit::multiline(&mut term.output)
+                                .desired_width(ui.available_width())
+                                .desired_rows(8)
+                                .interactive(false),
+                        );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            TextEdit::singleline(&mut term.input_buffer)
+                                .desired_width((ui.available_width() - TERMINAL_INPUT_RESERVED_WIDTH).max(120.0))
+                                .hint_text("command"),
+                        );
+                        if ui.button("Run").clicked() && !term.input_buffer.trim().is_empty() {
+                            run_cmd = Some(term.input_buffer.trim().to_string());
+                        }
+                    });
+                    if let Some(cmd) = run_cmd {
+                        term.input_buffer.clear();
+                        let terminal_id = term.id.clone();
+                        self.spawn_terminal_command(&terminal_id, cmd);
+                    }
+                } else {
+                    ui.label(RichText::new("No terminal opened").small().color(SKY_BLUE));
+                }
+            });
     }
 
     fn render_message(&mut self, ui: &mut egui::Ui, msg: &Message) {
@@ -1043,6 +1427,8 @@ impl eframe::App for ChatApp {
                             }
                         } else {
                             self.notify(format!("File written: {}", full_path.display()), NotificationKind::Info);
+                            self.ensure_changed_file_tracked(full_path_str.clone());
+                            self.open_file_in_workspace(full_path_str.clone());
                             self.append_system_message(
                                 action_session_idx,
                                 format!("✅ File written (approved): `{}`", full_path.display()),
@@ -1064,40 +1450,21 @@ impl eframe::App for ChatApp {
                                 self.dispatch_agent_requests(idx);
                             }
                         } else {
-                            let wd = self.settings.working_directory.clone();
-                            match crate::shell::execute_command(command, &wd) {
-                                Ok(out) => {
-                                    self.notify(format!("Command exited {}", out.exit_code), NotificationKind::Info);
-                                    let mut result = format!(
-                                        "✅ Command executed (approved)\nCommand: `{}`\nWorking directory: `{}`\nExit code: {}",
-                                        command, wd, out.exit_code
-                                    );
-                                    if !out.stdout.trim().is_empty() {
-                                        result.push_str("\n\nstdout:\n````text\n");
-                                        result.push_str(&out.stdout);
-                                        result.push_str("\n````");
-                                    }
-                                    if !out.stderr.trim().is_empty() {
-                                        result.push_str("\n\nstderr:\n````text\n");
-                                        result.push_str(&out.stderr);
-                                        result.push_str("\n````");
-                                    }
-                                    self.append_system_message(action_session_idx, result);
-                                    if let Some(idx) = action_session_idx {
-                                        self.dispatch_agent_requests(idx);
-                                    }
-                                }
-                                Err(e) => {
-                                    self.notify(format!("Command error: {e}"), NotificationKind::Error);
-                                    self.append_system_message(
-                                        action_session_idx,
-                                        format!("❌ Command execution failed for `{}`: {}", command, e),
-                                    );
-                                    if let Some(idx) = action_session_idx {
-                                        self.dispatch_agent_requests(idx);
-                                    }
-                                }
-                            }
+                            let terminal_name = if command.chars().count() > 32 {
+                                let shortened: String = command.chars().take(32).collect();
+                                format!("AI: {}…", shortened)
+                            } else {
+                                format!("AI: {}", command)
+                            };
+                            let tid = self.create_terminal(
+                                terminal_name,
+                                TerminalOwner::AI,
+                                command.clone(),
+                                action_session_idx,
+                                true,
+                            );
+                            self.spawn_terminal_command(&tid, command.clone());
+                            self.notify("AI command started in dedicated terminal", NotificationKind::Info);
                         }
                     }
                 }
@@ -1351,6 +1718,8 @@ impl eframe::App for ChatApp {
                 }
             });
 
+        self.render_file_workspace_panel(ctx);
+
         egui::SidePanel::right("activity")
             .resizable(true)
             .default_width(220.0)
@@ -1485,6 +1854,7 @@ impl eframe::App for ChatApp {
                     });
             });
 
+        self.render_bottom_terminal_panel(ctx);
         self.render_snapshots_window(ctx);
         self.draw_notifications(ctx);
     }

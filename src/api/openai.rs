@@ -279,7 +279,10 @@ impl OpenAIClient {
         use futures_util::StreamExt;
 
         let is_thinking_model = model.contains("o1") || model.contains("o3");
-        let supports_reasoning_effort = self.base_url.contains("api.openai.com");
+        let supports_reasoning_effort = self
+            .base_url
+            .trim_end_matches('/')
+            .starts_with("https://api.openai.com/v1");
 
         let request = ChatRequest {
             model: model.to_string(),
