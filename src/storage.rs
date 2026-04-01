@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
+use uuid::Uuid;
 
 /// One persisted chat role.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,7 +84,11 @@ impl Storage {
     pub async fn save_session(&self, session: &ChatSession) -> Result<()> {
         let serialized =
             serde_json::to_vec_pretty(session).context("failed to serialize chat session")?;
-        let tmp_path = self.paths.latest_session_path.with_extension("json.tmp");
+        let tmp_path = self.paths.data_dir.join(format!(
+            "latest_session_{}_{}.json.tmp",
+            Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+            Uuid::new_v4()
+        ));
 
         fs::write(&tmp_path, &serialized)
             .await

@@ -4,7 +4,6 @@ mod config;
 mod db;
 mod files;
 mod setup;
-mod shell;
 mod telemetry;
 mod parser;
 mod rag_engine;
