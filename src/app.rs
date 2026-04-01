@@ -4576,16 +4576,9 @@ impl eframe::App for ChatApp {
                                     .get(idx)
                                     .map(|s| s.name.clone())
                                     .unwrap_or_else(|| "Conversation".to_string());
-                                let display_name: String = if name.chars().count() > 32 {
-                                    let shortened: String = name.chars().take(29).collect();
-                                    format!("{shortened}...")
-                                } else {
-                                    name.clone()
-                                };
                                 ui.horizontal(|ui| {
                                     let btn = egui::Button::new(
-                                        RichText::new(format!("💬 {display_name}"))
-                                            .color(LIGHT_TEXT),
+                                        RichText::new(format!("💬 {name}")).color(LIGHT_TEXT),
                                     )
                                     .fill(if is_current { GOLD_DARK } else { SKY_BLUE_DARK })
                                     .min_size(Vec2::new(
