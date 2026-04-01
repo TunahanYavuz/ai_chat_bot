@@ -19,6 +19,7 @@ pub enum AgentRole {
     Router,
     SystemAdmin,
     CodeArchitect,
+    WebResearcher,
 }
 
 impl AgentRole {
@@ -27,6 +28,7 @@ impl AgentRole {
             AgentRole::Router => "Router",
             AgentRole::SystemAdmin => "SystemAdmin",
             AgentRole::CodeArchitect => "CodeArchitect",
+            AgentRole::WebResearcher => "WebResearcher",
         }
     }
 
@@ -35,6 +37,7 @@ impl AgentRole {
             "Router" => Some(Self::Router),
             "SystemAdmin" => Some(Self::SystemAdmin),
             "CodeArchitect" => Some(Self::CodeArchitect),
+            "WebResearcher" => Some(Self::WebResearcher),
             _ => None,
         }
     }
@@ -54,15 +57,17 @@ Your ONLY job is to create a routing plan and return STRICT JSON.
 Output ONLY a JSON array with no markdown, no prose, no code fences.
 Array schema:
 [
+  { "agent": "WebResearcher", "task": "..." },
   { "agent": "SystemAdmin", "task": "..." },
   { "agent": "CodeArchitect", "task": "..." }
 ]
 Rules:
-- Allowed agent values: "SystemAdmin", "CodeArchitect"
+- Allowed agent values: "WebResearcher", "SystemAdmin", "CodeArchitect"
 - Keep task text concise and executable.
 - Keep order exactly as execution order.
 - If no execution is needed, return [].
 - If you return [], orchestrator may inject a fallback CodeArchitect task from the user query.
+- Route to WebResearcher when user asks factual/current-events/documentation questions or when another agent needs external references.
 
 Router exception:
 - You still output ONLY the JSON routing array (no MESSAGE section)."#
@@ -84,6 +89,20 @@ Execution results will be automatically appended to swarm memory after actions r
         AgentRole::CodeArchitect => r#"You are CodeArchitect in a multi-agent swarm.
 Scope: analyze provided RAG snippets and author/edit code via file actions.
 You do NOT have terminal execution permission. Never emit run_cmd actions.
+Always produce:
+MESSAGE: ...
+PLAN:
+- [ ] ...
+```json
+{ "actions": [ ... ] }
+```"#
+            .to_string(),
+        AgentRole::WebResearcher => r#"You are WebResearcher in a multi-agent swarm.
+Scope: external information retrieval only.
+You do NOT write/edit code and do NOT execute terminal commands.
+Only emit:
+- "search_web" with parameter "query"
+- "read_url" with parameter "url"
 Always produce:
 MESSAGE: ...
 PLAN:

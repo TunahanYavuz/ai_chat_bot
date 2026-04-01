@@ -38,6 +38,8 @@ pub enum ActionKind {
     EditFile,
     CreatePdf,
     RunCmd,
+    SearchWeb,
+    ReadUrl,
 }
 
 /// Unified parameter bag for all supported actions with strict unknown-field handling.
@@ -49,6 +51,8 @@ pub struct CommandParams {
     pub mode: Option<String>,
     pub title: Option<String>,
     pub command: Option<String>,
+    pub query: Option<String>,
+    pub url: Option<String>,
 }
 
 /// Parses a model response that may contain MESSAGE, PLAN, and fenced JSON actions.
@@ -83,7 +87,7 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
 }
 
 pub fn parser_self_correction_feedback() -> &'static str {
-    "[System Error]: Action parser failed. You outputted an invalid key. Remember, you must strictly use 'create_file', 'edit_file', or 'run_cmd'. Please correct your JSON and try again."
+    "[System Error]: Action parser failed. You outputted an invalid key. Remember, you must strictly use valid action keys like 'create_file', 'edit_file', 'run_cmd', 'search_web', or 'read_url'. Please correct your JSON and try again."
 }
 
 fn extract_message_and_plan(text: &str) -> (Option<String>, Vec<String>) {

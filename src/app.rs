@@ -662,6 +662,7 @@ impl ChatApp {
                         Some(PendingAction::ExecuteCommand { command })
                     }
                 }
+                crate::parser::ActionKind::SearchWeb | crate::parser::ActionKind::ReadUrl => None,
             })
             .collect()
     }
@@ -860,6 +861,8 @@ impl ChatApp {
                     mode: None,
                     title: None,
                     command: Some(command),
+                    query: None,
+                    url: None,
                 },
             };
             let outcome = executor.execute_action(action, true).await;
@@ -1485,6 +1488,7 @@ impl ChatApp {
                     AgentRole::Router => "🔄 Router is analyzing...".to_string(),
                     AgentRole::SystemAdmin => "🛠️ SystemAdmin is working...".to_string(),
                     AgentRole::CodeArchitect => "🧠 CodeArchitect is writing...".to_string(),
+                    AgentRole::WebResearcher => "🌐 WebResearcher is researching...".to_string(),
                 };
                 let _ = event_tx
                     .send(AppEvent::SwarmStatus {
@@ -1584,6 +1588,10 @@ impl ChatApp {
                     .filter(|a| match role {
                         AgentRole::CodeArchitect => !matches!(a.action, ActionKind::RunCmd),
                         AgentRole::SystemAdmin => !matches!(a.action, ActionKind::RunCmd) || shell_enabled,
+                        AgentRole::WebResearcher => matches!(
+                            a.action,
+                            ActionKind::SearchWeb | ActionKind::ReadUrl
+                        ),
                         AgentRole::Router => {
                             swarm_memory.push_str(
                                 "\n[Router warning]\nRouter emitted actions unexpectedly; actions were ignored.\n",

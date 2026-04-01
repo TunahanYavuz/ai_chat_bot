@@ -10,6 +10,7 @@ mod setup;
 mod storage;
 mod swarm;
 mod telemetry;
+mod web_engine;
 
 use std::sync::Arc;
 

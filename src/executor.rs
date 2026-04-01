@@ -5,6 +5,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::parser::{ActionKind, AgentAction};
+use crate::web_engine::{format_search_results, WebEngine};
 
 const EMPTY_COMMAND_SUCCESS_MSG: &str = "[System: Command executed successfully with no output]";
 
@@ -42,12 +43,15 @@ pub struct ExecutionReport {
 /// - Normalizes empty successful command output.
 pub struct ActionExecutor {
     workspace_root: PathBuf,
+    web_engine: WebEngine,
 }
 
 impl ActionExecutor {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        let web_engine = WebEngine::new().expect("web engine init must succeed");
         Self {
             workspace_root: workspace_root.into(),
+            web_engine,
         }
     }
 
@@ -195,6 +199,28 @@ impl ActionExecutor {
                     action: "create_pdf".to_string(),
                     success: true,
                     stdout: format!("[System: PDF created] {}", full_path.display()),
+                    stderr: String::new(),
+                    exit_code: 0,
+                })
+            }
+            ActionKind::SearchWeb => {
+                let query = required_non_empty(action.parameters.query.as_deref(), "query")?;
+                let results = self.web_engine.search_web(&query).await?;
+                Ok(ExecutionReport {
+                    action: "search_web".to_string(),
+                    success: true,
+                    stdout: format_search_results(&results),
+                    stderr: String::new(),
+                    exit_code: 0,
+                })
+            }
+            ActionKind::ReadUrl => {
+                let url = required_non_empty(action.parameters.url.as_deref(), "url")?;
+                let content = self.web_engine.read_url(&url).await?;
+                Ok(ExecutionReport {
+                    action: "read_url".to_string(),
+                    success: true,
+                    stdout: format!("[Web] Read URL: {url}\n\n{content}"),
                     stderr: String::new(),
                     exit_code: 0,
                 })
