@@ -24,7 +24,6 @@ const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xE0, 0xE0, 0xE0);
 const TEXT_MUTED: Color32 = Color32::from_rgb(0xB5, 0xB5, 0xB5);
 const TEXT_DARK: Color32 = Color32::from_rgb(0x10, 0x10, 0x10);
 const BURGUNDY: Color32 = BG_PRIMARY;
-const BURGUNDY_LIGHT: Color32 = BG_SURFACE_ALT;
 const BURGUNDY_DARK: Color32 = BG_SURFACE;
 const SKY_BLUE: Color32 = ACCENT;
 const SKY_BLUE_DARK: Color32 = ACCENT_SOFT;
@@ -1696,10 +1695,10 @@ Do not fabricate directory listings, command outputs, or success messages.",
                                 .small()
                                 .color(TEXT_MUTED),
                         );
-                        let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
-                            let mut layout_job = Self::syntax_highlight_for_path(&path, text.as_str());
+                        let mut layouter = |ui: &egui::Ui, text: &str, wrap_width: f32| {
+                            let mut layout_job = Self::syntax_highlight_for_path(&path, text);
                             layout_job.wrap.max_width = wrap_width;
-                            ui.fonts_mut(|f| f.layout_job(layout_job))
+                            ui.fonts(|f| f.layout_job(layout_job))
                         };
                         ScrollArea::vertical().show(ui, |ui| {
                             let resp = ui.add(
