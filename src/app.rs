@@ -21,7 +21,7 @@ use crate::models::{
     get_model_capability, reasoning_config_for_model, ModelReasoningConfig, ReasoningCapability,
     ThinkingMode,
 };
-use crate::parser::{ActionKind, AgentAction, CommandParams};
+use crate::parser::ActionKind;
 use crate::rag_engine::{EmbeddingProvider, RagConfig, RagEngine};
 use crate::setup::SetupWizard;
 use crate::storage::{ChatSession, Storage, StoredMessage, StoredRole};
@@ -33,7 +33,6 @@ use qdrant_client::Qdrant;
 const BG_PRIMARY: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
 const BG_SURFACE: Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);
 const BG_SURFACE_ALT: Color32 = Color32::from_rgb(0x36, 0x36, 0x36);
-const BG_OVERLAY: Color32 = Color32::from_rgba_unmultiplied(0x16, 0x18, 0x1E, 0xCC);
 const ACCENT: Color32 = Color32::from_rgb(0x56, 0x9A, 0xD6);
 const ACCENT_SOFT: Color32 = Color32::from_rgb(0x3D, 0x6A, 0x8C);
 const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xE0, 0xE0, 0xE0);
@@ -507,16 +506,15 @@ impl ChatApp {
                 let filename = file
                     .name
                     .trim()
-                    .to_string()
                     .split(std::path::MAIN_SEPARATOR)
                     .next_back()
                     .unwrap_or("pasted.bin")
                     .to_string();
-                let mime_type = file
-                    .mime
-                    .clone()
-                    .filter(|m| !m.trim().is_empty())
-                    .unwrap_or_else(|| "application/octet-stream".to_string());
+                let mime_type = if file.mime.trim().is_empty() {
+                    "application/octet-stream".to_string()
+                } else {
+                    file.mime.clone()
+                };
                 let text = std::str::from_utf8(&raw).ok().map(|s| s.to_string());
                 let image_base64 = if mime_type.starts_with("image/") {
                     Some(general_purpose::STANDARD.encode(&raw))
@@ -5043,7 +5041,7 @@ impl eframe::App for ChatApp {
             .default_pos(egui::pos2(290.0, 96.0))
             .frame(
                 egui::Frame::new()
-                    .fill(BG_OVERLAY)
+                    .fill(Color32::from_rgba_unmultiplied(0x16, 0x18, 0x1E, 0xCC))
                     .corner_radius(10.0)
                     .stroke(egui::Stroke::new(1.0, BG_SURFACE_ALT))
                     .inner_margin(egui::Margin::same(10)),
