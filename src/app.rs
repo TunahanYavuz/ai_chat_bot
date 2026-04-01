@@ -51,6 +51,15 @@ const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
 const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const WORKFLOW_STEP_DETAIL_MAX_CHARS: usize = 1200;
+const SWARM_SYNTH_ROLE_PROMPT: &str = r#"You are Synthesizer in a multi-agent swarm.
+Output format:
+MESSAGE: ...
+PLAN: ```json ... ```
+Rules:
+- Produce a final user-facing summary in MESSAGE using only gathered execution data.
+- Include key findings, errors, and blocked steps when relevant.
+- If no reliable result is available, clearly state what is missing.
+- Keep PLAN as an empty JSON object."#;
 /// Prepended as the first system prompt for API requests so responses include
 /// a user-facing message plus a machine-readable ```json ... ``` execution block.
 const CORE_OS_SYSTEM_PROMPT: &str = r#"You are 'CoreOS', an advanced local File System and Command Line Interface (CLI) Agent. Your purpose is to assist the user by generating precise, executable commands while maintaining a helpful, conversational tone.
@@ -2243,18 +2252,9 @@ impl ChatApp {
                     })
                     .await;
 
-                let synth_role_prompt = "You are Synthesizer in a multi-agent swarm.
-Output format:
-MESSAGE: ...
-PLAN: ```json ... ```
-Rules:
-- Produce a final user-facing summary in MESSAGE using only gathered execution data.
-- Include key findings, errors, and blocked steps when relevant.
-- If no reliable result is available, clearly state what is missing.
-- Keep PLAN as an empty JSON object.";
                 let synth_system_prompt = format!(
-                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{rag_context}\n\n{synth_role_prompt}\n\nUser request:\n{query}\n\nSwarm memory:\n{}",
-                    swarm_memory
+                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{rag_context}\n\n{SWARM_SYNTH_ROLE_PROMPT}\n\nUser request:\n{query}\n\nSwarm memory:\n{swarm_memory}",
+                    swarm_memory = swarm_memory
                 );
                 let mut synth_messages = api_messages.clone();
                 synth_messages.insert(
@@ -2268,7 +2268,7 @@ Rules:
                         reasoning_capability,
                         tiered_reasoning_level.as_ref(),
                         binary_reasoning_enabled,
-                        |_| {},
+                        |_stream_chunk| {},
                     )
                     .await
                 {
