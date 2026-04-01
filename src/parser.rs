@@ -10,6 +10,7 @@ pub struct ParsedResponse {
     pub plan_items: Vec<String>,
     pub actions: Vec<AgentAction>,
     pub json_parse_error: Option<String>,
+    pub json_schema_drift: bool,
     pub fallback_text: String,
 }
 
@@ -66,13 +67,23 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
         (Vec::new(), None)
     };
 
+    let json_schema_drift = json_parse_error
+        .as_deref()
+        .map(is_schema_drift_error)
+        .unwrap_or(false);
+
     ParsedResponse {
         message,
         plan_items,
         actions,
         json_parse_error,
+        json_schema_drift,
         fallback_text: cleaned_text,
     }
+}
+
+pub fn parser_self_correction_feedback() -> &'static str {
+    "[System Error]: Action parser failed. You outputted an invalid key. Remember, you must strictly use 'create_file', 'edit_file', or 'run_cmd'. Please correct your JSON and try again."
 }
 
 fn extract_message_and_plan(text: &str) -> (Option<String>, Vec<String>) {
@@ -261,4 +272,10 @@ fn extract_balanced_json_object(input: &str) -> Option<&str> {
     }
 
     None
+}
+
+fn is_schema_drift_error(err: &str) -> bool {
+    err.contains("unknown variant")
+        || err.contains("unknown field")
+        || err.contains("did not match any variant")
 }

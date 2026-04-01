@@ -1,5 +1,19 @@
 use serde::Deserialize;
 
+const STRICT_TRANSLATION_AND_MAPPING_RULE: &str = r#"CRITICAL NLU & TRANSLATION RULE:
+The user will speak to you in Turkish. You must reply to them in Turkish in the 'MESSAGE:' section.
+HOWEVER, the underlying Operating System and JSON parser are STRICTLY ENGLISH. You act as a translator between the Turkish user and the Linux Unix terminal.
+
+INTENT MAPPING DICTIONARY:
+When the user asks to perform an action, you MUST map their intent to standard Linux commands and our strict JSON schema:
+- User intent: "klasör oluştur" (create folder) -> MUST map to: "run_cmd" with command "mkdir -p <name>"
+- User intent: "dosya oluştur" (create file) -> MUST map to: "create_file"
+- User intent: "dosya düzenle" (edit file) -> MUST map to: "edit_file"
+- User intent: "komut çalıştır" (run command) -> MUST map to: standard Linux Bash commands (e.g., ls, pwd, cargo, pip).
+
+ABSOLUTE PROHIBITION:
+NEVER translate the JSON action keys (always use `create_file`, `edit_file`, `run_cmd`). NEVER translate Bash/Linux commands. Your `EXECUTION_BLOCK` must always contain valid, English-based machine instructions."#;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRole {
     Router,
@@ -34,7 +48,7 @@ pub struct RoutedTask {
 }
 
 pub fn get_system_prompt(role: &AgentRole) -> String {
-    match role {
+    let base = match role {
         AgentRole::Router => r#"You are the Router in a multi-agent swarm.
 Your ONLY job is to create a routing plan and return STRICT JSON.
 Output ONLY a JSON array with no markdown, no prose, no code fences.
@@ -48,7 +62,10 @@ Rules:
 - Keep task text concise and executable.
 - Keep order exactly as execution order.
 - If no execution is needed, return [].
-- If you return [], orchestrator may inject a fallback CodeArchitect task from the user query."#
+- If you return [], orchestrator may inject a fallback CodeArchitect task from the user query.
+
+Router exception:
+- You still output ONLY the JSON routing array (no MESSAGE section)."#
             .to_string(),
         AgentRole::SystemAdmin => r#"You are SystemAdmin in a multi-agent swarm.
 Scope: OS commands, dependency management (cargo/pip/etc), and filesystem operations only.
@@ -61,7 +78,8 @@ PLAN:
 ```json
 { "actions": [ ... ] }
 ```
-Never claim command/file success unless execution results are provided in swarm memory."#
+Never claim command/file success unless execution results are provided in swarm memory.
+Execution results will be automatically appended to swarm memory after actions run."#
             .to_string(),
         AgentRole::CodeArchitect => r#"You are CodeArchitect in a multi-agent swarm.
 Scope: analyze provided RAG snippets and author/edit code via file actions.
@@ -74,7 +92,8 @@ PLAN:
 { "actions": [ ... ] }
 ```"#
             .to_string(),
-    }
+    };
+    format!("{base}\n\n{STRICT_TRANSLATION_AND_MAPPING_RULE}")
 }
 
 pub fn parse_router_plan(raw: &str) -> Vec<RoutedTask> {

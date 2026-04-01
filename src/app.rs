@@ -1317,6 +1317,8 @@ impl ChatApp {
             .map(|s| s.messages.iter().any(|m| m.role == Role::User))
             .unwrap_or(false)
         {
+            self.activity_log
+                .push("Swarm dispatch skipped: no user message in session".to_string());
             return;
         }
 
@@ -1465,7 +1467,7 @@ impl ChatApp {
 
             if queue.is_empty() {
                 queue.push(RoutedTask {
-                    agent: "CodeArchitect".to_string(),
+                    agent: AgentRole::CodeArchitect.as_str().to_string(),
                     task: query.clone(),
                 });
             }
@@ -1505,26 +1507,62 @@ impl ChatApp {
                 role_messages.insert(0, ChatMessage::with_cache_control("system", &role_system_prompt));
 
                 let role_raw = match client
-                    .chat_completion(
-                        &model_id,
-                        role_messages,
-                        thinking_mode.as_ref(),
-                        |_| {},
-                    )
+                    .chat_completion(&model_id, role_messages.clone(), thinking_mode.as_ref(), |_| {})
                     .await
                 {
                     Ok(resp) => resp,
                     Err(e) => {
-                        swarm_memory.push_str(&format!(
-                            "\n[{} error]\n{}\n",
-                            role.as_str(),
-                            e
-                        ));
+                        swarm_memory.push_str(&format!("\n[{} error]\n{}\n", role.as_str(), e));
                         continue;
                     }
                 };
 
-                let parsed = crate::parser::parse_response(&role_raw);
+                let mut parsed = crate::parser::parse_response(&role_raw);
+                if parsed.json_schema_drift {
+                    swarm_memory.push_str(&format!(
+                        "\n[{} parse error]\n{}\n",
+                        role.as_str(),
+                        parsed
+                            .json_parse_error
+                            .as_deref()
+                            .unwrap_or("Unknown parser error")
+                    ));
+                    swarm_memory.push_str("\n[System feedback injected]\n");
+                    swarm_memory.push_str(crate::parser::parser_self_correction_feedback());
+                    swarm_memory.push('\n');
+
+                    let mut retry_messages = role_messages.clone();
+                    retry_messages.push(ChatMessage::text(
+                        "system",
+                        crate::parser::parser_self_correction_feedback(),
+                    ));
+
+                    match client
+                        .chat_completion(&model_id, retry_messages, thinking_mode.as_ref(), |_| {})
+                        .await
+                    {
+                        Ok(retry_raw) => {
+                            let retry_parsed = crate::parser::parse_response(&retry_raw);
+                            if retry_parsed.json_schema_drift {
+                                swarm_memory.push_str(&format!(
+                                    "\n[{} retry parse error]\n{}\n",
+                                    role.as_str(),
+                                    retry_parsed
+                                        .json_parse_error
+                                        .as_deref()
+                                        .unwrap_or("Unknown parser error")
+                                ));
+                                continue;
+                            }
+                            parsed = retry_parsed;
+                        }
+                        Err(e) => {
+                            swarm_memory
+                                .push_str(&format!("\n[{} retry error]\n{}\n", role.as_str(), e));
+                            continue;
+                        }
+                    }
+                }
                 let display_text = parsed
                     .message
                     .as_deref()
