@@ -144,21 +144,6 @@ fn extract_docx_text(data: &[u8]) -> String {
     result.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-pub fn list_directory(path: &Path) -> Result<String> {
-    let mut result = format!("Directory: {}\n", path.display());
-    let entries = std::fs::read_dir(path)?;
-    for entry in entries.flatten() {
-        let meta = entry.metadata()?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if meta.is_dir() {
-            result.push_str(&format!("  [DIR]  {}\n", name));
-        } else {
-            result.push_str(&format!("  [FILE] {} ({} bytes)\n", name, meta.len()));
-        }
-    }
-    Ok(result)
-}
-
 pub fn read_text_file(path: &Path) -> Result<String> {
     Ok(std::fs::read_to_string(path)?)
 }

@@ -1,9 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 
+use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use regex::Regex;
 use uuid::Uuid;
 
 use crate::api::{builtin_models, provider_models, ChatMessage, ModelInfo, ThinkingMode};
@@ -25,6 +28,45 @@ const CUSTOM_MODEL_INPUT_RESERVED_WIDTH: f32 = 132.0;
 const DELETE_CHAT_BUTTON_WIDTH: f32 = 36.0;
 const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
 const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
+/// Prepended as the first system prompt for API requests so responses include
+/// a user-facing message plus a machine-readable ```json ... ``` execution block.
+const CORE_OS_SYSTEM_PROMPT: &str = r#"You are 'CoreOS', an advanced local File System and Command Line Interface (CLI) Agent. Your purpose is to assist the user by generating precise, executable commands while maintaining a helpful, conversational tone.
+
+YOUR WORKFLOW:
+Whenever the user makes a request, you must output your response in EXACTLY two parts:
+1. "MESSAGE": A friendly, brief, natural language response explaining what you are about to do.
+2. "EXECUTION_BLOCK": A strictly formatted JSON block containing the system instructions. This block MUST be enclosed in ```json ... ``` tags.
+
+AVAILABLE ACTIONS:
+You can output the following actions inside the JSON array:
+- "create_folder": Creates a new directory. (Requires: 'path')
+- "create_file": Creates a new text-based file (.txt, .rs, .py, etc.). (Requires: 'path', 'content')
+- "edit_file": Appends or overwrites text in an existing file. (Requires: 'path', 'mode' [overwrite/append], 'content')
+- "create_pdf": Generates a PDF file. (Requires: 'path', 'title', 'content')
+- "run_cmd": Executes a terminal command. (Requires: 'command')
+
+JSON SCHEMA OBLIGATION:
+Your JSON must strictly follow this format:
+{
+  "actions": [
+    {
+      "action": "action_name",
+      "parameters": {
+        "key": "value"
+      }
+    }
+  ]
+}
+
+CRITICAL RULES:
+
+Never output JSON outside the json block.
+
+Always use valid, escaped characters inside the JSON payload.
+
+If a user asks a simple conversational question that does not require system execution, keep the actions array empty ([]).
+
+THINK BEFORE YOU ACT: Ensure the commands are safe for a Linux/Unix environment."#;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -97,6 +139,17 @@ impl Session {
 pub enum PendingAction {
     WriteFile { path: String, content: String },
     ExecuteCommand { command: String },
+    CreateFolder { path: String },
+    EditFile {
+        path: String,
+        mode: String,
+        content: String,
+    },
+    CreatePdf {
+        path: String,
+        title: String,
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +227,7 @@ pub struct ChatApp {
 
     db: Arc<Mutex<Option<Database>>>,
     pending_action: Option<PendingAction>,
+    pending_actions_queue: VecDeque<PendingAction>,
     pending_action_session_idx: Option<usize>,
 
     markdown_cache: CommonMarkCache,
@@ -192,6 +246,11 @@ pub struct ChatApp {
 }
 
 impl ChatApp {
+    fn execution_json_block_regex() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"```json\s*(?P<json>\{[\s\S]*?\})\s*```").expect("valid regex"))
+    }
+
     fn extract_tag_block<'a>(text: &'a str, open_tag: &str, close_tag: &str) -> Option<&'a str> {
         let start = text.find(open_tag)?;
         let content_start = start + open_tag.len();
@@ -235,6 +294,137 @@ impl ChatApp {
         }
 
         None
+    }
+
+    fn parse_json_actions_actions_only(message: &str) -> Option<Vec<PendingAction>> {
+        let captures = Self::execution_json_block_regex().captures(message)?;
+        let json = captures.name("json")?.as_str();
+        let value: serde_json::Value = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("Invalid JSON execution block from model");
+                return None;
+            }
+        };
+        let actions = value.get("actions")?.as_array()?;
+
+        let mut parsed = Vec::new();
+        for action_item in actions {
+            let action_name = action_item.get("action")?.as_str()?.trim().to_string();
+            let params = action_item
+                .get("parameters")
+                .and_then(|p| p.as_object())
+                .cloned()
+                .unwrap_or_default();
+
+            match action_name.as_str() {
+                "create_folder" => {
+                    let path = params.get("path")?.as_str()?.trim().to_string();
+                    if !path.is_empty() {
+                        parsed.push(PendingAction::CreateFolder { path });
+                    }
+                }
+                "create_file" => {
+                    let path = params.get("path")?.as_str()?.trim().to_string();
+                    let content = params
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !path.is_empty() {
+                        parsed.push(PendingAction::WriteFile { path, content });
+                    }
+                }
+                "edit_file" => {
+                    let path = params.get("path")?.as_str()?.trim().to_string();
+                    let mode = params.get("mode")?.as_str()?.trim().to_string();
+                    let content = params
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !path.is_empty() && (mode == "overwrite" || mode == "append") {
+                        parsed.push(PendingAction::EditFile {
+                            path,
+                            mode,
+                            content,
+                        });
+                    }
+                }
+                "create_pdf" => {
+                    let path = params.get("path")?.as_str()?.trim().to_string();
+                    let title = params
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let content = params
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    if !path.is_empty() {
+                        parsed.push(PendingAction::CreatePdf {
+                            path,
+                            title,
+                            content,
+                        });
+                    }
+                }
+                "run_cmd" => {
+                    let command = params.get("command")?.as_str()?.trim().to_string();
+                    if !command.is_empty() {
+                        parsed.push(PendingAction::ExecuteCommand { command });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Some(parsed)
+    }
+
+    fn load_message_attachments(&self, message_id: &str) -> Vec<Attachment> {
+        if let Ok(guard) = self.db.lock() {
+            if let Some(database) = guard.as_ref() {
+                return database
+                    .load_attachments(message_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|att| {
+                        let ext = std::path::Path::new(&att.filename)
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_default()
+                            .to_lowercase();
+                        let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp");
+                        Attachment {
+                            filename: att.filename,
+                            text: if is_image {
+                                None
+                            } else {
+                                Some(String::from_utf8_lossy(&att.data).to_string())
+                            },
+                            image_base64: if is_image {
+                                Some(general_purpose::STANDARD.encode(&att.data))
+                            } else {
+                                None
+                            },
+                            mime_type: att.mime_type,
+                            raw_bytes: att.data,
+                        }
+                    })
+                    .collect();
+            }
+        }
+        vec![]
+    }
+
+    fn strip_json_execution_block(message: &str) -> String {
+        let cleaned = Self::execution_json_block_regex()
+            .replace_all(message, "")
+            .to_string();
+        cleaned.trim().to_string()
     }
 
     fn resolve_action_path(&self, raw_path: &str) -> std::path::PathBuf {
@@ -449,6 +639,7 @@ impl ChatApp {
             active_requests: HashMap::new(),
             db,
             pending_action: None,
+            pending_actions_queue: VecDeque::new(),
             pending_action_session_idx: None,
             markdown_cache: CommonMarkCache::default(),
             notifications: vec![],
@@ -620,7 +811,8 @@ Do not fabricate directory listings, command outputs, or success messages.",
                     "disabled"
                 }
             );
-            api_messages.push(ChatMessage::with_cache_control("system", &system_prompt));
+            let full_system_prompt = format!("{CORE_OS_SYSTEM_PROMPT}\n\n{system_prompt}");
+            api_messages.push(ChatMessage::with_cache_control("system", &full_system_prompt));
 
             if let Some(session) = self.sessions.get(session_idx) {
                 for msg in &session.messages {
@@ -752,22 +944,27 @@ Do not fabricate directory listings, command outputs, or success messages.",
             vec![]
         };
 
-        if let Some(s) = self.sessions.get_mut(idx) {
-            s.messages = messages
-                .into_iter()
-                .map(|m| Message {
-                    id: m.id,
+        let mapped_messages: Vec<Message> = messages
+            .into_iter()
+            .map(|m| {
+                let message_id = m.id;
+                Message {
+                    id: message_id.clone(),
                     role: match m.role.as_str() {
                         "user" => Role::User,
                         "assistant" => Role::Assistant,
                         _ => Role::System,
                     },
                     content: m.content,
-                    attachments: vec![],
+                    attachments: self.load_message_attachments(&message_id),
                     timestamp: m.created_at,
                     is_streaming: false,
-                })
-                .collect();
+                }
+            })
+            .collect();
+
+        if let Some(s) = self.sessions.get_mut(idx) {
+            s.messages = mapped_messages;
         }
     }
 
@@ -791,6 +988,37 @@ Do not fabricate directory listings, command outputs, or success messages.",
         };
         if let Some(err) = db_err {
             self.notify(format!("Failed to save message: {err}"), NotificationKind::Error);
+        }
+
+        if msg.attachments.is_empty() {
+            return;
+        }
+
+        let attachment_err = if let Ok(guard) = self.db.lock() {
+            if let Some(database) = guard.as_ref() {
+                let mut failed: Option<String> = None;
+                for att in &msg.attachments {
+                    let db_att = crate::db::DbAttachment {
+                        id: Uuid::new_v4().to_string(),
+                        message_id: msg.id.clone(),
+                        filename: att.filename.clone(),
+                        data: att.raw_bytes.clone(),
+                        mime_type: att.mime_type.clone(),
+                    };
+                    if let Err(e) = database.save_attachment(&db_att) {
+                        failed = Some(e.to_string());
+                        break;
+                    }
+                }
+                failed
+            } else {
+                None
+            }
+        } else {
+            Some("Database lock poisoned".to_string())
+        };
+        if let Some(err) = attachment_err {
+            self.notify(format!("Failed to save attachments: {err}"), NotificationKind::Error);
         }
     }
 
@@ -844,6 +1072,13 @@ Do not fabricate directory listings, command outputs, or success messages.",
                 self.snapshots.clear();
                 self.notify(format!("Failed to load snapshots: {e}"), NotificationKind::Error);
             }
+        }
+    }
+
+    fn read_text_file_for_view(path: &str) -> String {
+        match crate::files::read_text_file(std::path::Path::new(path)) {
+            Ok(c) => c,
+            Err(e) => format!("Could not open file: {e}"),
         }
     }
 
@@ -913,8 +1148,17 @@ Do not fabricate directory listings, command outputs, or success messages.",
                             let session_id = session.id.clone();
                             if let Some(msg) = session.messages.iter_mut().find(|m| m.id == active.message_id) {
                                 msg.is_streaming = false;
+                                let parsed_actions = Self::parse_json_actions_actions_only(&msg.content);
+                                msg.content = Self::strip_json_execution_block(&msg.content);
                                 if self.pending_action.is_none() {
-                                    if let Some(action) = Self::parse_pending_action(&msg.content) {
+                                    if let Some(actions) = parsed_actions {
+                                        let mut iter = actions.into_iter();
+                                        if let Some(action) = iter.next() {
+                                            self.pending_action = Some(action);
+                                            self.pending_action_session_idx = Some(active.session_idx);
+                                            self.pending_actions_queue = iter.collect();
+                                        }
+                                    } else if let Some(action) = Self::parse_pending_action(&msg.content) {
                                         self.pending_action = Some(action);
                                         self.pending_action_session_idx = Some(active.session_idx);
                                     }
@@ -1098,7 +1342,20 @@ Do not fabricate directory listings, command outputs, or success messages.",
                             ui.label(RichText::new(&snap.file_path).strong());
                             ui.label(snap.created_at.format("%Y-%m-%d %H:%M:%S UTC").to_string());
                             if ui.button("Restore this snapshot").clicked() {
-                                match std::fs::write(std::path::Path::new(&snap.file_path), &snap.content) {
+                                let snapshot_data = if let Ok(guard) = self.db.lock() {
+                                    if let Some(database) = guard.as_ref() {
+                                        database.get_file_snapshot(&snap.id).ok().flatten()
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                };
+                                let content_to_write = snapshot_data
+                                    .as_ref()
+                                    .map(|s| s.content.as_slice())
+                                    .unwrap_or(snap.content.as_slice());
+                                match std::fs::write(std::path::Path::new(&snap.file_path), content_to_write) {
                                     Ok(_) => self.notify(format!("Restored {}", snap.file_path), NotificationKind::Info),
                                     Err(e) => self.notify(format!("Restore failed: {e}"), NotificationKind::Error),
                                 }
@@ -1117,7 +1374,14 @@ Do not fabricate directory listings, command outputs, or success messages.",
             .min_width(200.0)
             .frame(egui::Frame::new().fill(BURGUNDY_DARK).inner_margin(egui::Margin::same(8)))
             .show(ctx, |ui| {
-                ui.label(RichText::new("Changed Files").color(GOLD).strong());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Changed Files").color(GOLD).strong());
+                    if ui.small_button("📂 Open File").clicked() {
+                        if let Some(path) = rfd::FileDialog::new().pick_file() {
+                            self.open_file_in_workspace(path.to_string_lossy().to_string());
+                        }
+                    }
+                });
                 ui.separator();
                 ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
                     let changed = self.changed_files.clone();
@@ -1167,10 +1431,7 @@ Do not fabricate directory listings, command outputs, or success messages.",
 
                 if let Some(path) = self.active_open_file.clone() {
                     ui.label(RichText::new(path.clone()).small().color(SKY_BLUE));
-                    let content = match std::fs::read_to_string(&path) {
-                        Ok(c) => c,
-                        Err(e) => format!("Could not open file: {e}"),
-                    };
+                    let content = Self::read_text_file_for_view(&path);
                     ScrollArea::vertical().show(ui, |ui| {
                         ui.add(
                             TextEdit::multiline(&mut content.clone())
@@ -1397,6 +1658,32 @@ impl eframe::App for ChatApp {
                             ui.label("Execute command:");
                             ui.monospace(command);
                         }
+                        PendingAction::CreateFolder { path } => {
+                            ui.label(format!("Create folder: {path}"));
+                        }
+                        PendingAction::EditFile {
+                            path,
+                            mode,
+                            content,
+                        } => {
+                            ui.label(format!("Edit file ({mode}): {path}"));
+                            ui.separator();
+                            ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                                ui.monospace(content);
+                            });
+                        }
+                        PendingAction::CreatePdf {
+                            path,
+                            title,
+                            content,
+                        } => {
+                            ui.label(format!("Create PDF: {path}"));
+                            ui.label(format!("Title: {title}"));
+                            ui.separator();
+                            ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                                ui.monospace(content);
+                            });
+                        }
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -1467,9 +1754,183 @@ impl eframe::App for ChatApp {
                             self.notify("AI command started in dedicated terminal", NotificationKind::Info);
                         }
                     }
+                    PendingAction::CreateFolder { path } => {
+                        let full_path = self.resolve_action_path(path);
+                        match std::fs::create_dir_all(&full_path) {
+                            Ok(_) => {
+                                self.notify(
+                                    format!("Folder created: {}", full_path.display()),
+                                    NotificationKind::Info,
+                                );
+                                self.append_system_message(
+                                    action_session_idx,
+                                    format!("✅ Folder created: `{}`", full_path.display()),
+                                );
+                                if let Some(idx) = action_session_idx {
+                                    self.dispatch_agent_requests(idx);
+                                }
+                            }
+                            Err(e) => {
+                                self.notify(format!("Create folder failed: {e}"), NotificationKind::Error);
+                                self.append_system_message(
+                                    action_session_idx,
+                                    format!("❌ Folder create failed for `{}`: {}", full_path.display(), e),
+                                );
+                                if let Some(idx) = action_session_idx {
+                                    self.dispatch_agent_requests(idx);
+                                }
+                            }
+                        }
+                    }
+                    PendingAction::EditFile {
+                        path,
+                        mode,
+                        content,
+                    } => {
+                        let full_path = self.resolve_action_path(path);
+                        let full_path_str = full_path.to_string_lossy().to_string();
+                        self.save_snapshot_if_exists(&full_path_str);
+                        let result = if mode == "append" {
+                            if let Some(parent) = full_path.parent() {
+                                let _ = std::fs::create_dir_all(parent);
+                            }
+                            std::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&full_path)
+                                .and_then(|mut f| {
+                                    use std::io::Write;
+                                    f.write_all(content.as_bytes())
+                                })
+                        } else {
+                            crate::files::write_text_file(&full_path, content)
+                                .map_err(std::io::Error::other)
+                        };
+                        match result {
+                            Ok(_) => {
+                                self.notify(format!("File edited: {}", full_path.display()), NotificationKind::Info);
+                                self.ensure_changed_file_tracked(full_path_str.clone());
+                                self.open_file_in_workspace(full_path_str.clone());
+                                self.append_system_message(
+                                    action_session_idx,
+                                    format!("✅ File edited ({}): `{}`", mode, full_path.display()),
+                                );
+                                self.refresh_snapshots();
+                                if let Some(idx) = action_session_idx {
+                                    self.dispatch_agent_requests(idx);
+                                }
+                            }
+                            Err(e) => {
+                                self.notify(format!("Edit failed: {e}"), NotificationKind::Error);
+                                self.append_system_message(
+                                    action_session_idx,
+                                    format!("❌ File edit failed for `{}`: {}", full_path.display(), e),
+                                );
+                                if let Some(idx) = action_session_idx {
+                                    self.dispatch_agent_requests(idx);
+                                }
+                            }
+                        }
+                    }
+                    PendingAction::CreatePdf {
+                        path,
+                        title,
+                        content,
+                    } => {
+                        let full_path = self.resolve_action_path(path);
+                        if full_path
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .map(|s| !s.eq_ignore_ascii_case("pdf"))
+                            .unwrap_or(true)
+                        {
+                            self.notify(
+                                "Create PDF rejected: path must end with .pdf",
+                                NotificationKind::Error,
+                            );
+                            self.append_system_message(
+                                action_session_idx,
+                                format!(
+                                    "❌ PDF create failed for `{}`: file extension must be .pdf",
+                                    full_path.display()
+                                ),
+                            );
+                            if let Some(idx) = action_session_idx {
+                                self.dispatch_agent_requests(idx);
+                            }
+                        } else {
+                            let full_path_str = full_path.to_string_lossy().to_string();
+                            self.save_snapshot_if_exists(&full_path_str);
+                            let normalized = format!("{title}\n\n{content}")
+                                .replace('\\', "\\\\")
+                                .replace('(', "\\(")
+                                .replace(')', "\\)");
+                            let mut pdf = String::new();
+                            pdf.push_str("%PDF-1.4\n");
+                            let mut offsets = vec![0usize];
+                            let obj1 = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
+                            offsets.push(pdf.len());
+                            pdf.push_str(obj1);
+                            let obj2 = "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n";
+                            offsets.push(pdf.len());
+                            pdf.push_str(obj2);
+                            let obj3 =
+                                "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>\nendobj\n";
+                            offsets.push(pdf.len());
+                            pdf.push_str(obj3);
+                            let stream_cmd = format!("BT /F1 12 Tf 72 720 Td ({normalized}) Tj ET\n");
+                            let obj4 = format!(
+                                "4 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
+                                stream_cmd.len(),
+                                stream_cmd
+                            );
+                            offsets.push(pdf.len());
+                            pdf.push_str(&obj4);
+                            let xref_start = pdf.len();
+                            pdf.push_str("xref\n0 5\n");
+                            pdf.push_str("0000000000 65535 f \n");
+                            for off in offsets.into_iter().skip(1) {
+                                pdf.push_str(&format!("{off:010} 00000 n \n"));
+                            }
+                            pdf.push_str("trailer\n<< /Size 5 /Root 1 0 R >>\n");
+                            pdf.push_str(&format!("startxref\n{xref_start}\n%%EOF\n"));
+                            match std::fs::write(&full_path, pdf.as_bytes()) {
+                                Ok(_) => {
+                                    self.notify(
+                                        format!("PDF file created: {}", full_path.display()),
+                                        NotificationKind::Info,
+                                    );
+                                    self.ensure_changed_file_tracked(full_path_str.clone());
+                                    self.open_file_in_workspace(full_path_str.clone());
+                                    self.append_system_message(
+                                        action_session_idx,
+                                        format!("✅ PDF file created: `{}`", full_path.display()),
+                                    );
+                                    self.refresh_snapshots();
+                                    if let Some(idx) = action_session_idx {
+                                        self.dispatch_agent_requests(idx);
+                                    }
+                                }
+                                Err(e) => {
+                                    self.notify(format!("Create PDF failed: {e}"), NotificationKind::Error);
+                                    self.append_system_message(
+                                        action_session_idx,
+                                        format!("❌ PDF create failed for `{}`: {}", full_path.display(), e),
+                                    );
+                                    if let Some(idx) = action_session_idx {
+                                        self.dispatch_agent_requests(idx);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 self.pending_action = None;
-                self.pending_action_session_idx = None;
+                if let Some(next_action) = self.pending_actions_queue.pop_front() {
+                    self.pending_action = Some(next_action);
+                } else {
+                    self.pending_action_session_idx = None;
+                }
             }
             if rejected {
                 self.append_system_message(
@@ -1480,6 +1941,7 @@ impl eframe::App for ChatApp {
                     self.dispatch_agent_requests(idx);
                 }
                 self.pending_action = None;
+                self.pending_actions_queue.clear();
                 self.pending_action_session_idx = None;
             }
         }
@@ -1738,6 +2200,8 @@ impl eframe::App for ChatApp {
                 });
             });
 
+        self.render_bottom_terminal_panel(ctx);
+
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(BURGUNDY).inner_margin(egui::Margin::same(0)))
             .show(ctx, |ui| {
@@ -1854,7 +2318,6 @@ impl eframe::App for ChatApp {
                     });
             });
 
-        self.render_bottom_terminal_panel(ctx);
         self.render_snapshots_window(ctx);
         self.draw_notifications(ctx);
     }

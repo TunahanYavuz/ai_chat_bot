@@ -21,9 +21,6 @@ impl ThinkingMode {
         }
     }
 
-    pub fn is_enabled(&self) -> bool {
-        !matches!(self, ThinkingMode::Disabled)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -210,7 +207,7 @@ impl ChatMessage {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
@@ -229,7 +226,6 @@ pub struct ChatChoice {
 
 #[derive(Debug, Deserialize)]
 pub struct ChatResponseMessage {
-    pub role: String,
     pub content: Option<String>,
 }
 
@@ -267,6 +263,34 @@ impl OpenAIClient {
             api_key: api_key.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
         }
+    }
+
+    async fn chat_completion_non_stream(&self, mut request: ChatRequest) -> Result<String> {
+        request.stream = None;
+
+        let url = format!("{}/chat/completions", self.base_url);
+        let response = self
+            .client
+            .post(&url)
+            .bearer_auth(&self.api_key)
+            .json(&request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("API error {}: {}", status, body));
+        }
+
+        let parsed: ChatResponse = response.json().await?;
+        let text = parsed
+            .choices
+            .into_iter()
+            .next()
+            .and_then(|choice| choice.message.content)
+            .unwrap_or_default();
+        Ok(text)
     }
 
     pub async fn chat_completion(
@@ -314,6 +338,7 @@ impl OpenAIClient {
         let mut stream = response.bytes_stream();
         let mut full_content = String::new();
 
+        let mut stream_finished = false;
         while let Some(chunk_result) = stream.next().await {
             let chunk = chunk_result?;
             let text = String::from_utf8_lossy(&chunk);
@@ -321,6 +346,7 @@ impl OpenAIClient {
             for line in text.lines() {
                 if let Some(data) = line.strip_prefix("data: ") {
                     if data.trim() == "[DONE]" {
+                        stream_finished = true;
                         break;
                     }
                     if let Ok(parsed) = serde_json::from_str::<StreamChunk>(data) {
@@ -331,10 +357,25 @@ impl OpenAIClient {
                                     on_chunk(content);
                                 }
                             }
+                            if choice.finish_reason.is_some() {
+                                stream_finished = true;
+                            }
                         }
                     }
                 }
             }
+            if stream_finished {
+                break;
+            }
+        }
+
+        if full_content.trim().is_empty() && stream_finished {
+            eprintln!("Streaming response completed empty; retrying once with non-stream request");
+            let fallback_text = self.chat_completion_non_stream(request).await?;
+            if !fallback_text.is_empty() {
+                on_chunk(fallback_text.clone());
+            }
+            return Ok(fallback_text);
         }
 
         Ok(full_content)

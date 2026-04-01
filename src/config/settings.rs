@@ -76,16 +76,6 @@ impl ApiProvider {
         }
     }
 
-    pub fn emoji(&self) -> &'static str {
-        match self {
-            Self::OpenAI => "🟢",
-            Self::Nvidia => "🟩",
-            Self::OpenRouter => "🔀",
-            Self::HuggingFace => "🤗",
-            Self::Custom => "⚙️",
-        }
-    }
-
     pub fn all() -> Vec<ApiProvider> {
         vec![
             Self::OpenAI,
