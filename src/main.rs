@@ -11,6 +11,7 @@ mod storage;
 mod swarm;
 mod telemetry;
 mod web_engine;
+mod models;
 
 use std::sync::Arc;
 

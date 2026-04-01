@@ -9,12 +9,14 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::api::{
-    builtin_models, get_model_capability, provider_models, ChatMessage, ModelInfo,
-    ReasoningCapability, RemoteModelInfo, ThinkingMode,
+    builtin_models, provider_models, ChatMessage, ModelInfo, RemoteModelInfo,
 };
 use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT_MODEL_ID};
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
 use crate::executor::{ActionExecutor, ExecutionPolicy, ExecutionStatus};
+use crate::models::{
+    reasoning_config_for_model, ModelReasoningConfig, ReasoningCapability, ThinkingMode,
+};
 use crate::parser::{ActionKind, AgentAction, CommandParams};
 use crate::rag_engine::{EmbeddingProvider, RagConfig, RagEngine};
 use crate::setup::SetupWizard;
@@ -123,6 +125,11 @@ pub enum AppEvent {
     SwarmStatus {
         request_id: String,
         status: String,
+    },
+    SwarmWorkflowStep {
+        request_id: String,
+        title: String,
+        details: String,
     },
     PolicyBlocked {
         request_id: String,
@@ -258,6 +265,21 @@ struct ActiveRequest {
     agent_name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowStepStatus {
+    Running,
+    Success,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowStep {
+    id: String,
+    title: String,
+    details: String,
+    status: WorkflowStepStatus,
+}
+
 #[derive(Clone)]
 struct OpenAIEmbeddingProvider {
     api_key: String,
@@ -357,21 +379,189 @@ pub struct ChatApp {
     show_left_sidebar: bool,
     show_activity_panel: bool,
     swarm_status: String,
+    swarm_workflow: Vec<WorkflowStep>,
+    workflow_expanded: HashMap<String, bool>,
+    workflow_request_id: Option<String>,
     policy_block_dialog: Option<String>,
 }
 
 impl ChatApp {
-    fn clean_copy_text(content: &str) -> String {
-        if let Some(plan_idx) = content.find("PLAN:") {
-            let before = &content[..plan_idx];
-            let plan_section = &content[plan_idx..];
-            if let Some(json_idx) = plan_section.find("```json") {
-                let cleaned_plan = &plan_section[..json_idx];
-                let merged = format!("{}{}", before, cleaned_plan);
-                return merged.trim().to_string();
+    fn sanitize_workflow_details(raw: &str) -> String {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return "No additional details.".to_string();
+        }
+        const MAX_CHARS: usize = 1200;
+        if trimmed.chars().count() <= MAX_CHARS {
+            return trimmed.to_string();
+        }
+        let clipped: String = trimmed.chars().take(MAX_CHARS).collect();
+        format!("{clipped}\n…")
+    }
+
+    fn active_reasoning_config(&self) -> ModelReasoningConfig {
+        reasoning_config_for_model(&self.selected_model_id())
+    }
+
+    fn ensure_thinking_mode_valid_for_model(&mut self) {
+        let cfg = self.active_reasoning_config();
+        if matches!(cfg.capability, ReasoningCapability::Tiered)
+            && !cfg.tiered_modes.contains(&self.selected_thinking_mode)
+        {
+            if let Some(default_mode) = cfg.tiered_modes.first().copied() {
+                self.selected_thinking_mode = default_mode;
             }
         }
-        content.trim().to_string()
+    }
+
+    fn activate_model_selection(&mut self) {
+        self.settings.default_model = self.selected_model_id();
+        let _ = save_settings(&self.settings);
+        self.ensure_thinking_mode_valid_for_model();
+        self.refresh_model_access_outline();
+    }
+
+    fn begin_workflow_step(&mut self, request_id: &str, title: String, details: String) {
+        if self.workflow_request_id.as_deref() != Some(request_id) {
+            self.workflow_request_id = Some(request_id.to_string());
+            self.swarm_workflow.clear();
+            self.workflow_expanded.clear();
+        }
+
+        if let Some(last_running) = self
+            .swarm_workflow
+            .iter_mut()
+            .rev()
+            .find(|step| matches!(step.status, WorkflowStepStatus::Running))
+        {
+            last_running.status = WorkflowStepStatus::Success;
+        }
+
+        let step_id = Uuid::new_v4().to_string();
+        self.workflow_expanded.insert(step_id.clone(), false);
+        self.swarm_workflow.push(WorkflowStep {
+            id: step_id,
+            title,
+            details: Self::sanitize_workflow_details(&details),
+            status: WorkflowStepStatus::Running,
+        });
+    }
+
+    fn finalize_workflow(&mut self, request_id: &str, success: bool) {
+        if self.workflow_request_id.as_deref() != Some(request_id) {
+            return;
+        }
+        if let Some(last_running) = self
+            .swarm_workflow
+            .iter_mut()
+            .rev()
+            .find(|step| matches!(step.status, WorkflowStepStatus::Running))
+        {
+            last_running.status = if success {
+                WorkflowStepStatus::Success
+            } else {
+                WorkflowStepStatus::Failed
+            };
+        }
+    }
+
+    fn render_workflow_visualizer(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(BG_SURFACE)
+            .corner_radius(8.0)
+            .stroke(egui::Stroke::new(1.0, BG_SURFACE_ALT))
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Swarm Workflow")
+                            .strong()
+                            .color(TEXT_PRIMARY)
+                            .size(15.0),
+                    );
+                    ui.add_space(8.0);
+                    if !self.active_requests.is_empty() {
+                        ui.spinner();
+                    }
+                    ui.label(RichText::new(&self.swarm_status).small().color(TEXT_MUTED));
+                });
+                ui.add_space(8.0);
+
+                if self.swarm_workflow.is_empty() {
+                    ui.label(
+                        RichText::new("No workflow steps yet. Send a request to start.")
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                    return;
+                }
+
+                ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                    for step in self.swarm_workflow.clone() {
+                        ui.horizontal(|ui| {
+                            let expanded = self.workflow_expanded.entry(step.id.clone()).or_insert(false);
+                            let chevron = if *expanded { "▾" } else { "▸" };
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new(chevron).color(TEXT_PRIMARY))
+                                        .frame(false),
+                                )
+                                .clicked()
+                            {
+                                *expanded = !*expanded;
+                            }
+
+                            match step.status {
+                                WorkflowStepStatus::Running => ui.spinner(),
+                                WorkflowStepStatus::Success => {
+                                    ui.label(RichText::new("✅").color(Color32::from_rgb(0x66, 0xBB, 0x6A)))
+                                }
+                                WorkflowStepStatus::Failed => {
+                                    ui.label(RichText::new("❌").color(Color32::from_rgb(0xEF, 0x53, 0x50)))
+                                }
+                            };
+
+                            ui.label(RichText::new(step.title).color(TEXT_PRIMARY));
+                        });
+
+                        if *self.workflow_expanded.get(&step.id).unwrap_or(&false) {
+                            egui::Frame::new()
+                                .fill(BG_SURFACE_ALT)
+                                .corner_radius(6.0)
+                                .inner_margin(egui::Margin::same(8))
+                                .show(ui, |ui| {
+                                    ui.label(RichText::new(step.details).small().monospace().color(TEXT_MUTED));
+                                });
+                        }
+                        ui.add_space(4.0);
+                    }
+                });
+            });
+    }
+
+    fn clean_copy_text(content: &str) -> String {
+        let parsed = crate::parser::parse_response(content);
+        let mut out = String::new();
+
+        if let Some(message) = parsed.message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            out.push_str(message);
+        } else if !parsed.fallback_text.trim().is_empty() {
+            out.push_str(parsed.fallback_text.trim());
+        }
+
+        if !parsed.plan_items.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str("PLAN:\n");
+            for item in parsed.plan_items {
+                out.push_str("- [ ] ");
+                out.push_str(item.trim());
+                out.push('\n');
+            }
+            out = out.trim_end().to_string();
+        }
+        out.trim().to_string()
     }
 
     fn copy_to_clipboard(&mut self, raw_content: &str) {
@@ -723,7 +913,7 @@ impl ChatApp {
     }
 
     fn current_reasoning_capability(&self) -> ReasoningCapability {
-        get_model_capability(&self.selected_model_id())
+        self.active_reasoning_config().capability
     }
 
     fn refresh_model_access_outline(&mut self) {
@@ -1262,6 +1452,9 @@ impl ChatApp {
             show_left_sidebar: true,
             show_activity_panel: false,
             swarm_status: "✅ Ready".to_string(),
+            swarm_workflow: vec![],
+            workflow_expanded: HashMap::new(),
+            workflow_request_id: None,
             policy_block_dialog: None,
         };
 
@@ -1400,6 +1593,9 @@ impl ChatApp {
         );
         self.activity_log.push("Swarm started response".to_string());
         self.swarm_status = "🔄 Router is analyzing...".to_string();
+        self.workflow_request_id = Some(request_id.clone());
+        self.swarm_workflow.clear();
+        self.workflow_expanded.clear();
 
         let mut api_messages: Vec<ChatMessage> = vec![];
         let telemetry_context =
@@ -1464,6 +1660,16 @@ impl ChatApp {
 
         self.tokio_rt.spawn(async move {
             let mut rag_context = "LOCAL REPOSITORY CONTEXT:\n- No relevant snippets found.".to_string();
+            let _ = event_tx
+                .send(AppEvent::SwarmWorkflowStep {
+                    request_id: req_id.clone(),
+                    title: "Setting up environment".to_string(),
+                    details: format!(
+                        "provider_base_url={}\nworkspace={}\nmodel={}",
+                        base_url, working_dir, model_id
+                    ),
+                })
+                .await;
             if !api_key.is_empty() && !query.trim().is_empty() {
                 let provider = OpenAIEmbeddingProvider {
                     api_key: api_key.clone(),
@@ -1491,6 +1697,13 @@ impl ChatApp {
             let router_system_prompt = format!(
                 "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{rag_context}\n\n{router_prompt}\n\nUser request:\n{query}"
             );
+            let _ = event_tx
+                .send(AppEvent::SwarmWorkflowStep {
+                    request_id: req_id.clone(),
+                    title: "Router: planning workflow".to_string(),
+                    details: router_system_prompt.clone(),
+                })
+                .await;
             router_messages.insert(
                 0,
                 ChatMessage::with_cache_control("system", &router_system_prompt),
@@ -1546,6 +1759,13 @@ impl ChatApp {
                     .send(AppEvent::SwarmStatus {
                         request_id: req_id.clone(),
                         status,
+                    })
+                    .await;
+                let _ = event_tx
+                    .send(AppEvent::SwarmWorkflowStep {
+                        request_id: req_id.clone(),
+                        title: format!("{}: analyze task", role.as_str()),
+                        details: step.task.clone(),
                     })
                     .await;
 
@@ -1684,12 +1904,73 @@ impl ChatApp {
                         for status in statuses {
                             match status {
                                 ExecutionStatus::Executed(report) => {
+                                    let _ = event_tx
+                                        .send(AppEvent::SwarmWorkflowStep {
+                                            request_id: req_id.clone(),
+                                            title: format!("{}: {}", role.as_str(), report.action),
+                                            details: format!(
+                                                "success={}\nexit_code={}\nstdout:\n{}\nstderr:\n{}",
+                                                report.success, report.exit_code, report.stdout, report.stderr
+                                            ),
+                                        })
+                                        .await;
                                     swarm_memory.push_str(&format!(
                                         "action={} success={} exit_code={}\nstdout:\n{}\nstderr:\n{}\n",
                                         report.action, report.success, report.exit_code, report.stdout, report.stderr
                                     ));
                                 }
                                 ExecutionStatus::AwaitingApproval(req) => {
+                                    let detail = match req.action.action {
+                                        ActionKind::RunCmd => req
+                                            .action
+                                            .parameters
+                                            .command
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                        ActionKind::EditFile => req
+                                            .action
+                                            .parameters
+                                            .path
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                        ActionKind::CreateFile => req
+                                            .action
+                                            .parameters
+                                            .path
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                        ActionKind::CreateFolder => req
+                                            .action
+                                            .parameters
+                                            .path
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                        ActionKind::CreatePdf => req
+                                            .action
+                                            .parameters
+                                            .path
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                        ActionKind::SearchWeb => req
+                                            .action
+                                            .parameters
+                                            .query
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                        ActionKind::ReadUrl => req
+                                            .action
+                                            .parameters
+                                            .url
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                    };
+                                    let _ = event_tx
+                                        .send(AppEvent::SwarmWorkflowStep {
+                                            request_id: req_id.clone(),
+                                            title: format!("{}: awaiting approval", role.as_str()),
+                                            details: format!("{}\n{}", req.reason, detail),
+                                        })
+                                        .await;
                                     swarm_memory.push_str(&format!(
                                         "action awaiting approval: {:?}\nreason: {}\n",
                                         req.action.action, req.reason
@@ -1705,6 +1986,13 @@ impl ChatApp {
                         }
                     }
                     Err(e) => {
+                        let _ = event_tx
+                            .send(AppEvent::SwarmWorkflowStep {
+                                request_id: req_id.clone(),
+                                title: format!("{}: execution error", role.as_str()),
+                                details: e.to_string(),
+                            })
+                            .await;
                         swarm_memory.push_str(&format!(
                             "\n[{} execution error]\n{}\n",
                             role.as_str(),
@@ -1727,6 +2015,13 @@ impl ChatApp {
                 .send(AppEvent::SwarmStatus {
                     request_id: req_id.clone(),
                     status: "✅ Swarm completed".to_string(),
+                })
+                .await;
+            let _ = event_tx
+                .send(AppEvent::SwarmWorkflowStep {
+                    request_id: req_id.clone(),
+                    title: "Workflow complete".to_string(),
+                    details: "All planned swarm steps finished.".to_string(),
                 })
                 .await;
             let _ = event_tx.send(AppEvent::ResponseComplete(req_id)).await;
@@ -2087,6 +2382,7 @@ impl ChatApp {
                     }
                 }
                 AppEvent::ResponseComplete(req_id) => {
+                    self.finalize_workflow(&req_id, true);
                     if let Some(active) = self.active_requests.remove(&req_id) {
                         let mut to_save: Option<(String, Message)> = None;
                         let mut parse_error_notification: Option<String> = None;
@@ -2160,6 +2456,7 @@ impl ChatApp {
                     }
                 }
                 AppEvent::ResponseError(req_id, err) => {
+                    self.finalize_workflow(&req_id, false);
                     if let Some(active) = self.active_requests.remove(&req_id) {
                         if let Some(session) = self.sessions.get_mut(active.session_idx) {
                             if let Some(msg) = session
@@ -2181,6 +2478,15 @@ impl ChatApp {
                 AppEvent::SwarmStatus { request_id, status } => {
                     if self.active_requests.contains_key(&request_id) {
                         self.swarm_status = status;
+                    }
+                }
+                AppEvent::SwarmWorkflowStep {
+                    request_id,
+                    title,
+                    details,
+                } => {
+                    if self.active_requests.contains_key(&request_id) {
+                        self.begin_workflow_step(&request_id, title, details);
                     }
                 }
                 AppEvent::PolicyBlocked { request_id, reason } => {
@@ -3378,6 +3684,7 @@ impl eframe::App for ChatApp {
                             .fill(BG_SURFACE)
                             .stroke(egui::Stroke::new(1.0, outline_color))
                             .show(ui, |ui| {
+                                let mut picked_model_idx: Option<usize> = None;
                                 egui::ComboBox::from_id_salt("model_selector")
                                     .selected_text(
                                         RichText::new(selected_model_name).color(TEXT_PRIMARY),
@@ -3385,11 +3692,15 @@ impl eframe::App for ChatApp {
                                     .width(ui.available_width())
                                     .show_ui(ui, |ui| {
                                         for (i, m) in self.models.iter().enumerate() {
-                                            ui.selectable_value(
-                                                &mut self.selected_model_idx,
-                                                i,
-                                                RichText::new(&m.name).color(TEXT_PRIMARY),
-                                            );
+                                            if ui
+                                                .selectable_label(
+                                                    self.selected_model_idx == i,
+                                                    RichText::new(&m.name).color(TEXT_PRIMARY),
+                                                )
+                                                .clicked()
+                                            {
+                                                picked_model_idx = Some(i);
+                                            }
                                         }
                                         if !self.remote_models.is_empty() {
                                             ui.separator();
@@ -3413,59 +3724,31 @@ impl eframe::App for ChatApp {
                                             }
                                         }
                                     });
+                                if let Some(idx) = picked_model_idx {
+                                    self.selected_model_idx = idx;
+                                    self.custom_model_id.clear();
+                                    self.activate_model_selection();
+                                }
                             });
                         ui.label(RichText::new("Custom model ID").small().color(TEXT_MUTED));
                         ui.horizontal(|ui| {
-                            ui.add(
+                            let changed = ui
+                                .add(
                                 TextEdit::singleline(&mut self.custom_model_id)
                                     .desired_width(
                                         ui.available_width() - CUSTOM_MODEL_INPUT_RESERVED_WIDTH,
                                     )
                                     .hint_text("e.g. gpt-4o, meta-llama/Llama-3.1-8B-Instruct"),
-                            );
-                            if ui.button("Use").clicked() {
-                                if self.custom_model_id.trim().is_empty() {
-                                    self.custom_model_id = self
-                                        .current_model()
-                                        .map(|m| m.id.clone())
-                                        .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
-                                }
-                                self.settings.default_model =
-                                    self.custom_model_id.trim().to_string();
-                                let _ = save_settings(&self.settings);
-                                self.refresh_model_access_outline();
+                                )
+                                .changed();
+                            if changed {
+                                self.activate_model_selection();
                             }
                             if ui.button("From list").clicked() {
                                 self.custom_model_id.clear();
-                                self.settings.default_model = self
-                                    .current_model()
-                                    .map(|m| m.id.clone())
-                                    .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
-                                let _ = save_settings(&self.settings);
-                                self.refresh_model_access_outline();
+                                self.activate_model_selection();
                             }
                         });
-                        if !self.remote_models.is_empty() {
-                            let mut picked_model_id: Option<String> = None;
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new("Quick pick:").small().color(TEXT_MUTED));
-                                for model in self.remote_models.iter().take(8) {
-                                    let mut label = model.id.clone();
-                                    if model.premium {
-                                        label.push_str(" [Premium]");
-                                    }
-                                    if model.gated {
-                                        label.push_str(" [Gated]");
-                                    }
-                                if ui.small_button(label).clicked() {
-                                    picked_model_id = Some(model.id.clone());
-                                }
-                            }
-                        });
-                        if let Some(model_id) = picked_model_id {
-                            self.custom_model_id = model_id;
-                            self.refresh_model_access_outline();
-                        }
                     }
 
                     ui.horizontal(|ui| {
@@ -3501,39 +3784,28 @@ impl eframe::App for ChatApp {
                             });
                     });
 
-                    match self.current_reasoning_capability() {
+                    let reasoning_cfg = self.active_reasoning_config();
+                    match reasoning_cfg.capability {
                             ReasoningCapability::None => {}
                             ReasoningCapability::Binary => {
                                 ui.checkbox(
                                     &mut self.binary_reasoning_enabled,
-                                    "Enable Reasoning / Thinking",
+                                    reasoning_cfg.binary_label,
                                 );
                             }
                             ReasoningCapability::Tiered => {
                                 ui.horizontal(|ui| {
-                                    ui.label("Thinking level:");
+                                    ui.label(reasoning_cfg.tiered_label);
                                     egui::ComboBox::from_id_salt("thinking_mode")
-                                        .selected_text(match self.selected_thinking_mode {
-                                            ThinkingMode::Low => "Low",
-                                            ThinkingMode::Medium => "Medium",
-                                            ThinkingMode::High => "High",
-                                        })
+                                        .selected_text(self.selected_thinking_mode.display_name())
                                         .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut self.selected_thinking_mode,
-                                                ThinkingMode::Low,
-                                                "Low",
-                                            );
-                                            ui.selectable_value(
-                                                &mut self.selected_thinking_mode,
-                                                ThinkingMode::Medium,
-                                                "Medium",
-                                            );
-                                            ui.selectable_value(
-                                                &mut self.selected_thinking_mode,
-                                                ThinkingMode::High,
-                                                "High",
-                                            );
+                                            for mode in reasoning_cfg.tiered_modes {
+                                                ui.selectable_value(
+                                                    &mut self.selected_thinking_mode,
+                                                    *mode,
+                                                    mode.display_name(),
+                                                );
+                                            }
                                         });
                                 });
                             }
