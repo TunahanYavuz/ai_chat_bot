@@ -1,19 +1,22 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
-use std::sync::OnceLock;
-
+use std::sync::Arc;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, TextFormat, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use regex::Regex;
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::api::{builtin_models, provider_models, ChatMessage, ModelInfo, RemoteModelInfo, ThinkingMode};
 use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT_MODEL_ID};
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
+use crate::executor::{ActionExecutor, ExecutionStatus};
+use crate::parser::{ActionKind, AgentAction, CommandParams};
+use crate::rag_engine::{EmbeddingProvider, RagConfig, RagEngine};
 use crate::setup::SetupWizard;
+use crate::storage::{ChatSession, Storage, StoredMessage, StoredRole};
+use crate::telemetry::collect_telemetry_cached;
 
 const BG_PRIMARY: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
 const BG_SURFACE: Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);
@@ -36,6 +39,7 @@ const CUSTOM_MODEL_INPUT_RESERVED_WIDTH: f32 = 132.0;
 const DELETE_CHAT_BUTTON_WIDTH: f32 = 36.0;
 const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
 const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// Prepended as the first system prompt for API requests so responses include
 /// a user-facing message plus a machine-readable ```json ... ``` execution block.
 const CORE_OS_SYSTEM_PROMPT: &str = r#"You are 'CoreOS', an advanced local File System and Command Line Interface (CLI) Agent. Your purpose is to assist the user by generating precise, executable commands while maintaining a helpful, conversational tone.
@@ -72,6 +76,8 @@ Never output JSON outside the json block.
 
 Always use valid, escaped characters inside the JSON payload.
 
+GLOBAL NLU PROTOCOL: The user may speak to you in ANY language (e.g., Turkish, Spanish, etc.). You must understand and execute their intent. However, your structural output MUST remain strictly in English. The headers MUST be exactly 'MESSAGE:' and 'PLAN:'. The JSON keys and actions (e.g., 'create_file', 'run_cmd') MUST remain exactly as defined in the schema. You may translate the *content* of the MESSAGE and PLAN into the user's language, but NEVER translate the structural keys.
+
 If a user asks a simple conversational question that does not require system execution, keep the actions array empty ([]).
 
 THINK BEFORE YOU ACT: Ensure the commands are safe for a Linux/Unix environment."#;
@@ -88,6 +94,28 @@ pub enum AppEvent {
         stderr: String,
         exit_code: i32,
     },
+    InitialSessionsLoaded {
+        sessions: Vec<Session>,
+        error: Option<String>,
+    },
+    SessionMessagesLoaded {
+        idx: usize,
+        messages: Vec<Message>,
+        error: Option<String>,
+    },
+    StoredSessionLoaded {
+        session: Option<Session>,
+        error: Option<String>,
+    },
+    SnapshotsLoaded {
+        snapshots: Vec<DbFileSnapshot>,
+        error: Option<String>,
+    },
+    SnapshotRestored {
+        file_path: String,
+        error: Option<String>,
+    },
+    DbError(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +239,55 @@ struct ActiveRequest {
     agent_name: String,
 }
 
+#[derive(Clone)]
+struct OpenAIEmbeddingProvider {
+    api_key: String,
+    base_url: String,
+    model: String,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingResponse {
+    data: Vec<EmbeddingItem>,
+}
+
+#[derive(Deserialize)]
+struct EmbeddingItem {
+    embedding: Vec<f32>,
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for OpenAIEmbeddingProvider {
+    async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>> {
+        let client = reqwest::Client::new();
+        let url = format!("{}/embeddings", self.base_url.trim_end_matches('/'));
+        let response = client
+            .post(url)
+            .bearer_auth(&self.api_key)
+            .json(&serde_json::json!({
+                "model": self.model,
+                "input": text,
+            }))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow::anyhow!("embedding API error {}: {}", status, body));
+        }
+
+        let parsed: EmbeddingResponse = response.json().await?;
+        let embedding = parsed
+            .data
+            .into_iter()
+            .next()
+            .map(|d| d.embedding)
+            .ok_or_else(|| anyhow::anyhow!("empty embedding response"))?;
+        Ok(embedding)
+    }
+}
+
 pub struct ChatApp {
     settings: Settings,
     show_settings: bool,
@@ -230,12 +307,13 @@ pub struct ChatApp {
     input_text: String,
     pending_attachments: Vec<Attachment>,
 
-    event_tx: std::sync::mpsc::Sender<AppEvent>,
-    event_rx: std::sync::mpsc::Receiver<AppEvent>,
+    event_tx: tokio::sync::mpsc::Sender<AppEvent>,
+    event_rx: tokio::sync::mpsc::Receiver<AppEvent>,
     tokio_rt: Arc<tokio::runtime::Runtime>,
     active_requests: HashMap<String, ActiveRequest>,
 
-    db: Arc<Mutex<Option<Database>>>,
+    db_path: String,
+    storage: Option<Storage>,
     pending_action: Option<PendingAction>,
     pending_actions_queue: VecDeque<PendingAction>,
     pending_action_session_idx: Option<usize>,
@@ -260,6 +338,236 @@ pub struct ChatApp {
 }
 
 impl ChatApp {
+    fn stored_role_from_role(role: &Role) -> StoredRole {
+        match role {
+            Role::System => StoredRole::System,
+            Role::User => StoredRole::User,
+            Role::Assistant => StoredRole::Assistant,
+        }
+    }
+
+    fn role_from_stored_role(role: &StoredRole) -> Role {
+        match role {
+            StoredRole::System => Role::System,
+            StoredRole::User => Role::User,
+            StoredRole::Assistant => Role::Assistant,
+        }
+    }
+
+    fn session_to_stored(session: &Session) -> ChatSession {
+        ChatSession {
+            id: session.id.clone(),
+            name: session.name.clone(),
+            updated_at: Utc::now(),
+            messages: session
+                .messages
+                .iter()
+                .map(|m| StoredMessage {
+                    role: Self::stored_role_from_role(&m.role),
+                    content: m.content.clone(),
+                    timestamp: m.timestamp,
+                })
+                .collect(),
+        }
+    }
+
+    fn persist_session_snapshot_async(&self, session_idx: usize) {
+        let Some(storage) = self.storage.clone() else {
+            return;
+        };
+        let Some(session) = self.sessions.get(session_idx) else {
+            return;
+        };
+        let payload = Self::session_to_stored(session);
+        self.tokio_rt.spawn(async move {
+            if let Err(e) = storage.save_session(&payload).await {
+                eprintln!("Failed to persist latest session: {e}");
+            }
+        });
+    }
+
+    fn spawn_initial_data_load(&self) {
+        let tx = self.event_tx.clone();
+        let db_path = self.db_path.clone();
+        self.tokio_rt.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || -> Result<Vec<Session>, String> {
+                let db = Database::new(&db_path).map_err(|e| e.to_string())?;
+                let sessions = db
+                    .list_sessions()
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(|s| Session {
+                        id: s.id,
+                        name: s.name,
+                        messages: vec![],
+                    })
+                    .collect();
+                Ok(sessions)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(sessions)) => {
+                    let _ = tx.send(AppEvent::InitialSessionsLoaded { sessions, error: None }).await;
+                }
+                Ok(Err(e)) => {
+                    let _ = tx
+                        .send(AppEvent::InitialSessionsLoaded {
+                            sessions: vec![],
+                            error: Some(e),
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(AppEvent::InitialSessionsLoaded {
+                            sessions: vec![],
+                            error: Some(e.to_string()),
+                        })
+                        .await;
+                }
+            }
+        });
+
+        if let Some(storage) = self.storage.clone() {
+            let tx = self.event_tx.clone();
+            self.tokio_rt.spawn(async move {
+                match storage.load_latest_session().await {
+                    Ok(Some(stored)) => {
+                        let restored_messages: Vec<Message> = stored
+                            .messages
+                            .into_iter()
+                            .map(|m| Message {
+                                id: Uuid::new_v4().to_string(),
+                                role: Self::role_from_stored_role(&m.role),
+                                content: m.content,
+                                attachments: vec![],
+                                timestamp: m.timestamp,
+                                is_streaming: false,
+                            })
+                            .collect();
+                        let session = Session {
+                            id: stored.id,
+                            name: stored.name,
+                            messages: restored_messages,
+                        };
+                        let _ = tx
+                            .send(AppEvent::StoredSessionLoaded {
+                                session: Some(session),
+                                error: None,
+                            })
+                            .await;
+                    }
+                    Ok(None) => {
+                        let _ = tx
+                            .send(AppEvent::StoredSessionLoaded {
+                                session: None,
+                                error: None,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(AppEvent::StoredSessionLoaded {
+                                session: None,
+                                error: Some(e.to_string()),
+                            })
+                            .await;
+                    }
+                }
+            });
+        }
+    }
+
+    fn spawn_load_session_messages(&self, idx: usize, session_id: String) {
+        let tx = self.event_tx.clone();
+        let db_path = self.db_path.clone();
+        self.tokio_rt.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || -> Result<Vec<Message>, String> {
+                let db = Database::new(&db_path).map_err(|e| e.to_string())?;
+                let messages = db.load_messages(&session_id).map_err(|e| e.to_string())?;
+                let mapped: Vec<Message> = messages
+                    .into_iter()
+                    .map(|m| {
+                        let message_id = m.id;
+                        let attachments = db
+                            .load_attachments(&message_id)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|att| {
+                                let ext = std::path::Path::new(&att.filename)
+                                    .extension()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or_default()
+                                    .to_lowercase();
+                                let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp");
+                                Attachment {
+                                    filename: att.filename,
+                                    text: if is_image {
+                                        None
+                                    } else {
+                                        Some(String::from_utf8_lossy(&att.data).to_string())
+                                    },
+                                    image_base64: if is_image {
+                                        Some(general_purpose::STANDARD.encode(&att.data))
+                                    } else {
+                                        None
+                                    },
+                                    mime_type: att.mime_type,
+                                    raw_bytes: att.data,
+                                }
+                            })
+                            .collect();
+                        Message {
+                            id: message_id.clone(),
+                            role: match m.role.as_str() {
+                                "user" => Role::User,
+                                "assistant" => Role::Assistant,
+                                _ => Role::System,
+                            },
+                            content: m.content,
+                            attachments,
+                            timestamp: m.created_at,
+                            is_streaming: false,
+                        }
+                    })
+                    .collect();
+                Ok(mapped)
+            })
+            .await;
+
+            match result {
+                Ok(Ok(messages)) => {
+                    let _ = tx
+                        .send(AppEvent::SessionMessagesLoaded {
+                            idx,
+                            messages,
+                            error: None,
+                        })
+                        .await;
+                }
+                Ok(Err(e)) => {
+                    let _ = tx
+                        .send(AppEvent::SessionMessagesLoaded {
+                            idx,
+                            messages: vec![],
+                            error: Some(e),
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(AppEvent::SessionMessagesLoaded {
+                            idx,
+                            messages: vec![],
+                            error: Some(e.to_string()),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
     fn sanitized_command_stdout(stdout: &str, exit_code: i32) -> String {
         if stdout.trim().is_empty() {
             if exit_code == 0 {
@@ -270,6 +578,66 @@ impl ChatApp {
         } else {
             stdout.to_string()
         }
+    }
+
+    fn pending_actions_from_agent_actions(actions: Vec<crate::parser::AgentAction>) -> Vec<PendingAction> {
+        actions
+            .into_iter()
+            .filter_map(|item| match item.action {
+                crate::parser::ActionKind::CreateFolder => {
+                    let path = item.parameters.path?.trim().to_string();
+                    if path.is_empty() {
+                        None
+                    } else {
+                        Some(PendingAction::CreateFolder { path })
+                    }
+                }
+                crate::parser::ActionKind::CreateFile => {
+                    let path = item.parameters.path?.trim().to_string();
+                    if path.is_empty() {
+                        None
+                    } else {
+                        Some(PendingAction::WriteFile {
+                            path,
+                            content: item.parameters.content.unwrap_or_default(),
+                        })
+                    }
+                }
+                crate::parser::ActionKind::EditFile => {
+                    let path = item.parameters.path?.trim().to_string();
+                    let mode = item.parameters.mode?.trim().to_string();
+                    if path.is_empty() || (mode != "overwrite" && mode != "append") {
+                        None
+                    } else {
+                        Some(PendingAction::EditFile {
+                            path,
+                            mode,
+                            content: item.parameters.content.unwrap_or_default(),
+                        })
+                    }
+                }
+                crate::parser::ActionKind::CreatePdf => {
+                    let path = item.parameters.path?.trim().to_string();
+                    if path.is_empty() {
+                        None
+                    } else {
+                        Some(PendingAction::CreatePdf {
+                            path,
+                            title: item.parameters.title.unwrap_or_default(),
+                            content: item.parameters.content.unwrap_or_default(),
+                        })
+                    }
+                }
+                crate::parser::ActionKind::RunCmd => {
+                    let command = item.parameters.command?.trim().to_string();
+                    if command.is_empty() {
+                        None
+                    } else {
+                        Some(PendingAction::ExecuteCommand { command })
+                    }
+                }
+            })
+            .collect()
     }
 
     fn selected_model_id(&self) -> String {
@@ -294,11 +662,6 @@ impl ChatApp {
             .find(|m| m.id == selected)
             .map(|m| !(m.gated || m.premium))
             .or(Some(false));
-    }
-
-    fn execution_json_block_regex() -> &'static Regex {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        RE.get_or_init(|| Regex::new(r"```json\s*(?P<json>\{[\s\S]*?\})\s*```").expect("valid regex"))
     }
 
     fn extract_tag_block<'a>(text: &'a str, open_tag: &str, close_tag: &str) -> Option<&'a str> {
@@ -344,137 +707,6 @@ impl ChatApp {
         }
 
         None
-    }
-
-    fn parse_json_actions_actions_only(message: &str) -> Option<Vec<PendingAction>> {
-        let captures = Self::execution_json_block_regex().captures(message)?;
-        let json = captures.name("json")?.as_str();
-        let value: serde_json::Value = match serde_json::from_str(json) {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!("Invalid JSON execution block from model");
-                return None;
-            }
-        };
-        let actions = value.get("actions")?.as_array()?;
-
-        let mut parsed = Vec::new();
-        for action_item in actions {
-            let action_name = action_item.get("action")?.as_str()?.trim().to_string();
-            let params = action_item
-                .get("parameters")
-                .and_then(|p| p.as_object())
-                .cloned()
-                .unwrap_or_default();
-
-            match action_name.as_str() {
-                "create_folder" => {
-                    let path = params.get("path")?.as_str()?.trim().to_string();
-                    if !path.is_empty() {
-                        parsed.push(PendingAction::CreateFolder { path });
-                    }
-                }
-                "create_file" => {
-                    let path = params.get("path")?.as_str()?.trim().to_string();
-                    let content = params
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if !path.is_empty() {
-                        parsed.push(PendingAction::WriteFile { path, content });
-                    }
-                }
-                "edit_file" => {
-                    let path = params.get("path")?.as_str()?.trim().to_string();
-                    let mode = params.get("mode")?.as_str()?.trim().to_string();
-                    let content = params
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if !path.is_empty() && (mode == "overwrite" || mode == "append") {
-                        parsed.push(PendingAction::EditFile {
-                            path,
-                            mode,
-                            content,
-                        });
-                    }
-                }
-                "create_pdf" => {
-                    let path = params.get("path")?.as_str()?.trim().to_string();
-                    let title = params
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let content = params
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if !path.is_empty() {
-                        parsed.push(PendingAction::CreatePdf {
-                            path,
-                            title,
-                            content,
-                        });
-                    }
-                }
-                "run_cmd" => {
-                    let command = params.get("command")?.as_str()?.trim().to_string();
-                    if !command.is_empty() {
-                        parsed.push(PendingAction::ExecuteCommand { command });
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        Some(parsed)
-    }
-
-    fn load_message_attachments(&self, message_id: &str) -> Vec<Attachment> {
-        if let Ok(guard) = self.db.lock() {
-            if let Some(database) = guard.as_ref() {
-                return database
-                    .load_attachments(message_id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|att| {
-                        let ext = std::path::Path::new(&att.filename)
-                            .extension()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or_default()
-                            .to_lowercase();
-                        let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp");
-                        Attachment {
-                            filename: att.filename,
-                            text: if is_image {
-                                None
-                            } else {
-                                Some(String::from_utf8_lossy(&att.data).to_string())
-                            },
-                            image_base64: if is_image {
-                                Some(general_purpose::STANDARD.encode(&att.data))
-                            } else {
-                                None
-                            },
-                            mime_type: att.mime_type,
-                            raw_bytes: att.data,
-                        }
-                    })
-                    .collect();
-            }
-        }
-        vec![]
-    }
-
-    fn strip_json_execution_block(message: &str) -> String {
-        let cleaned = Self::execution_json_block_regex()
-            .replace_all(message, "")
-            .to_string();
-        cleaned.trim().to_string()
     }
 
     fn resolve_action_path(&self, raw_path: &str) -> std::path::PathBuf {
@@ -593,23 +825,48 @@ impl ChatApp {
         let tx = self.event_tx.clone();
         let tid = terminal_id.to_string();
         self.tokio_rt.spawn(async move {
-            let out = crate::shell::execute_command(&command, &wd);
-            match out {
-                Ok(r) => {
-                    let _ = tx.send(AppEvent::TerminalFinished {
-                        terminal_id: tid,
-                        stdout: r.stdout,
-                        stderr: r.stderr,
-                        exit_code: r.exit_code,
-                    });
+            let executor = ActionExecutor::new(wd);
+            let action = AgentAction {
+                action: ActionKind::RunCmd,
+                parameters: CommandParams {
+                    path: None,
+                    content: None,
+                    mode: None,
+                    title: None,
+                    command: Some(command),
+                },
+            };
+            let outcome = executor.execute_action(action, true).await;
+            match outcome {
+                Ok(ExecutionStatus::Executed(report)) => {
+                    let _ = tx
+                        .send(AppEvent::TerminalFinished {
+                            terminal_id: tid,
+                            stdout: report.stdout,
+                            stderr: report.stderr,
+                            exit_code: report.exit_code,
+                        })
+                        .await;
+                }
+                Ok(ExecutionStatus::AwaitingApproval(_)) => {
+                    let _ = tx
+                        .send(AppEvent::TerminalFinished {
+                            terminal_id: tid,
+                            stdout: String::new(),
+                            stderr: "Command awaiting approval".to_string(),
+                            exit_code: -1,
+                        })
+                        .await;
                 }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::TerminalFinished {
-                        terminal_id: tid,
-                        stdout: String::new(),
-                        stderr: e.to_string(),
-                        exit_code: -1,
-                    });
+                    let _ = tx
+                        .send(AppEvent::TerminalFinished {
+                            terminal_id: tid,
+                            stdout: String::new(),
+                            stderr: e.to_string(),
+                            exit_code: -1,
+                        })
+                        .await;
                 }
             }
         });
@@ -636,39 +893,205 @@ impl ChatApp {
         if let Some((session_id, msg)) = to_save {
             self.save_message(&session_id, &msg);
         }
+        if let Some(i) = idx {
+            self.persist_session_snapshot_async(i);
+        }
+    }
+
+    fn spawn_save_message(&self, session_id: String, msg: Message) {
+        let db_path = self.db_path.clone();
+        let tx = self.event_tx.clone();
+        self.tokio_rt.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let db = Database::new(&db_path).map_err(|e| e.to_string())?;
+                let db_msg = DbMessage {
+                    id: msg.id.clone(),
+                    session_id,
+                    role: msg.role.as_str().to_string(),
+                    content: msg.content.clone(),
+                    created_at: msg.timestamp,
+                };
+                db.save_message(&db_msg).map_err(|e| e.to_string())?;
+
+                for att in &msg.attachments {
+                    let db_att = crate::db::DbAttachment {
+                        id: Uuid::new_v4().to_string(),
+                        message_id: msg.id.clone(),
+                        filename: att.filename.clone(),
+                        data: att.raw_bytes.clone(),
+                        mime_type: att.mime_type.clone(),
+                    };
+                    db.save_attachment(&db_att).map_err(|e| e.to_string())?;
+                }
+                Ok(())
+            })
+            .await;
+
+            if let Ok(Err(e)) = result {
+                let _ = tx.send(AppEvent::DbError(format!("Failed to save message: {e}"))).await;
+            } else if let Err(e) = result {
+                let _ = tx.send(AppEvent::DbError(format!("Failed to save message: {e}"))).await;
+            }
+        });
+    }
+
+    fn spawn_create_session(&self, session: Session) {
+        let db_path = self.db_path.clone();
+        let tx = self.event_tx.clone();
+        self.tokio_rt.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let db = Database::new(&db_path).map_err(|e| e.to_string())?;
+                let db_session = DbSession {
+                    id: session.id,
+                    name: session.name,
+                    created_at: Utc::now(),
+                };
+                db.create_session(&db_session).map_err(|e| e.to_string())
+            })
+            .await;
+
+            if let Ok(Err(e)) = result {
+                let _ = tx.send(AppEvent::DbError(format!("Failed to create DB session: {e}"))).await;
+            } else if let Err(e) = result {
+                let _ = tx.send(AppEvent::DbError(format!("Failed to create DB session: {e}"))).await;
+            }
+        });
+    }
+
+    fn spawn_delete_session(&self, session_id: String) {
+        let db_path = self.db_path.clone();
+        let tx = self.event_tx.clone();
+        self.tokio_rt.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let db = Database::new(&db_path).map_err(|e| e.to_string())?;
+                db.delete_session(&session_id).map_err(|e| e.to_string())
+            })
+            .await;
+
+            if let Ok(Err(e)) = result {
+                let _ = tx.send(AppEvent::DbError(format!("Failed to delete conversation: {e}"))).await;
+            } else if let Err(e) = result {
+                let _ = tx.send(AppEvent::DbError(format!("Failed to delete conversation: {e}"))).await;
+            }
+        });
+    }
+
+    fn spawn_save_snapshot(&self, snapshot: DbFileSnapshot) {
+        let db_path = self.db_path.clone();
+        let tx = self.event_tx.clone();
+        self.tokio_rt.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let db = Database::new(&db_path).map_err(|e| e.to_string())?;
+                db.save_file_snapshot(&snapshot).map_err(|e| e.to_string())
+            })
+            .await;
+            if let Ok(Err(e)) = result {
+                let _ = tx
+                    .send(AppEvent::DbError(format!("Failed to persist file snapshot: {e}")))
+                    .await;
+            } else if let Err(e) = result {
+                let _ = tx
+                    .send(AppEvent::DbError(format!("Failed to persist file snapshot: {e}")))
+                    .await;
+            }
+        });
+    }
+
+    fn spawn_refresh_snapshots(&self) {
+        let db_path = self.db_path.clone();
+        let tx = self.event_tx.clone();
+        self.tokio_rt.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || -> Result<Vec<DbFileSnapshot>, String> {
+                let db = Database::new(&db_path).map_err(|e| e.to_string())?;
+                db.list_file_snapshots(50).map_err(|e| e.to_string())
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshots)) => {
+                    let _ = tx
+                        .send(AppEvent::SnapshotsLoaded {
+                            snapshots,
+                            error: None,
+                        })
+                        .await;
+                }
+                Ok(Err(e)) => {
+                    let _ = tx
+                        .send(AppEvent::SnapshotsLoaded {
+                            snapshots: vec![],
+                            error: Some(e),
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(AppEvent::SnapshotsLoaded {
+                            snapshots: vec![],
+                            error: Some(e.to_string()),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn spawn_restore_snapshot(&self, snapshot_id: String, file_path: String, fallback: Vec<u8>) {
+        let db_path = self.db_path.clone();
+        let tx = self.event_tx.clone();
+        let file_path_for_write = file_path.clone();
+        self.tokio_rt.spawn(async move {
+            let result = tokio::task::spawn_blocking(move || -> Result<(), String> {
+                let db = Database::new(&db_path).map_err(|e| e.to_string())?;
+                let snapshot_data = db
+                    .get_file_snapshot(&snapshot_id)
+                    .map_err(|e| e.to_string())?
+                    .map(|s| s.content)
+                    .unwrap_or(fallback);
+                std::fs::write(std::path::Path::new(&file_path_for_write), snapshot_data)
+                    .map_err(|e| e.to_string())?;
+                Ok(())
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => {
+                    let _ = tx
+                        .send(AppEvent::SnapshotRestored {
+                            file_path,
+                            error: None,
+                        })
+                        .await;
+                }
+                Ok(Err(e)) => {
+                    let _ = tx
+                        .send(AppEvent::SnapshotRestored {
+                            file_path,
+                            error: Some(e),
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(AppEvent::SnapshotRestored {
+                            file_path,
+                            error: Some(e.to_string()),
+                        })
+                        .await;
+                }
+            }
+        });
     }
 
     pub fn new(cc: &eframe::CreationContext, rt: Arc<tokio::runtime::Runtime>) -> Self {
-        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let settings = load_settings();
+        let db_path = settings.db_path.clone();
         Self::apply_theme(&cc.egui_ctx, settings.dark_mode);
-
-        let db = match Database::new(&settings.db_path) {
-            Ok(d) => Some(d),
+        let storage = match Storage::new() {
+            Ok(s) => Some(s),
             Err(e) => {
-                eprintln!("DB error: {e}");
+                eprintln!("Storage init error: {e}");
                 None
             }
-        };
-        let db = Arc::new(Mutex::new(db));
-
-        let sessions = if let Ok(guard) = db.lock() {
-            if let Some(database) = guard.as_ref() {
-                database
-                    .list_sessions()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|s| Session {
-                        id: s.id,
-                        name: s.name,
-                        messages: vec![],
-                    })
-                    .collect()
-            } else {
-                vec![]
-            }
-        } else {
-            vec![]
         };
 
         let models = provider_models(settings.selected_provider.key());
@@ -681,7 +1104,7 @@ impl ChatApp {
             },
             settings,
             show_settings: false,
-            sessions,
+            sessions: vec![],
             current_session_idx: None,
             models,
             selected_model_idx: 0,
@@ -696,7 +1119,8 @@ impl ChatApp {
             event_rx,
             tokio_rt: rt,
             active_requests: HashMap::new(),
-            db,
+            db_path,
+            storage,
             pending_action: None,
             pending_actions_queue: VecDeque::new(),
             pending_action_session_idx: None,
@@ -741,6 +1165,7 @@ impl ChatApp {
             app.selected_model_idx = idx;
         }
 
+        app.spawn_initial_data_load();
         app.load_models_from_provider();
         app
     }
@@ -821,7 +1246,7 @@ impl ChatApp {
                 Ok(ids) => ids,
                 Err(_) => vec![],
             };
-            let _ = tx.send(AppEvent::ModelsLoaded(model_ids));
+            let _ = tx.send(AppEvent::ModelsLoaded(model_ids)).await;
         });
     }
 
@@ -885,8 +1310,22 @@ Do not fabricate directory listings, command outputs, or success messages.",
                     "disabled"
                 }
             );
-            let full_system_prompt = format!("{CORE_OS_SYSTEM_PROMPT}\n\n{system_prompt}");
-            api_messages.push(ChatMessage::with_cache_control("system", &full_system_prompt));
+            let telemetry_context =
+                collect_telemetry_cached(std::time::Duration::from_secs(2)).to_llm_system_context();
+            let api_key = self.settings.active_api_key();
+            let base_url = self.settings.active_base_url();
+            let query = self
+                .sessions
+                .get(session_idx)
+                .and_then(|s| {
+                    s.messages
+                        .iter()
+                        .rev()
+                        .find(|m| matches!(m.role, Role::User))
+                        .map(|m| m.content.clone())
+                })
+                .unwrap_or_default();
+            let working_dir = self.settings.working_directory.clone();
 
             if let Some(session) = self.sessions.get(session_idx) {
                 for msg in &session.messages {
@@ -918,29 +1357,50 @@ Do not fabricate directory listings, command outputs, or success messages.",
                 None
             };
 
-            let api_key = self.settings.active_api_key();
-            let base_url = self.settings.active_base_url();
             let event_tx = self.event_tx.clone();
             let req_id = request_id.clone();
             let model_id = model_id.clone();
 
             self.tokio_rt.spawn(async move {
+                let mut rag_context = "LOCAL REPOSITORY CONTEXT:\n- No relevant snippets found.".to_string();
+                if !api_key.is_empty() && !query.trim().is_empty() {
+                    let provider = OpenAIEmbeddingProvider {
+                        api_key: api_key.clone(),
+                        base_url: base_url.clone(),
+                        model: "text-embedding-3-small".to_string(),
+                    };
+                    let rag_cfg = RagConfig::with_workspace(working_dir, 1536);
+                    if let Ok(engine) = RagEngine::new(rag_cfg, provider).await {
+                        if let Ok(snippets) = engine.semantic_search(&query).await {
+                            rag_context = RagEngine::<OpenAIEmbeddingProvider>::format_repository_context(&snippets);
+                        }
+                    }
+                }
+
+                let full_system_prompt = format!(
+                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{rag_context}\n\n{system_prompt}"
+                );
+                api_messages.insert(0, ChatMessage::with_cache_control("system", &full_system_prompt));
                 let client = crate::api::OpenAIClient::new(&api_key, &base_url);
                 let req_id_clone = req_id.clone();
                 let tx_clone = event_tx.clone();
 
                 let result = client
                     .chat_completion(&model_id, api_messages, thinking_mode.as_ref(), move |chunk| {
-                        let _ = tx_clone.send(AppEvent::ChunkReceived(req_id_clone.clone(), chunk));
+                        if let Err(e) =
+                            tx_clone.try_send(AppEvent::ChunkReceived(req_id_clone.clone(), chunk))
+                        {
+                            eprintln!("Dropped stream chunk due to full event queue: {e}");
+                        }
                     })
                     .await;
 
                 match result {
                     Ok(_) => {
-                        let _ = event_tx.send(AppEvent::ResponseComplete(req_id));
+                        let _ = event_tx.send(AppEvent::ResponseComplete(req_id)).await;
                     }
                     Err(e) => {
-                        let _ = event_tx.send(AppEvent::ResponseError(req_id, e.to_string()));
+                        let _ = event_tx.send(AppEvent::ResponseError(req_id, e.to_string())).await;
                     }
                 }
             });
@@ -953,19 +1413,7 @@ Do not fabricate directory listings, command outputs, or success messages.",
         };
         let session_id = session.id.clone();
         let session_name = session.name.clone();
-        let db_err = if let Ok(guard) = self.db.lock() {
-            if let Some(database) = guard.as_ref() {
-                database.delete_session(&session_id).err().map(|e| e.to_string())
-            } else {
-                None
-            }
-        } else {
-            Some("Database lock poisoned".to_string())
-        };
-        if let Some(err) = db_err {
-            self.notify(format!("Failed to delete conversation: {err}"), NotificationKind::Error);
-            return;
-        }
+        self.spawn_delete_session(session_id);
 
         self.sessions.remove(idx);
         self.current_session_idx = match self.current_session_idx {
@@ -979,24 +1427,7 @@ Do not fabricate directory listings, command outputs, or success messages.",
 
     fn new_session(&mut self) {
         let session = Session::new("New Chat");
-        let db_session = DbSession {
-            id: session.id.clone(),
-            name: session.name.clone(),
-            created_at: Utc::now(),
-        };
-
-        let db_err = if let Ok(guard) = self.db.lock() {
-            if let Some(database) = guard.as_ref() {
-                database.create_session(&db_session).err().map(|e| e.to_string())
-            } else {
-                None
-            }
-        } else {
-            Some("Database lock poisoned".to_string())
-        };
-        if let Some(err) = db_err {
-            self.notify(format!("Failed to create DB session: {err}"), NotificationKind::Error);
-        }
+        self.spawn_create_session(session.clone());
 
         self.sessions.insert(0, session);
         self.current_session_idx = Some(0);
@@ -1008,92 +1439,11 @@ Do not fabricate directory listings, command outputs, or success messages.",
             return;
         };
         let session_id = session.id.clone();
-        let messages = if let Ok(guard) = self.db.lock() {
-            if let Some(database) = guard.as_ref() {
-                database.load_messages(&session_id).unwrap_or_default()
-            } else {
-                vec![]
-            }
-        } else {
-            vec![]
-        };
-
-        let mapped_messages: Vec<Message> = messages
-            .into_iter()
-            .map(|m| {
-                let message_id = m.id;
-                Message {
-                    id: message_id.clone(),
-                    role: match m.role.as_str() {
-                        "user" => Role::User,
-                        "assistant" => Role::Assistant,
-                        _ => Role::System,
-                    },
-                    content: m.content,
-                    attachments: self.load_message_attachments(&message_id),
-                    timestamp: m.created_at,
-                    is_streaming: false,
-                }
-            })
-            .collect();
-
-        if let Some(s) = self.sessions.get_mut(idx) {
-            s.messages = mapped_messages;
-        }
+        self.spawn_load_session_messages(idx, session_id);
     }
 
     fn save_message(&mut self, session_id: &str, msg: &Message) {
-        let db_msg = DbMessage {
-            id: msg.id.clone(),
-            session_id: session_id.to_string(),
-            role: msg.role.as_str().to_string(),
-            content: msg.content.clone(),
-            created_at: msg.timestamp,
-        };
-
-        let db_err = if let Ok(guard) = self.db.lock() {
-            if let Some(database) = guard.as_ref() {
-                database.save_message(&db_msg).err().map(|e| e.to_string())
-            } else {
-                None
-            }
-        } else {
-            Some("Database lock poisoned".to_string())
-        };
-        if let Some(err) = db_err {
-            self.notify(format!("Failed to save message: {err}"), NotificationKind::Error);
-        }
-
-        if msg.attachments.is_empty() {
-            return;
-        }
-
-        let attachment_err = if let Ok(guard) = self.db.lock() {
-            if let Some(database) = guard.as_ref() {
-                let mut failed: Option<String> = None;
-                for att in &msg.attachments {
-                    let db_att = crate::db::DbAttachment {
-                        id: Uuid::new_v4().to_string(),
-                        message_id: msg.id.clone(),
-                        filename: att.filename.clone(),
-                        data: att.raw_bytes.clone(),
-                        mime_type: att.mime_type.clone(),
-                    };
-                    if let Err(e) = database.save_attachment(&db_att) {
-                        failed = Some(e.to_string());
-                        break;
-                    }
-                }
-                failed
-            } else {
-                None
-            }
-        } else {
-            Some("Database lock poisoned".to_string())
-        };
-        if let Some(err) = attachment_err {
-            self.notify(format!("Failed to save attachments: {err}"), NotificationKind::Error);
-        }
+        self.spawn_save_message(session_id.to_string(), msg.clone());
     }
 
     fn save_snapshot_if_exists(&mut self, path: &str) {
@@ -1114,39 +1464,11 @@ Do not fabricate directory listings, command outputs, or success messages.",
             content,
             created_at: Utc::now(),
         };
-        let db_err = if let Ok(guard) = self.db.lock() {
-            if let Some(database) = guard.as_ref() {
-                database.save_file_snapshot(&snapshot).err().map(|e| e.to_string())
-            } else {
-                None
-            }
-        } else {
-            Some("Database lock poisoned".to_string())
-        };
-        if let Some(err) = db_err {
-            self.notify(format!("Failed to persist file snapshot: {err}"), NotificationKind::Error);
-        }
+        self.spawn_save_snapshot(snapshot);
     }
 
     fn refresh_snapshots(&mut self) {
-        let result = if let Ok(guard) = self.db.lock() {
-            if let Some(database) = guard.as_ref() {
-                database.list_file_snapshots(50)
-            } else {
-                Ok(vec![])
-            }
-        } else {
-            Err(anyhow::anyhow!("Database lock poisoned"))
-        };
-        match result {
-            Ok(list) => {
-                self.snapshots = list;
-            }
-            Err(e) => {
-                self.snapshots.clear();
-                self.notify(format!("Failed to load snapshots: {e}"), NotificationKind::Error);
-            }
-        }
+        self.spawn_refresh_snapshots();
     }
 
     fn read_text_file_for_view(path: &str) -> String {
@@ -1365,6 +1687,7 @@ Do not fabricate directory listings, command outputs, or success messages.",
             session.messages.push(user_msg);
         }
         self.input_text.clear();
+        self.persist_session_snapshot_async(session_idx);
 
         self.dispatch_agent_requests(session_idx);
     }
@@ -1384,15 +1707,43 @@ Do not fabricate directory listings, command outputs, or success messages.",
                 AppEvent::ResponseComplete(req_id) => {
                     if let Some(active) = self.active_requests.remove(&req_id) {
                         let mut to_save: Option<(String, Message)> = None;
+                        let mut parse_error_notification: Option<String> = None;
                         if let Some(session) = self.sessions.get_mut(active.session_idx) {
                             let session_id = session.id.clone();
                             if let Some(msg) = session.messages.iter_mut().find(|m| m.id == active.message_id) {
                                 msg.is_streaming = false;
-                                let parsed_actions = Self::parse_json_actions_actions_only(&msg.content);
-                                msg.content = Self::strip_json_execution_block(&msg.content);
+                                let parsed = crate::parser::parse_response(&msg.content);
+                                let mut rendered = String::new();
+                                if let Some(message) = parsed.message.as_deref() {
+                                    rendered.push_str(message);
+                                } else if !parsed.fallback_text.trim().is_empty() {
+                                    rendered.push_str(parsed.fallback_text.trim());
+                                }
+
+                                if !parsed.plan_items.is_empty() {
+                                    if !rendered.is_empty() {
+                                        rendered.push_str("\n\n");
+                                    }
+                                    rendered.push_str("PLAN:\n");
+                                    for item in &parsed.plan_items {
+                                        rendered.push_str("- [ ] ");
+                                        rendered.push_str(item);
+                                        rendered.push('\n');
+                                    }
+                                    rendered = rendered.trim_end().to_string();
+                                }
+
+                                if let Some(err) = parsed.json_parse_error.as_deref() {
+                                    parse_error_notification =
+                                        Some(format!("Execution block parse error: {err}"));
+                                }
+
+                                msg.content = rendered;
+
                                 if self.pending_action.is_none() {
-                                    if let Some(actions) = parsed_actions {
-                                        let mut iter = actions.into_iter();
+                                    let parsed_actions = Self::pending_actions_from_agent_actions(parsed.actions);
+                                    if !parsed_actions.is_empty() {
+                                        let mut iter = parsed_actions.into_iter();
                                         if let Some(action) = iter.next() {
                                             self.pending_action = Some(action);
                                             self.pending_action_session_idx = Some(active.session_idx);
@@ -1406,9 +1757,13 @@ Do not fabricate directory listings, command outputs, or success messages.",
                                 to_save = Some((session_id, msg.clone()));
                             }
                         }
+                        if let Some(error_text) = parse_error_notification {
+                            self.notify(error_text, NotificationKind::Error);
+                        }
                         if let Some((session_id, msg)) = to_save {
                             self.save_message(&session_id, &msg);
                         }
+                        self.persist_session_snapshot_async(active.session_idx);
                         self.activity_log.push(format!("{} finished response", active.agent_name));
                     }
                 }
@@ -1509,6 +1864,54 @@ Do not fabricate directory listings, command outputs, or success messages.",
                     if let Some(session_idx) = continue_session {
                         self.dispatch_agent_requests(session_idx);
                     }
+                }
+                AppEvent::InitialSessionsLoaded { sessions, error } => {
+                    if let Some(err) = error {
+                        self.notify(format!("DB load error: {err}"), NotificationKind::Error);
+                    } else {
+                        self.sessions = sessions;
+                        if !self.sessions.is_empty() {
+                            self.current_session_idx = Some(0);
+                            self.load_session_messages(0);
+                        }
+                    }
+                }
+                AppEvent::SessionMessagesLoaded { idx, messages, error } => {
+                    if let Some(err) = error {
+                        self.notify(format!("Failed to load messages: {err}"), NotificationKind::Error);
+                    } else if let Some(session) = self.sessions.get_mut(idx) {
+                        session.messages = messages;
+                    }
+                }
+                AppEvent::StoredSessionLoaded { session, error } => {
+                    if let Some(err) = error {
+                        self.activity_log.push(format!("Failed to load stored session: {err}"));
+                    } else if self.sessions.is_empty() {
+                        if let Some(stored) = session {
+                            self.sessions.push(stored);
+                            self.current_session_idx = Some(0);
+                            self.activity_log
+                                .push("Loaded latest chat session from local storage".to_string());
+                        }
+                    }
+                }
+                AppEvent::SnapshotsLoaded { snapshots, error } => {
+                    if let Some(err) = error {
+                        self.snapshots.clear();
+                        self.notify(format!("Failed to load snapshots: {err}"), NotificationKind::Error);
+                    } else {
+                        self.snapshots = snapshots;
+                    }
+                }
+                AppEvent::SnapshotRestored { file_path, error } => {
+                    if let Some(err) = error {
+                        self.notify(format!("Restore failed: {err}"), NotificationKind::Error);
+                    } else {
+                        self.notify(format!("Restored {}", file_path), NotificationKind::Info);
+                    }
+                }
+                AppEvent::DbError(err) => {
+                    self.notify(err, NotificationKind::Error);
                 }
             }
         }
@@ -1611,23 +2014,11 @@ Do not fabricate directory listings, command outputs, or success messages.",
                             ui.label(RichText::new(&snap.file_path).strong());
                             ui.label(snap.created_at.format("%Y-%m-%d %H:%M:%S UTC").to_string());
                             if ui.button("Restore this snapshot").clicked() {
-                                let snapshot_data = if let Ok(guard) = self.db.lock() {
-                                    if let Some(database) = guard.as_ref() {
-                                        database.get_file_snapshot(&snap.id).ok().flatten()
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                };
-                                let content_to_write = snapshot_data
-                                    .as_ref()
-                                    .map(|s| s.content.as_slice())
-                                    .unwrap_or(snap.content.as_slice());
-                                match std::fs::write(std::path::Path::new(&snap.file_path), content_to_write) {
-                                    Ok(_) => self.notify(format!("Restored {}", snap.file_path), NotificationKind::Info),
-                                    Err(e) => self.notify(format!("Restore failed: {e}"), NotificationKind::Error),
-                                }
+                                self.spawn_restore_snapshot(
+                                    snap.id.clone(),
+                                    snap.file_path.clone(),
+                                    snap.content.clone(),
+                                );
                             }
                         });
                     }
