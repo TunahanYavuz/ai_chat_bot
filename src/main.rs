@@ -7,6 +7,8 @@ mod setup;
 mod shell;
 mod telemetry;
 mod parser;
+mod rag_engine;
+mod executor;
 
 use std::sync::Arc;
 
