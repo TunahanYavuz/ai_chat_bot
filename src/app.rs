@@ -55,6 +55,8 @@ const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
 const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const WORKFLOW_STEP_DETAIL_MAX_CHARS: usize = 1200;
+const TIMEOUT_EXIT_CODE: i32 = 124;
+const TERMINAL_RUNNING_MARKER: &str = "[running...]\n";
 const QDRANT_URL: &str = "http://127.0.0.1:6334";
 const AUTONOMOUS_SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
 const AUTONOMOUS_WORKFLOW_PREFIX: &str = "[AUTONOMOUS CRON-SWARM]";
@@ -546,7 +548,22 @@ impl ChatApp {
         if trimmed.is_empty() {
             return None;
         }
-        let filename = if trimmed.lines().count() > 1 || trimmed.contains("fn ") {
+        let lines: Vec<&str> = trimmed.lines().collect();
+        let code_keyword_hits = ["fn ", "def ", "class ", "function ", "import ", "let ", "const "]
+            .iter()
+            .filter(|kw| trimmed.contains(**kw))
+            .count();
+        let punctuated_lines = lines
+            .iter()
+            .filter(|line| {
+                let l = line.trim();
+                l.ends_with(';') || l.ends_with('{') || l.ends_with('}')
+            })
+            .count();
+        let looks_like_code = trimmed.contains("```")
+            || code_keyword_hits >= 1
+            || (lines.len() >= 3 && punctuated_lines >= 2);
+        let filename = if trimmed.lines().count() > 1 || looks_like_code {
             "clipboard_code.txt".to_string()
         } else {
             "clipboard_text.txt".to_string()
@@ -1467,7 +1484,7 @@ impl ChatApp {
         self.terminals[idx]
             .output
             .push_str(&format!("$ {}\n", command));
-        self.terminals[idx].output.push_str("[running...]\n");
+        self.terminals[idx].output.push_str(TERMINAL_RUNNING_MARKER);
         let wd = self.settings.working_directory.clone();
         let tx = self.event_tx.clone();
         let tid = terminal_id.to_string();
@@ -3223,7 +3240,10 @@ impl ChatApp {
                     if let Some(term) = self.terminals.iter_mut().find(|t| t.id == terminal_id) {
                         term.running = false;
                         term.exit_code = Some(exit_code);
-                        term.output = term.output.replace("[running...]\n", "");
+                        if term.output.ends_with(TERMINAL_RUNNING_MARKER) {
+                            let len = term.output.len() - TERMINAL_RUNNING_MARKER.len();
+                            term.output.truncate(len);
+                        }
                         if !streamed && !stdout.trim().is_empty() {
                             term.output.push_str(&stdout);
                             if !stdout.ends_with('\n') {
@@ -3253,7 +3273,9 @@ impl ChatApp {
                                     result.push_str(&stderr);
                                     result.push_str("\n```");
                                 }
-                                if exit_code == 124 || stderr.to_ascii_lowercase().contains("[timeout]") {
+                                if exit_code == TIMEOUT_EXIT_CODE
+                                    || stderr.to_ascii_lowercase().contains("[timeout]")
+                                {
                                     result.push_str(
                                         "\n\n[Synthesizer hint]\nThe command timed out. Analyze partial output, identify the blocker, and propose the next safe autonomous step.",
                                     );

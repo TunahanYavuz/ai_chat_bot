@@ -17,6 +17,7 @@ const EMPTY_COMMAND_SUCCESS_MSG: &str = "[System: Command executed successfully 
 const SUPPORTED_DOCUMENT_FORMATS: [&str; 2] = ["pdf", "docx"];
 const TERMINAL_ACTION_TIMEOUT_SECS: u64 = 90;
 const FILE_ACTION_TIMEOUT_SECS: u64 = 15;
+const TIMEOUT_EXIT_CODE: i32 = 124;
 
 /// Execution status emitted by the action pipeline.
 #[derive(Debug, Clone)]
@@ -444,7 +445,7 @@ impl ActionExecutor {
                             "[timeout] command exceeded {}s: {}",
                             TERMINAL_ACTION_TIMEOUT_SECS, cmd
                         ),
-                        exit_code: 124,
+                        exit_code: TIMEOUT_EXIT_CODE,
                         timed_out: true,
                     });
                 }
@@ -513,14 +514,18 @@ impl ActionExecutor {
                 loop {
                     match reader.next_line().await {
                         Ok(Some(line)) => {
-                            let _ = stdout_tx.send((true, line.clone()));
+                            if let Err(e) = stdout_tx.send((true, line.clone())) {
+                                eprintln!("failed to send stdout chunk to terminal UI channel: {e}");
+                            }
                             output.push_str(&line);
                             output.push('\n');
                         }
                         Ok(None) => break,
                         Err(e) => {
                             let msg = format!("[stdout read error] {e}");
-                            let _ = stdout_tx.send((false, msg.clone()));
+                            if let Err(e) = stdout_tx.send((false, msg.clone())) {
+                                eprintln!("failed to send stdout read error to terminal UI channel: {e}");
+                            }
                             output.push_str(&msg);
                             output.push('\n');
                             break;
@@ -538,14 +543,18 @@ impl ActionExecutor {
                 loop {
                     match reader.next_line().await {
                         Ok(Some(line)) => {
-                            let _ = stderr_tx.send((false, line.clone()));
+                            if let Err(e) = stderr_tx.send((false, line.clone())) {
+                                eprintln!("failed to send stderr chunk to terminal UI channel: {e}");
+                            }
                             output.push_str(&line);
                             output.push('\n');
                         }
                         Ok(None) => break,
                         Err(e) => {
                             let msg = format!("[stderr read error] {e}");
-                            let _ = stderr_tx.send((false, msg.clone()));
+                            if let Err(e) = stderr_tx.send((false, msg.clone())) {
+                                eprintln!("failed to send stderr read error to terminal UI channel: {e}");
+                            }
                             output.push_str(&msg);
                             output.push('\n');
                             break;
@@ -572,7 +581,7 @@ impl ActionExecutor {
         let stderr = stderr_task.await.unwrap_or_default();
         let timed_out = status.1;
         let exit_code = if timed_out {
-            124
+            TIMEOUT_EXIT_CODE
         } else {
             status.0.code().unwrap_or(-1)
         };
@@ -694,9 +703,17 @@ impl ActionExecutor {
 
 fn should_skip_timeout_for_ui_app(cmd: &str) -> bool {
     let normalized = cmd.to_ascii_lowercase();
-    normalized.contains("ui.py")
-        || normalized.contains(" python ui.py")
-        || normalized.contains("python3 ui.py")
+    let ui_indicators = [
+        " ui.py",
+        "python ui.py",
+        "python3 ui.py",
+        "streamlit run",
+        "gradio",
+        "uvicorn",
+        "flask run",
+        "npm run dev",
+    ];
+    ui_indicators.iter().any(|pat| normalized.contains(pat))
 }
 
 async fn wait_for_child_with_optional_timeout(
