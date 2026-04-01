@@ -1,18 +1,16 @@
 use serde::Deserialize;
 
-const STRICT_TRANSLATION_AND_MAPPING_RULE: &str = r#"CRITICAL NLU & TRANSLATION RULE:
-The user will speak to you in Turkish. You must reply to them in Turkish in the 'MESSAGE:' section.
-HOWEVER, the underlying Operating System and JSON parser are STRICTLY ENGLISH. You act as a translator between the Turkish user and the Linux Unix terminal.
+const UNIVERSAL_NLU_DIRECTIVE: &str = r#"GLOBAL NLU PROTOCOL: The user may command you in ANY language (Turkish, Spanish, etc.). You must understand their intent and reply in their language in the 'MESSAGE:' block. HOWEVER, your internal reasoning and the JSON `EXECUTION_BLOCK` MUST remain strictly in English. Never translate OS commands (e.g., use `mkdir`, not `klasör_aç`) or JSON keys."#;
 
-INTENT MAPPING DICTIONARY:
-When the user asks to perform an action, you MUST map their intent to standard Linux commands and our strict JSON schema:
-- User intent: "klasör oluştur" (create folder) -> MUST map to: "run_cmd" with command "mkdir -p <name>"
-- User intent: "dosya oluştur" (create file) -> MUST map to: "create_file"
-- User intent: "dosya düzenle" (edit file) -> MUST map to: "edit_file"
-- User intent: "komut çalıştır" (run command) -> MUST map to: standard Linux Bash commands (e.g., ls, pwd, cargo, pip).
+const VISUAL_QA_PROTOCOL: &str = r#"VISUAL QA PROTOCOL:
+If the user provides image/screenshot context, perform visual QA triage before proposing actions:
+- Detect overlapping components, clipping, spacing regressions, and layout/flexbox breakpoints.
+- Detect unreadable text contrast and broken/garbled unicode icons or glyph fallback issues.
+- Report concrete UI defects in MESSAGE and produce only actionable, minimal execution steps."#;
 
-ABSOLUTE PROHIBITION:
-NEVER translate the JSON action keys (always use `create_file`, `edit_file`, `run_cmd`). NEVER translate Bash/Linux commands. Your `EXECUTION_BLOCK` must always contain valid, English-based machine instructions."#;
+const WEB_SYNTHESIS_PROTOCOL: &str = r#"WEB SYNTHESIS PROTOCOL:
+When WebResearcher is needed, the Router MUST schedule WebResearcher first and then schedule CodeArchitect to apply local code patches based on web findings.
+The orchestrator must treat WebResearcher output as dependency context for the subsequent CodeArchitect task."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRole {
@@ -112,7 +110,9 @@ PLAN:
 ```"#
             .to_string(),
     };
-    format!("{base}\n\n{STRICT_TRANSLATION_AND_MAPPING_RULE}")
+    format!(
+        "{base}\n\n{UNIVERSAL_NLU_DIRECTIVE}\n\n{VISUAL_QA_PROTOCOL}\n\n{WEB_SYNTHESIS_PROTOCOL}"
+    )
 }
 
 pub fn parse_router_plan(raw: &str) -> Vec<RoutedTask> {

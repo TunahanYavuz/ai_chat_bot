@@ -79,6 +79,7 @@ You can output the following actions inside the JSON array:
 - "create_file": Creates a new text-based file (.txt, .rs, .py, etc.). (Requires: 'path', 'content')
 - "edit_file": Appends or overwrites text in an existing file. (Requires: 'path', 'mode' [overwrite/append], 'content')
 - "create_pdf": Generates a PDF file. (Requires: 'path', 'title', 'content')
+- "generate_document": Generates a PDF or DOCX from markdown. (Requires: 'format' [pdf/docx], 'path', 'markdown_content')
 - "run_cmd": Executes a terminal command. (Requires: 'command')
 
 JSON SCHEMA OBLIGATION:
@@ -148,10 +149,6 @@ pub enum AppEvent {
         request_id: String,
         title: String,
         details: String,
-    },
-    PolicyBlocked {
-        request_id: String,
-        reason: String,
     },
     ExecutionApprovalRequested {
         request_id: String,
@@ -1127,6 +1124,7 @@ impl ChatApp {
                         })
                     }
                 }
+                crate::parser::ActionKind::GenerateDocument => None,
                 crate::parser::ActionKind::RunCmd => {
                     let command = item.parameters.command?.trim().to_string();
                     if command.is_empty() {
@@ -1343,6 +1341,8 @@ impl ChatApp {
                     content: None,
                     mode: None,
                     title: None,
+                    format: None,
+                    markdown_content: None,
                     command: Some(command),
                     query: None,
                     url: None,
@@ -2859,12 +2859,6 @@ impl ChatApp {
                         self.begin_workflow_step(&request_id, title, details);
                     }
                 }
-                AppEvent::PolicyBlocked { request_id, reason } => {
-                    if self.active_requests.contains_key(&request_id) {
-                        self.policy_block_dialog = Some(reason.clone());
-                        self.notify(reason, NotificationKind::Error);
-                    }
-                }
                 AppEvent::ExecutionApprovalRequested {
                     request_id,
                     approval_id,
@@ -3624,6 +3618,34 @@ impl eframe::App for ChatApp {
                             ui.separator();
                             ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
                                 ui.monospace(content);
+                            });
+                        }
+                        ActionKind::GenerateDocument => {
+                            let format = pending
+                                .request
+                                .action
+                                .parameters
+                                .format
+                                .as_deref()
+                                .unwrap_or("unknown");
+                            let path = pending
+                                .request
+                                .action
+                                .parameters
+                                .path
+                                .as_deref()
+                                .unwrap_or("");
+                            let markdown = pending
+                                .request
+                                .action
+                                .parameters
+                                .markdown_content
+                                .as_deref()
+                                .unwrap_or("");
+                            ui.label(format!("Generate document ({format}): {path}"));
+                            ui.separator();
+                            ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                                ui.monospace(markdown);
                             });
                         }
                         _ => {

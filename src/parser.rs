@@ -37,6 +37,7 @@ pub enum ActionKind {
     CreateFile,
     EditFile,
     CreatePdf,
+    GenerateDocument,
     RunCmd,
     SearchWeb,
     ReadUrl,
@@ -50,6 +51,8 @@ pub struct CommandParams {
     pub content: Option<String>,
     pub mode: Option<String>,
     pub title: Option<String>,
+    pub format: Option<String>,
+    pub markdown_content: Option<String>,
     pub command: Option<String>,
     pub query: Option<String>,
     pub url: Option<String>,
@@ -87,7 +90,7 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
 }
 
 pub fn parser_self_correction_feedback() -> &'static str {
-    "[System Error]: Action parser failed. You outputted an invalid key. Remember, you must strictly use valid action keys like 'create_file', 'edit_file', 'run_cmd', 'search_web', or 'read_url'. Please correct your JSON and try again."
+    "[System Error]: Action parser failed. You outputted an invalid key. Remember, you must strictly use valid action keys like 'create_file', 'edit_file', 'generate_document', 'run_cmd', 'search_web', or 'read_url'. Please correct your JSON and try again."
 }
 
 fn extract_message_and_plan(text: &str) -> (Option<String>, Vec<String>) {
