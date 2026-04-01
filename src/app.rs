@@ -39,6 +39,7 @@ const CUSTOM_MODEL_INPUT_RESERVED_WIDTH: f32 = 132.0;
 const DELETE_CHAT_BUTTON_WIDTH: f32 = 36.0;
 const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
 const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// Prepended as the first system prompt for API requests so responses include
 /// a user-facing message plus a machine-readable ```json ... ``` execution block.
 const CORE_OS_SYSTEM_PROMPT: &str = r#"You are 'CoreOS', an advanced local File System and Command Line Interface (CLI) Agent. Your purpose is to assist the user by generating precise, executable commands while maintaining a helpful, conversational tone.
@@ -1081,7 +1082,7 @@ impl ChatApp {
     }
 
     pub fn new(cc: &eframe::CreationContext, rt: Arc<tokio::runtime::Runtime>) -> Self {
-        let (event_tx, event_rx) = tokio::sync::mpsc::channel(1024);
+        let (event_tx, event_rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let settings = load_settings();
         let db_path = settings.db_path.clone();
         Self::apply_theme(&cc.egui_ctx, settings.dark_mode);
@@ -1386,7 +1387,11 @@ Do not fabricate directory listings, command outputs, or success messages.",
 
                 let result = client
                     .chat_completion(&model_id, api_messages, thinking_mode.as_ref(), move |chunk| {
-                        let _ = tx_clone.blocking_send(AppEvent::ChunkReceived(req_id_clone.clone(), chunk));
+                        if let Err(e) =
+                            tx_clone.try_send(AppEvent::ChunkReceived(req_id_clone.clone(), chunk))
+                        {
+                            eprintln!("Dropped stream chunk due to full event queue: {e}");
+                        }
                     })
                     .await;
 
