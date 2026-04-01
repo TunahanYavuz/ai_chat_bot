@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::collections::HashMap;
 
 pub const DEFAULT_MODEL_ID: &str = "gpt-4o";
+const OLD_HUGGINGFACE_BASE_URL: &str = "https://api-inference.huggingface.co/v1";
 
 // ─── API Provider ─────────────────────────────────────────────────────────────
 
@@ -49,7 +50,7 @@ impl ApiProvider {
             Self::OpenAI => "https://api.openai.com/v1",
             Self::Nvidia => "https://integrate.api.nvidia.com/v1",
             Self::OpenRouter => "https://openrouter.ai/api/v1",
-            Self::HuggingFace => "https://api-inference.huggingface.co/v1",
+            Self::HuggingFace => "https://router.huggingface.co/v1",
             Self::Custom => "https://",
         }
     }
@@ -268,7 +269,13 @@ pub fn load_settings() -> Settings {
     let path = config_path();
     if path.exists() {
         if let Ok(content) = std::fs::read_to_string(&path) {
-            if let Ok(s) = serde_json::from_str(&content) {
+            if let Ok(mut s) = serde_json::from_str::<Settings>(&content) {
+                // Migrate deprecated Hugging Face endpoint to the new router endpoint.
+                if let Some(cfg) = s.provider_configs.get_mut(ApiProvider::HuggingFace.key()) {
+                    if cfg.base_url.trim_end_matches('/') == OLD_HUGGINGFACE_BASE_URL {
+                        cfg.base_url = ApiProvider::HuggingFace.default_base_url().to_string();
+                    }
+                }
                 return s;
             }
         }

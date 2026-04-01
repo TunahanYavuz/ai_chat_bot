@@ -11,15 +11,16 @@ use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
 use crate::setup::SetupWizard;
 
-const BURGUNDY: Color32 = Color32::from_rgb(114, 47, 55);
-const BURGUNDY_LIGHT: Color32 = Color32::from_rgb(140, 65, 75);
-const BURGUNDY_DARK: Color32 = Color32::from_rgb(80, 30, 38);
-const SKY_BLUE: Color32 = Color32::from_rgb(135, 206, 235);
-const SKY_BLUE_DARK: Color32 = Color32::from_rgb(100, 170, 200);
-const GOLD: Color32 = Color32::from_rgb(255, 215, 0);
-const GOLD_DARK: Color32 = Color32::from_rgb(220, 180, 0);
+const BURGUNDY: Color32 = Color32::from_rgb(26, 35, 50);
+const BURGUNDY_LIGHT: Color32 = Color32::from_rgb(45, 58, 82);
+const BURGUNDY_DARK: Color32 = Color32::from_rgb(17, 24, 37);
+const SKY_BLUE: Color32 = Color32::from_rgb(176, 226, 255);
+const SKY_BLUE_DARK: Color32 = Color32::from_rgb(86, 154, 214);
+const GOLD: Color32 = Color32::from_rgb(255, 208, 92);
+const GOLD_DARK: Color32 = Color32::from_rgb(214, 163, 50);
 const WHITE: Color32 = Color32::WHITE;
 const DARK_TEXT: Color32 = Color32::from_rgb(20, 10, 12);
+const CUSTOM_MODEL_INPUT_RESERVED_WIDTH: f32 = 132.0;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -127,6 +128,7 @@ pub struct ChatApp {
     models: Vec<ModelInfo>,
     selected_model_idx: usize,
     remote_models: Vec<String>,
+    custom_model_id: String,
     selected_thinking_mode: ThinkingMode,
 
     input_text: String,
@@ -139,6 +141,7 @@ pub struct ChatApp {
 
     db: Arc<Mutex<Option<Database>>>,
     pending_action: Option<PendingAction>,
+    pending_action_session_idx: Option<usize>,
 
     markdown_cache: CommonMarkCache,
     notifications: Vec<Notification>,
@@ -151,6 +154,83 @@ pub struct ChatApp {
 }
 
 impl ChatApp {
+    fn extract_tag_block<'a>(text: &'a str, open_tag: &str, close_tag: &str) -> Option<&'a str> {
+        let start = text.find(open_tag)?;
+        let content_start = start + open_tag.len();
+        let end_rel = text[content_start..].find(close_tag)?;
+        let end = content_start + end_rel;
+        Some(&text[content_start..end])
+    }
+
+    fn parse_pending_action(message: &str) -> Option<PendingAction> {
+        let trimmed = message.trim();
+
+        if let Some(start) = trimmed.find("<write_file") {
+            let open_end = trimmed[start..].find('>')?;
+            let open_tag = &trimmed[start..start + open_end + 1];
+            let path_key = "path=\"";
+            let path_start = open_tag.find(path_key)? + path_key.len();
+            let path_rest = &open_tag[path_start..];
+            let path_end = path_rest.find('"')?;
+            let path = path_rest[..path_end].trim();
+            if path.is_empty() {
+                return None;
+            }
+            let content_start = start + open_end + 1;
+            let end_rel = trimmed[content_start..].find("</write_file>")?;
+            let end = content_start + end_rel;
+            let content = trimmed[content_start..end].to_string();
+            return Some(PendingAction::WriteFile {
+                path: path.to_string(),
+                content,
+            });
+        }
+
+        if let Some(command_block) =
+            Self::extract_tag_block(trimmed, "<execute_command>", "</execute_command>")
+        {
+            let command = command_block.trim().to_string();
+            if command.is_empty() {
+                return None;
+            }
+            return Some(PendingAction::ExecuteCommand { command });
+        }
+
+        None
+    }
+
+    fn resolve_action_path(&self, raw_path: &str) -> std::path::PathBuf {
+        let path = std::path::Path::new(raw_path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::path::Path::new(&self.settings.working_directory).join(path)
+        }
+    }
+
+    fn append_system_message(&mut self, session_idx: Option<usize>, content: String) {
+        let idx = session_idx.or(self.current_session_idx);
+        let mut to_save: Option<(String, Message)> = None;
+        if let Some(i) = idx {
+            if let Some(session) = self.sessions.get_mut(i) {
+                let msg = Message {
+                    id: Uuid::new_v4().to_string(),
+                    role: Role::System,
+                    content,
+                    attachments: vec![],
+                    timestamp: Utc::now(),
+                    is_streaming: false,
+                };
+                let session_id = session.id.clone();
+                session.messages.push(msg.clone());
+                to_save = Some((session_id, msg));
+            }
+        }
+        if let Some((session_id, msg)) = to_save {
+            self.save_message(&session_id, &msg);
+        }
+    }
+
     pub fn new(cc: &eframe::CreationContext, rt: Arc<tokio::runtime::Runtime>) -> Self {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let settings = load_settings();
@@ -185,6 +265,7 @@ impl ChatApp {
         };
 
         let models = provider_models(settings.selected_provider.key());
+        let custom_model_id = settings.default_model.clone();
         let mut app = Self {
             setup_wizard: if settings.setup_complete {
                 None
@@ -198,6 +279,7 @@ impl ChatApp {
             models,
             selected_model_idx: 0,
             remote_models: vec![],
+            custom_model_id,
             selected_thinking_mode: ThinkingMode::Auto,
             input_text: String::new(),
             pending_attachments: vec![],
@@ -207,6 +289,7 @@ impl ChatApp {
             active_requests: HashMap::new(),
             db,
             pending_action: None,
+            pending_action_session_idx: None,
             markdown_cache: CommonMarkCache::default(),
             notifications: vec![],
             activity_log: vec!["App started".to_string()],
@@ -292,6 +375,11 @@ impl ChatApp {
             self.selected_model_idx = idx;
         } else {
             self.selected_model_idx = 0;
+        }
+        if self.custom_model_id.trim().is_empty() {
+            if let Some(model) = self.current_model() {
+                self.custom_model_id = model.id.clone();
+            }
         }
 
         let api_key = self.settings.active_api_key();
@@ -487,10 +575,13 @@ impl ChatApp {
         }
         self.input_text.clear();
 
-        let model_id = self
-            .current_model()
-            .map(|m| m.id.clone())
-            .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+        let model_id = if self.custom_model_id.trim().is_empty() {
+            self.current_model()
+                .map(|m| m.id.clone())
+                .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string())
+        } else {
+            self.custom_model_id.trim().to_string()
+        };
 
         if !self.agents.iter().any(|a| a.enabled) {
             self.notify("Enable at least one agent", NotificationKind::Error);
@@ -529,7 +620,11 @@ impl ChatApp {
 
             let mut api_messages: Vec<ChatMessage> = vec![];
             let system_prompt = format!(
-                "You are agent '{}'. {} Working directory: {}. Shell execution: {}.",
+                "You are agent '{}'. {} Working directory: {}. Shell execution: {}. \
+Never claim file writes or shell commands succeeded unless they actually ran with user approval. \
+If user asks to create/edit a file, respond ONLY with <write_file path=\"relative/or/absolute/path\">FILE_CONTENT</write_file>. \
+If user asks to run a command and shell execution is enabled, respond ONLY with <execute_command>THE_COMMAND</execute_command>. \
+Do not fabricate directory listings, command outputs, or success messages.",
                 agent_name,
                 agent_prompt,
                 self.settings.working_directory,
@@ -619,6 +714,12 @@ impl ChatApp {
                             let session_id = session.id.clone();
                             if let Some(msg) = session.messages.iter_mut().find(|m| m.id == active.message_id) {
                                 msg.is_streaming = false;
+                                if self.pending_action.is_none() {
+                                    if let Some(action) = Self::parse_pending_action(&msg.content) {
+                                        self.pending_action = Some(action);
+                                        self.pending_action_session_idx = Some(active.session_idx);
+                                    }
+                                }
                                 to_save = Some((session_id, msg.clone()));
                             }
                         }
@@ -888,28 +989,76 @@ impl eframe::App for ChatApp {
                 });
 
             if approved {
+                let action_session_idx = self.pending_action_session_idx;
                 match &action {
                     PendingAction::WriteFile { path, content } => {
-                        self.save_snapshot_if_exists(path);
-                        if let Err(e) = crate::files::write_text_file(std::path::Path::new(path), content) {
+                        let full_path = self.resolve_action_path(path);
+                        let full_path_str = full_path.to_string_lossy().to_string();
+                        self.save_snapshot_if_exists(&full_path_str);
+                        if let Err(e) = crate::files::write_text_file(&full_path, content) {
                             self.notify(format!("Write failed: {e}"), NotificationKind::Error);
+                            self.append_system_message(
+                                action_session_idx,
+                                format!("❌ File write failed for `{}`: {}", full_path.display(), e),
+                            );
                         } else {
-                            self.notify("File written", NotificationKind::Info);
+                            self.notify(format!("File written: {}", full_path.display()), NotificationKind::Info);
+                            self.append_system_message(
+                                action_session_idx,
+                                format!("✅ File written (approved): `{}`", full_path.display()),
+                            );
                             self.refresh_snapshots();
                         }
                     }
                     PendingAction::ExecuteCommand { command } => {
-                        let wd = self.settings.working_directory.clone();
-                        match crate::shell::execute_command(command, &wd) {
-                            Ok(out) => self.notify(format!("Command exited {}", out.exit_code), NotificationKind::Info),
-                            Err(e) => self.notify(format!("Command error: {e}"), NotificationKind::Error),
+                        if !self.settings.shell_execution_enabled {
+                            self.notify("Shell execution is disabled", NotificationKind::Error);
+                            self.append_system_message(
+                                action_session_idx,
+                                "❌ Command not executed: shell execution is disabled in settings.".to_string(),
+                            );
+                        } else {
+                            let wd = self.settings.working_directory.clone();
+                            match crate::shell::execute_command(command, &wd) {
+                                Ok(out) => {
+                                    self.notify(format!("Command exited {}", out.exit_code), NotificationKind::Info);
+                                    let mut result = format!(
+                                        "✅ Command executed (approved)\nCommand: `{}`\nWorking directory: `{}`\nExit code: {}",
+                                        command, wd, out.exit_code
+                                    );
+                                    if !out.stdout.trim().is_empty() {
+                                        result.push_str("\n\nstdout:\n````text\n");
+                                        result.push_str(&out.stdout);
+                                        result.push_str("\n````");
+                                    }
+                                    if !out.stderr.trim().is_empty() {
+                                        result.push_str("\n\nstderr:\n````text\n");
+                                        result.push_str(&out.stderr);
+                                        result.push_str("\n````");
+                                    }
+                                    self.append_system_message(action_session_idx, result);
+                                }
+                                Err(e) => {
+                                    self.notify(format!("Command error: {e}"), NotificationKind::Error);
+                                    self.append_system_message(
+                                        action_session_idx,
+                                        format!("❌ Command execution failed for `{}`: {}", command, e),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
                 self.pending_action = None;
+                self.pending_action_session_idx = None;
             }
             if rejected {
+                self.append_system_message(
+                    self.pending_action_session_idx,
+                    "❌ Action rejected by user. No file write or command execution was performed.".to_string(),
+                );
                 self.pending_action = None;
+                self.pending_action_session_idx = None;
             }
         }
 
@@ -962,10 +1111,13 @@ impl eframe::App for ChatApp {
                                 &self.settings.get_provider_api_key(&selected_provider),
                                 &self.settings.get_provider_base_url(&selected_provider),
                             );
-                            self.settings.default_model = self
-                                .current_model()
-                                .map(|m| m.id.clone())
-                                .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+                            self.settings.default_model = self.custom_model_id.trim().to_string();
+                            if self.settings.default_model.is_empty() {
+                                self.settings.default_model = self
+                                    .current_model()
+                                    .map(|m| m.id.clone())
+                                    .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+                            }
                             if let Err(e) = save_settings(&self.settings) {
                                 self.notify(format!("Failed to save settings: {e}"), NotificationKind::Error);
                             } else {
@@ -1051,6 +1203,42 @@ impl eframe::App for ChatApp {
                             }
                         }
                     });
+                ui.label(RichText::new("Custom model ID").small().color(DARK_TEXT));
+                ui.horizontal(|ui| {
+                    ui.add(
+                        TextEdit::singleline(&mut self.custom_model_id)
+                            .desired_width(ui.available_width() - CUSTOM_MODEL_INPUT_RESERVED_WIDTH)
+                            .hint_text("e.g. gpt-4o, meta-llama/Llama-3.1-8B-Instruct"),
+                    );
+                    if ui.button("Use").clicked() {
+                        if self.custom_model_id.trim().is_empty() {
+                            self.custom_model_id = self
+                                .current_model()
+                                .map(|m| m.id.clone())
+                                .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+                        }
+                        self.settings.default_model = self.custom_model_id.trim().to_string();
+                        let _ = save_settings(&self.settings);
+                    }
+                    if ui.button("From list").clicked() {
+                        self.custom_model_id.clear();
+                        self.settings.default_model = self
+                            .current_model()
+                            .map(|m| m.id.clone())
+                            .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+                        let _ = save_settings(&self.settings);
+                    }
+                });
+                if !self.remote_models.is_empty() {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Quick pick:").small().color(DARK_TEXT));
+                        for id in self.remote_models.iter().take(8) {
+                            if ui.small_button(id).clicked() {
+                                self.custom_model_id = id.clone();
+                            }
+                        }
+                    });
+                }
 
                 let supports_thinking = self.current_model().map(|m| m.supports_thinking()).unwrap_or(false);
                 if supports_thinking {
