@@ -1146,12 +1146,15 @@ Do not fabricate directory listings, command outputs, or success messages.",
                 "rs" => matches!(
                     w.as_str(),
                     "fn" | "let" | "mut" | "pub" | "impl" | "struct" | "enum" | "match" | "if"
-                        | "else" | "for" | "while" | "use" | "mod" | "return"
+                        | "else" | "for" | "while" | "use" | "mod" | "return" | "const"
+                        | "static" | "trait" | "type" | "async" | "await" | "unsafe" | "where"
                 ),
                 "py" => matches!(
                     w.as_str(),
                     "def" | "class" | "if" | "elif" | "else" | "for" | "while" | "import" | "from"
-                        | "return" | "with" | "as" | "try" | "except" | "lambda"
+                        | "return" | "with" | "as" | "try" | "except" | "lambda" | "async"
+                        | "await" | "yield" | "finally" | "raise" | "assert" | "pass"
+                        | "break" | "continue" | "global" | "nonlocal" | "and" | "or" | "not"
                 ),
                 "md" => w.starts_with('#') || w == "```",
                 _ => false,
@@ -1198,7 +1201,15 @@ Do not fabricate directory listings, command outputs, or success messages.",
                     }
                     if let Some(quote) = in_string {
                         word.push(ch);
-                        if ch == quote {
+                        let mut escaped = false;
+                        for s in word.chars().rev().skip(1) {
+                            if s == '\\' {
+                                escaped = !escaped;
+                            } else {
+                                break;
+                            }
+                        }
+                        if ch == quote && !escaped {
                             job.append(
                                 &word,
                                 0.0,
@@ -1259,7 +1270,15 @@ Do not fabricate directory listings, command outputs, or success messages.",
                 }
                 if let Some(quote) = in_string {
                     word.push(ch);
-                    if ch == quote {
+                    let mut escaped = false;
+                    for s in word.chars().rev().skip(1) {
+                        if s == '\\' {
+                            escaped = !escaped;
+                        } else {
+                            break;
+                        }
+                    }
+                    if ch == quote && !escaped {
                         job.append(
                             &word,
                             0.0,
@@ -1318,7 +1337,13 @@ Do not fabricate directory listings, command outputs, or success messages.",
                 self.ensure_changed_file_tracked(path.clone());
                 self.notify(format!("Saved {}", path), NotificationKind::Info);
             }
-            Err(e) => self.notify(format!("Save failed for {}: {}", path, e), NotificationKind::Error),
+            Err(e) => self.notify(
+                format!(
+                    "Save failed for {}: {}. Check file permissions or path validity.",
+                    path, e
+                ),
+                NotificationKind::Error,
+            ),
         }
     }
 
