@@ -1,69 +1,12 @@
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ThinkingMode {
-    Low,
-    Medium,
-    High,
-}
-
-impl ThinkingMode {
-    pub fn as_reasoning_effort(&self) -> Option<&'static str> {
-        match self {
-            ThinkingMode::Low => Some("low"),
-            ThinkingMode::Medium => Some("medium"),
-            ThinkingMode::High => Some("high"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReasoningCapability {
-    None,
-    Binary,
-    Tiered,
-}
-
-pub fn get_model_capability(model_name: &str) -> ReasoningCapability {
-    let m = model_name.trim().to_lowercase();
-    if m.is_empty() {
-        return ReasoningCapability::None;
-    }
-
-    if m.starts_with("o1")
-        || m.starts_with("o3")
-        || m.contains("/o1")
-        || m.contains("/o3")
-        || m.contains("-o1")
-        || m.contains("-o3")
-    {
-        return ReasoningCapability::Tiered;
-    }
-
-    if m.contains("deepseek-reasoner")
-        || m.contains("deepseek-r1")
-        || m.contains("qwen-reasoner")
-        || m.contains("qwq")
-    {
-        return ReasoningCapability::Binary;
-    }
-
-    ReasoningCapability::None
-}
+use crate::models::{ReasoningCapability, ThinkingMode};
 
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub id: String,
     pub name: String,
-    pub thinking_modes: Vec<ThinkingMode>,
-}
-
-impl ModelInfo {
-    pub fn supports_thinking(&self) -> bool {
-        !self.thinking_modes.is_empty()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +20,6 @@ pub fn builtin_models() -> Vec<ModelInfo> {
     vec![ModelInfo {
         id: "gpt-4o".to_string(),
         name: "gpt-4o".to_string(),
-        thinking_modes: vec![],
     }]
 }
 
@@ -287,8 +229,7 @@ impl OpenAIClient {
             messages: normalized_messages,
             reasoning_effort: if supports_reasoning_effort {
                 tiered_reasoning_level
-                    .and_then(|m| m.as_reasoning_effort())
-                    .map(str::to_string)
+                    .map(|m| m.as_reasoning_effort().to_string())
             } else {
                 None
             },

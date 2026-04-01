@@ -9,18 +9,22 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::api::{
-    builtin_models, get_model_capability, provider_models, ChatMessage, ModelInfo,
-    ReasoningCapability, RemoteModelInfo, ThinkingMode,
+    builtin_models, provider_models, ChatMessage, ModelInfo, RemoteModelInfo,
 };
 use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT_MODEL_ID};
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
 use crate::executor::{ActionExecutor, ExecutionPolicy, ExecutionStatus};
+use crate::models::{
+    get_model_capability, reasoning_config_for_model, ModelReasoningConfig, ReasoningCapability,
+    ThinkingMode,
+};
 use crate::parser::{ActionKind, AgentAction, CommandParams};
 use crate::rag_engine::{EmbeddingProvider, RagConfig, RagEngine};
 use crate::setup::SetupWizard;
 use crate::storage::{ChatSession, Storage, StoredMessage, StoredRole};
 use crate::swarm::{get_system_prompt, parse_router_plan, AgentRole, RoutedTask};
 use crate::telemetry::collect_telemetry_cached;
+use crate::watcher::run_workspace_watcher;
 
 const BG_PRIMARY: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
 const BG_SURFACE: Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);
@@ -39,11 +43,14 @@ const GOLD_DARK: Color32 = Color32::from_rgb(0x7A, 0x7A, 0x7A);
 const WHITE: Color32 = TEXT_PRIMARY;
 const DARK_TEXT: Color32 = TEXT_DARK;
 const LIGHT_TEXT: Color32 = TEXT_PRIMARY;
+const STATUS_SUCCESS: Color32 = Color32::from_rgb(0x66, 0xBB, 0x6A);
+const STATUS_ERROR: Color32 = Color32::from_rgb(0xEF, 0x53, 0x50);
 const CUSTOM_MODEL_INPUT_RESERVED_WIDTH: f32 = 132.0;
 const DELETE_CHAT_BUTTON_WIDTH: f32 = 36.0;
 const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
 const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
+const WORKFLOW_STEP_DETAIL_MAX_CHARS: usize = 1200;
 /// Prepended as the first system prompt for API requests so responses include
 /// a user-facing message plus a machine-readable ```json ... ``` execution block.
 const CORE_OS_SYSTEM_PROMPT: &str = r#"You are 'CoreOS', an advanced local File System and Command Line Interface (CLI) Agent. Your purpose is to assist the user by generating precise, executable commands while maintaining a helpful, conversational tone.
@@ -124,9 +131,23 @@ pub enum AppEvent {
         request_id: String,
         status: String,
     },
+    SwarmWorkflowStep {
+        request_id: String,
+        title: String,
+        details: String,
+    },
     PolicyBlocked {
         request_id: String,
         reason: String,
+    },
+    WorkspaceTreeLoaded {
+        root: crate::storage::FileNode,
+        error: Option<String>,
+    },
+    WorkspaceFileLoaded {
+        path: String,
+        content: String,
+        error: Option<String>,
     },
 }
 
@@ -258,6 +279,26 @@ struct ActiveRequest {
     agent_name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkflowStepStatus {
+    Running,
+    Success,
+    Failed,
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowStep {
+    id: String,
+    title: String,
+    details: String,
+    status: WorkflowStepStatus,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspaceNodeUiState {
+    expanded: bool,
+}
+
 #[derive(Clone)]
 struct OpenAIEmbeddingProvider {
     api_key: String,
@@ -357,21 +398,367 @@ pub struct ChatApp {
     show_left_sidebar: bool,
     show_activity_panel: bool,
     swarm_status: String,
+    swarm_workflow: Vec<WorkflowStep>,
+    workflow_expanded: HashMap<String, bool>,
+    workflow_request_id: Option<String>,
+    workspace_tree: Option<crate::storage::FileNode>,
+    workspace_node_state: HashMap<String, WorkspaceNodeUiState>,
+    workspace_refresh_tx: tokio::sync::mpsc::Sender<()>,
+    workspace_refresh_rx: tokio::sync::mpsc::Receiver<()>,
+    workspace_watcher_task: Option<tokio::task::JoinHandle<()>>,
     policy_block_dialog: Option<String>,
 }
 
 impl ChatApp {
-    fn clean_copy_text(content: &str) -> String {
-        if let Some(plan_idx) = content.find("PLAN:") {
-            let before = &content[..plan_idx];
-            let plan_section = &content[plan_idx..];
-            if let Some(json_idx) = plan_section.find("```json") {
-                let cleaned_plan = &plan_section[..json_idx];
-                let merged = format!("{}{}", before, cleaned_plan);
-                return merged.trim().to_string();
+    fn request_workspace_refresh(&self) {
+        let _ = self.workspace_refresh_tx.try_send(());
+    }
+
+    fn spawn_workspace_cache_rebuild(&self) {
+        let workspace_root = self.settings.working_directory.clone();
+        let tx = self.event_tx.clone();
+        self.tokio_rt.spawn(async move {
+            match crate::storage::rebuild_file_cache(workspace_root).await {
+                Ok(root) => {
+                    let _ = tx
+                        .send(AppEvent::WorkspaceTreeLoaded { root, error: None })
+                        .await;
+                }
+                Err(e) => {
+                    let fallback = crate::storage::FileNode {
+                        name: "workspace".to_string(),
+                        path: String::new(),
+                        is_dir: true,
+                        children: vec![],
+                    };
+                    let _ = tx
+                        .send(AppEvent::WorkspaceTreeLoaded {
+                            root: fallback,
+                            error: Some(e.to_string()),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn spawn_workspace_file_open(&self, path: String) {
+        let tx = self.event_tx.clone();
+        self.tokio_rt.spawn(async move {
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => {
+                    let _ = tx
+                        .send(AppEvent::WorkspaceFileLoaded {
+                            path,
+                            content,
+                            error: None,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(AppEvent::WorkspaceFileLoaded {
+                            path,
+                            content: String::new(),
+                            error: Some(e.to_string()),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn process_workspace_refresh_signals(&mut self) {
+        let mut should_refresh = false;
+        while self.workspace_refresh_rx.try_recv().is_ok() {
+            should_refresh = true;
+        }
+        if should_refresh {
+            self.spawn_workspace_cache_rebuild();
+        }
+    }
+
+    fn start_workspace_watcher_task(&mut self) {
+        if let Some(handle) = self.workspace_watcher_task.take() {
+            handle.abort();
+        }
+        let workspace_root = self.settings.working_directory.clone();
+        let tx = self.workspace_refresh_tx.clone();
+        self.workspace_watcher_task = Some(self.tokio_rt.spawn(async move {
+            if let Err(err) = run_workspace_watcher(workspace_root, tx).await {
+                eprintln!("workspace watcher failed: {err}");
+            }
+        }));
+    }
+
+    fn render_workspace_tree_node(
+        &mut self,
+        ui: &mut egui::Ui,
+        node: &crate::storage::FileNode,
+        request_refresh: &mut bool,
+    ) {
+        let is_dir = node.is_dir;
+        let icon_emoji = if is_dir { "📁" } else { "📄" };
+        let label = format!("{icon_emoji} {}", node.name);
+
+        if is_dir {
+            let expanded_now = self
+                .workspace_node_state
+                .get(&node.path)
+                .map(|s| s.expanded)
+                .unwrap_or(false);
+            let chevron = if expanded_now { "▾" } else { "▸" };
+            let mut toggle = false;
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new(chevron).frame(false))
+                    .clicked()
+                {
+                    toggle = true;
+                }
+                let resp = ui.selectable_label(false, RichText::new(label).color(TEXT_PRIMARY));
+                resp.context_menu(|ui| {
+                    if ui.button("Refresh").clicked() {
+                        *request_refresh = true;
+                        ui.close_menu();
+                    }
+                });
+            });
+            if toggle {
+                let entry = self
+                    .workspace_node_state
+                    .entry(node.path.clone())
+                    .or_insert(WorkspaceNodeUiState { expanded: false });
+                entry.expanded = !entry.expanded;
+            }
+            let expanded_after = self
+                .workspace_node_state
+                .get(&node.path)
+                .map(|s| s.expanded)
+                .unwrap_or(false);
+            if expanded_after {
+                ui.indent(format!("indent_{}", node.path), |ui| {
+                    for child in &node.children {
+                        self.render_workspace_tree_node(ui, child, request_refresh);
+                    }
+                });
+            }
+            return;
+        }
+
+        let selected = self.active_open_file.as_deref() == Some(node.path.as_str());
+        let resp = ui.selectable_label(
+            selected,
+            RichText::new(label).color(if selected { GOLD } else { TEXT_PRIMARY }),
+        );
+        if resp.double_clicked() {
+            self.spawn_workspace_file_open(node.path.clone());
+        }
+        resp.context_menu(|ui| {
+            if ui.button("Refresh").clicked() {
+                *request_refresh = true;
+                ui.close_menu();
+            }
+        });
+    }
+
+    fn sanitize_workflow_details(raw: &str) -> String {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return "No additional details.".to_string();
+        }
+        // Cap detail text to ~1200 chars so expanded blocks stay within a typical
+        // laptop-height viewport and avoid pushing active steps out of view.
+        if trimmed.len() <= WORKFLOW_STEP_DETAIL_MAX_CHARS {
+            return trimmed.to_string();
+        }
+        let clipped: String = trimmed
+            .chars()
+            .take(WORKFLOW_STEP_DETAIL_MAX_CHARS)
+            .collect();
+        format!("{clipped}\n…")
+    }
+
+    fn active_reasoning_config(&self) -> ModelReasoningConfig {
+        reasoning_config_for_model(&self.selected_model_id())
+    }
+
+    fn ensure_thinking_mode_valid_for_model(&mut self) {
+        let cfg = self.active_reasoning_config();
+        if matches!(cfg.capability, ReasoningCapability::Tiered)
+            && !cfg.tiered_modes.contains(&self.selected_thinking_mode)
+        {
+            if let Some(default_mode) = cfg.tiered_modes.first().copied() {
+                self.selected_thinking_mode = default_mode;
             }
         }
-        content.trim().to_string()
+    }
+
+    fn activate_model_selection(&mut self) {
+        self.settings.default_model = self.selected_model_id();
+        let _ = save_settings(&self.settings);
+        self.ensure_thinking_mode_valid_for_model();
+        self.refresh_model_access_outline();
+    }
+
+    fn begin_workflow_step(&mut self, request_id: &str, title: String, details: String) {
+        if self.workflow_request_id.as_deref() != Some(request_id) {
+            self.workflow_request_id = Some(request_id.to_string());
+            self.swarm_workflow.clear();
+            self.workflow_expanded.clear();
+        }
+
+        if let Some(last_running) = self
+            .swarm_workflow
+            .iter_mut()
+            .rev()
+            .find(|step| matches!(step.status, WorkflowStepStatus::Running))
+        {
+            last_running.status = WorkflowStepStatus::Success;
+        }
+
+        let step_id = Uuid::new_v4().to_string();
+        self.workflow_expanded.insert(step_id.clone(), false);
+        self.swarm_workflow.push(WorkflowStep {
+            id: step_id,
+            title,
+            details: Self::sanitize_workflow_details(&details),
+            status: WorkflowStepStatus::Running,
+        });
+    }
+
+    fn finalize_workflow(&mut self, request_id: &str, success: bool) {
+        if self.workflow_request_id.as_deref() != Some(request_id) {
+            return;
+        }
+        if let Some(last_running) = self
+            .swarm_workflow
+            .iter_mut()
+            .rev()
+            .find(|step| matches!(step.status, WorkflowStepStatus::Running))
+        {
+            last_running.status = if success {
+                WorkflowStepStatus::Success
+            } else {
+                WorkflowStepStatus::Failed
+            };
+        }
+    }
+
+    fn render_workflow_visualizer(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(BG_SURFACE)
+            .corner_radius(8.0)
+            .stroke(egui::Stroke::new(1.0, BG_SURFACE_ALT))
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Swarm Workflow")
+                            .strong()
+                            .color(TEXT_PRIMARY)
+                            .size(15.0),
+                    );
+                    ui.add_space(8.0);
+                    if !self.active_requests.is_empty() {
+                        ui.spinner();
+                    }
+                    ui.label(RichText::new(&self.swarm_status).small().color(TEXT_MUTED));
+                });
+                ui.add_space(8.0);
+
+                if self.swarm_workflow.is_empty() {
+                    ui.label(
+                        RichText::new("No workflow steps yet. Send a request to start.")
+                            .small()
+                            .color(TEXT_MUTED),
+                    );
+                    return;
+                }
+
+                ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                    for idx in 0..self.swarm_workflow.len() {
+                        let (step_id, step_title, step_details, step_status) = {
+                            let step = &self.swarm_workflow[idx];
+                            (
+                                step.id.clone(),
+                                step.title.clone(),
+                                step.details.clone(),
+                                step.status,
+                            )
+                        };
+                        ui.horizontal(|ui| {
+                            let expanded = self
+                                .workflow_expanded
+                                .entry(step_id.clone())
+                                .or_insert(false);
+                            let chevron = if *expanded { "▾" } else { "▸" };
+                            if ui
+                                .add(
+                                    egui::Button::new(RichText::new(chevron).color(TEXT_PRIMARY))
+                                        .frame(false),
+                                )
+                                .clicked()
+                            {
+                                *expanded = !*expanded;
+                            }
+
+                            match step_status {
+                                WorkflowStepStatus::Running => ui.spinner(),
+                                WorkflowStepStatus::Success => {
+                                    ui.label(RichText::new("✅").color(STATUS_SUCCESS))
+                                }
+                                WorkflowStepStatus::Failed => {
+                                    ui.label(RichText::new("❌").color(STATUS_ERROR))
+                                }
+                            };
+
+                            ui.label(RichText::new(step_title).color(TEXT_PRIMARY));
+                        });
+
+                        if *self.workflow_expanded.get(&step_id).unwrap_or(&false) {
+                            egui::Frame::new()
+                                .fill(BG_SURFACE_ALT)
+                                .corner_radius(6.0)
+                                .inner_margin(egui::Margin::same(8))
+                                .show(ui, |ui| {
+                                    ui.label(
+                                        RichText::new(step_details)
+                                            .small()
+                                            .monospace()
+                                            .color(TEXT_MUTED),
+                                    );
+                                });
+                        }
+                        ui.add_space(4.0);
+                    }
+                });
+            });
+    }
+
+    fn clean_copy_text(content: &str) -> String {
+        let parsed = crate::parser::parse_response(content);
+        let mut out = String::new();
+
+        if let Some(message) = parsed.message.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            out.push_str(message);
+        } else if !parsed.fallback_text.trim().is_empty() {
+            out.push_str(parsed.fallback_text.trim());
+        }
+
+        if !parsed.plan_items.is_empty() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str("PLAN:\n");
+            for item in parsed.plan_items {
+                out.push_str("- [ ] ");
+                out.push_str(item.trim());
+                out.push('\n');
+            }
+            out = out.trim_end().to_string();
+        }
+        out.trim().to_string()
     }
 
     fn copy_to_clipboard(&mut self, raw_content: &str) {
@@ -1199,6 +1586,8 @@ impl ChatApp {
 
         let models = provider_models(settings.selected_provider.key());
         let custom_model_id = settings.default_model.clone();
+        let (workspace_refresh_tx, workspace_refresh_rx) =
+            tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let mut app = Self {
             setup_wizard: if settings.setup_complete {
                 None
@@ -1262,6 +1651,14 @@ impl ChatApp {
             show_left_sidebar: true,
             show_activity_panel: false,
             swarm_status: "✅ Ready".to_string(),
+            swarm_workflow: vec![],
+            workflow_expanded: HashMap::new(),
+            workflow_request_id: None,
+            workspace_tree: None,
+            workspace_node_state: HashMap::new(),
+            workspace_refresh_tx,
+            workspace_refresh_rx,
+            workspace_watcher_task: None,
             policy_block_dialog: None,
         };
 
@@ -1275,6 +1672,8 @@ impl ChatApp {
 
         app.spawn_initial_data_load();
         app.load_models_from_provider();
+        app.start_workspace_watcher_task();
+        app.request_workspace_refresh();
         app
     }
 
@@ -1400,6 +1799,9 @@ impl ChatApp {
         );
         self.activity_log.push("Swarm started response".to_string());
         self.swarm_status = "🔄 Router is analyzing...".to_string();
+        self.workflow_request_id = Some(request_id.clone());
+        self.swarm_workflow.clear();
+        self.workflow_expanded.clear();
 
         let mut api_messages: Vec<ChatMessage> = vec![];
         let telemetry_context =
@@ -1451,7 +1853,7 @@ impl ChatApp {
 
         let reasoning_capability = self.current_reasoning_capability();
         let tiered_reasoning_level = if matches!(reasoning_capability, ReasoningCapability::Tiered) {
-            Some(self.selected_thinking_mode.clone())
+            Some(self.selected_thinking_mode)
         } else {
             None
         };
@@ -1464,6 +1866,16 @@ impl ChatApp {
 
         self.tokio_rt.spawn(async move {
             let mut rag_context = "LOCAL REPOSITORY CONTEXT:\n- No relevant snippets found.".to_string();
+            let _ = event_tx
+                .send(AppEvent::SwarmWorkflowStep {
+                    request_id: req_id.clone(),
+                    title: "Setting up environment".to_string(),
+                    details: format!(
+                        "provider_base_url={}\nworkspace={}\nmodel={}",
+                        base_url, working_dir, model_id
+                    ),
+                })
+                .await;
             if !api_key.is_empty() && !query.trim().is_empty() {
                 let provider = OpenAIEmbeddingProvider {
                     api_key: api_key.clone(),
@@ -1491,6 +1903,13 @@ impl ChatApp {
             let router_system_prompt = format!(
                 "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{rag_context}\n\n{router_prompt}\n\nUser request:\n{query}"
             );
+            let _ = event_tx
+                .send(AppEvent::SwarmWorkflowStep {
+                    request_id: req_id.clone(),
+                    title: "Router: planning workflow".to_string(),
+                    details: router_system_prompt.clone(),
+                })
+                .await;
             router_messages.insert(
                 0,
                 ChatMessage::with_cache_control("system", &router_system_prompt),
@@ -1546,6 +1965,13 @@ impl ChatApp {
                     .send(AppEvent::SwarmStatus {
                         request_id: req_id.clone(),
                         status,
+                    })
+                    .await;
+                let _ = event_tx
+                    .send(AppEvent::SwarmWorkflowStep {
+                        request_id: req_id.clone(),
+                        title: format!("{}: analyze task", role.as_str()),
+                        details: step.task.clone(),
                     })
                     .await;
 
@@ -1684,12 +2110,73 @@ impl ChatApp {
                         for status in statuses {
                             match status {
                                 ExecutionStatus::Executed(report) => {
+                                    let _ = event_tx
+                                        .send(AppEvent::SwarmWorkflowStep {
+                                            request_id: req_id.clone(),
+                                            title: format!("{}: {}", role.as_str(), report.action),
+                                            details: format!(
+                                                "success={}\nexit_code={}\nstdout:\n{}\nstderr:\n{}",
+                                                report.success, report.exit_code, report.stdout, report.stderr
+                                            ),
+                                        })
+                                        .await;
                                     swarm_memory.push_str(&format!(
                                         "action={} success={} exit_code={}\nstdout:\n{}\nstderr:\n{}\n",
                                         report.action, report.success, report.exit_code, report.stdout, report.stderr
                                     ));
                                 }
                                 ExecutionStatus::AwaitingApproval(req) => {
+                                    let detail = match req.action.action {
+                                        ActionKind::RunCmd => req
+                                            .action
+                                            .parameters
+                                            .command
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                        ActionKind::EditFile => req
+                                            .action
+                                            .parameters
+                                            .path
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                        ActionKind::CreateFile => req
+                                            .action
+                                            .parameters
+                                            .path
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                        ActionKind::CreateFolder => req
+                                            .action
+                                            .parameters
+                                            .path
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                        ActionKind::CreatePdf => req
+                                            .action
+                                            .parameters
+                                            .path
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                        ActionKind::SearchWeb => req
+                                            .action
+                                            .parameters
+                                            .query
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                        ActionKind::ReadUrl => req
+                                            .action
+                                            .parameters
+                                            .url
+                                            .as_deref()
+                                            .unwrap_or(""),
+                                    };
+                                    let _ = event_tx
+                                        .send(AppEvent::SwarmWorkflowStep {
+                                            request_id: req_id.clone(),
+                                            title: format!("{}: awaiting approval", role.as_str()),
+                                            details: format!("{}\n{}", req.reason, detail),
+                                        })
+                                        .await;
                                     swarm_memory.push_str(&format!(
                                         "action awaiting approval: {:?}\nreason: {}\n",
                                         req.action.action, req.reason
@@ -1705,6 +2192,13 @@ impl ChatApp {
                         }
                     }
                     Err(e) => {
+                        let _ = event_tx
+                            .send(AppEvent::SwarmWorkflowStep {
+                                request_id: req_id.clone(),
+                                title: format!("{}: execution error", role.as_str()),
+                                details: e.to_string(),
+                            })
+                            .await;
                         swarm_memory.push_str(&format!(
                             "\n[{} execution error]\n{}\n",
                             role.as_str(),
@@ -1727,6 +2221,13 @@ impl ChatApp {
                 .send(AppEvent::SwarmStatus {
                     request_id: req_id.clone(),
                     status: "✅ Swarm completed".to_string(),
+                })
+                .await;
+            let _ = event_tx
+                .send(AppEvent::SwarmWorkflowStep {
+                    request_id: req_id.clone(),
+                    title: "Workflow complete".to_string(),
+                    details: "All planned swarm steps finished.".to_string(),
                 })
                 .await;
             let _ = event_tx.send(AppEvent::ResponseComplete(req_id)).await;
@@ -2022,6 +2523,18 @@ impl ChatApp {
         }
     }
 
+    fn active_editor_language_label(&self) -> String {
+        let Some(path) = self.active_open_file.as_ref() else {
+            return "Language: txt".to_string();
+        };
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("txt")
+            .to_lowercase();
+        format!("Language: {}", ext)
+    }
+
     fn send_message(&mut self) {
         let text = self.input_text.trim().to_string();
         if text.is_empty() && self.pending_attachments.is_empty() {
@@ -2087,6 +2600,7 @@ impl ChatApp {
                     }
                 }
                 AppEvent::ResponseComplete(req_id) => {
+                    self.finalize_workflow(&req_id, true);
                     if let Some(active) = self.active_requests.remove(&req_id) {
                         let mut to_save: Option<(String, Message)> = None;
                         let mut parse_error_notification: Option<String> = None;
@@ -2160,6 +2674,7 @@ impl ChatApp {
                     }
                 }
                 AppEvent::ResponseError(req_id, err) => {
+                    self.finalize_workflow(&req_id, false);
                     if let Some(active) = self.active_requests.remove(&req_id) {
                         if let Some(session) = self.sessions.get_mut(active.session_idx) {
                             if let Some(msg) = session
@@ -2181,6 +2696,15 @@ impl ChatApp {
                 AppEvent::SwarmStatus { request_id, status } => {
                     if self.active_requests.contains_key(&request_id) {
                         self.swarm_status = status;
+                    }
+                }
+                AppEvent::SwarmWorkflowStep {
+                    request_id,
+                    title,
+                    details,
+                } => {
+                    if self.active_requests.contains_key(&request_id) {
+                        self.begin_workflow_step(&request_id, title, details);
                     }
                 }
                 AppEvent::PolicyBlocked { request_id, reason } => {
@@ -2205,7 +2729,6 @@ impl ChatApp {
                                 ModelInfo {
                                     id: m.id.clone(),
                                     name,
-                                    thinking_modes: vec![],
                                 }
                             })
                             .collect();
@@ -2335,6 +2858,30 @@ impl ChatApp {
                 }
                 AppEvent::DbError(err) => {
                     self.notify(err, NotificationKind::Error);
+                }
+                AppEvent::WorkspaceTreeLoaded { root, error } => {
+                    self.workspace_tree = Some(root);
+                    if let Some(err) = error {
+                        self.notify(
+                            format!("Workspace refresh failed: {err}"),
+                            NotificationKind::Error,
+                        );
+                    }
+                }
+                AppEvent::WorkspaceFileLoaded { path, content, error } => {
+                    if let Some(err) = error {
+                        self.notify(
+                            format!("Open failed for {}: {}", path, err),
+                            NotificationKind::Error,
+                        );
+                        continue;
+                    }
+                    if !self.opened_files.iter().any(|p| p == &path) {
+                        self.opened_files.push(path.clone());
+                    }
+                    self.editor_buffers.insert(path.clone(), content);
+                    self.editor_dirty.insert(path.clone(), false);
+                    self.active_open_file = Some(path);
                 }
             }
         }
@@ -2474,7 +3021,7 @@ impl ChatApp {
                     ui.label(RichText::new("Editor").color(TEXT_PRIMARY).strong());
                     if ui.small_button("📂 Open File").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            self.open_file_in_workspace(path.to_string_lossy().to_string());
+                            self.spawn_workspace_file_open(path.to_string_lossy().to_string());
                         }
                     }
                 });
@@ -2485,7 +3032,7 @@ impl ChatApp {
                         for path in changed {
                             ui.horizontal(|ui| {
                                 if ui.small_button("Open").clicked() {
-                                    self.open_file_in_workspace(path.clone());
+                                    self.spawn_workspace_file_open(path.clone());
                                 }
                                 ui.label(RichText::new(path.clone()).small().color(LIGHT_TEXT));
                             });
@@ -2498,6 +3045,30 @@ impl ChatApp {
                             );
                         }
                     });
+                });
+                ui.separator();
+                let panel_resp = ui.collapsing("Workspace Explorer", |ui| {
+                    let max_h = (ui.available_height() * 0.30).max(120.0);
+                    ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
+                        let mut request_refresh = false;
+                        if let Some(root) = &self.workspace_tree {
+                            let children = root.children.clone();
+                            for child in &children {
+                                self.render_workspace_tree_node(ui, child, &mut request_refresh);
+                            }
+                        } else {
+                            ui.label(RichText::new("Loading workspace…").small().color(TEXT_MUTED));
+                        }
+                        if request_refresh {
+                            self.request_workspace_refresh();
+                        }
+                    });
+                });
+                panel_resp.header_response.context_menu(|ui| {
+                    if ui.button("Refresh").clicked() {
+                        self.request_workspace_refresh();
+                        ui.close_menu();
+                    }
                 });
                 ui.separator();
 
@@ -2549,6 +3120,7 @@ impl ChatApp {
                 ui.separator();
 
                 if let Some(path) = self.active_open_file.clone() {
+                    let language_label = self.active_editor_language_label();
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(path.clone()).small().color(TEXT_MUTED));
                         if ui.button("💾 Save").clicked() {
@@ -2556,13 +3128,8 @@ impl ChatApp {
                         }
                     });
                     if let Some(buffer) = self.editor_buffers.get_mut(&path) {
-                        let ext = std::path::Path::new(&path)
-                            .extension()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("txt")
-                            .to_lowercase();
                         ui.label(
-                            RichText::new(format!("Language: {}", ext))
+                            RichText::new(language_label)
                                 .small()
                                 .color(TEXT_MUTED),
                         );
@@ -2793,13 +3360,17 @@ impl ChatApp {
                             if ui.button("📋 Copy").clicked() {
                                 self.copy_to_clipboard(&msg.content);
                             }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(msg.timestamp.format("%H:%M").to_string())
+                                            .small()
+                                            .color(Color32::from_rgb(160, 160, 160)),
+                                    );
+                                },
+                            );
                         });
-
-                        ui.label(
-                            RichText::new(msg.timestamp.format("%H:%M").to_string())
-                                .small()
-                                .color(Color32::from_rgb(160, 160, 160)),
-                        );
                     });
             },
         );
@@ -2809,6 +3380,7 @@ impl ChatApp {
 impl eframe::App for ChatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_events();
+        self.process_workspace_refresh_signals();
         self.tick_notifications(ctx.input(|i| i.stable_dt));
         if !self.active_requests.is_empty() {
             ctx.request_repaint();
@@ -3378,6 +3950,7 @@ impl eframe::App for ChatApp {
                             .fill(BG_SURFACE)
                             .stroke(egui::Stroke::new(1.0, outline_color))
                             .show(ui, |ui| {
+                                let mut picked_model_idx: Option<usize> = None;
                                 egui::ComboBox::from_id_salt("model_selector")
                                     .selected_text(
                                         RichText::new(selected_model_name).color(TEXT_PRIMARY),
@@ -3385,11 +3958,19 @@ impl eframe::App for ChatApp {
                                     .width(ui.available_width())
                                     .show_ui(ui, |ui| {
                                         for (i, m) in self.models.iter().enumerate() {
-                                            ui.selectable_value(
-                                                &mut self.selected_model_idx,
-                                                i,
-                                                RichText::new(&m.name).color(TEXT_PRIMARY),
-                                            );
+                                            if ui
+                                                .selectable_label(
+                                                    self.selected_model_idx == i,
+                                                    RichText::new(&m.name).color(TEXT_PRIMARY),
+                                                )
+                                                .clicked()
+                                            {
+                                                // Defer activation until after ComboBox rendering
+                                                // to avoid borrow checker conflicts: egui holds an
+                                                // immutable borrow of `self.models` during iteration,
+                                                // but activation requires mutable access to `self`.
+                                                picked_model_idx = Some(i);
+                                            }
                                         }
                                         if !self.remote_models.is_empty() {
                                             ui.separator();
@@ -3413,60 +3994,36 @@ impl eframe::App for ChatApp {
                                             }
                                         }
                                     });
+                                if let Some(idx) = picked_model_idx {
+                                    self.selected_model_idx = idx;
+                                    self.custom_model_id.clear();
+                                    self.activate_model_selection();
+                                }
                             });
                         ui.label(RichText::new("Custom model ID").small().color(TEXT_MUTED));
                         ui.horizontal(|ui| {
-                            ui.add(
+                            let custom_id_response = ui.add(
                                 TextEdit::singleline(&mut self.custom_model_id)
                                     .desired_width(
                                         ui.available_width() - CUSTOM_MODEL_INPUT_RESERVED_WIDTH,
                                     )
-                                    .hint_text("e.g. gpt-4o, meta-llama/Llama-3.1-8B-Instruct"),
+                                    .hint_text(
+                                        "e.g. gpt-4o, meta-llama/Llama-3.1-8B-Instruct",
+                                    ),
                             );
-                            if ui.button("Use").clicked() {
-                                if self.custom_model_id.trim().is_empty() {
-                                    self.custom_model_id = self
-                                        .current_model()
-                                        .map(|m| m.id.clone())
-                                        .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
-                                }
-                                self.settings.default_model =
-                                    self.custom_model_id.trim().to_string();
-                                let _ = save_settings(&self.settings);
-                                self.refresh_model_access_outline();
+                            let apply_custom_model = (custom_id_response.changed()
+                                && custom_id_response.lost_focus())
+                                || (custom_id_response.has_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if apply_custom_model {
+                                self.activate_model_selection();
                             }
                             if ui.button("From list").clicked() {
                                 self.custom_model_id.clear();
-                                self.settings.default_model = self
-                                    .current_model()
-                                    .map(|m| m.id.clone())
-                                    .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
-                                let _ = save_settings(&self.settings);
-                                self.refresh_model_access_outline();
+                                self.activate_model_selection();
                             }
                         });
-                        if !self.remote_models.is_empty() {
-                            let mut picked_model_id: Option<String> = None;
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new("Quick pick:").small().color(TEXT_MUTED));
-                                for model in self.remote_models.iter().take(8) {
-                                    let mut label = model.id.clone();
-                                    if model.premium {
-                                        label.push_str(" [Premium]");
-                                    }
-                                    if model.gated {
-                                        label.push_str(" [Gated]");
-                                    }
-                                if ui.small_button(label).clicked() {
-                                    picked_model_id = Some(model.id.clone());
-                                }
-                            }
-                        });
-                        if let Some(model_id) = picked_model_id {
-                            self.custom_model_id = model_id;
-                            self.refresh_model_access_outline();
-                        }
-                    }
+                    });
 
                     ui.horizontal(|ui| {
                         ui.label("Execution policy:");
@@ -3501,44 +4058,32 @@ impl eframe::App for ChatApp {
                             });
                     });
 
-                    match self.current_reasoning_capability() {
-                            ReasoningCapability::None => {}
-                            ReasoningCapability::Binary => {
-                                ui.checkbox(
-                                    &mut self.binary_reasoning_enabled,
-                                    "Enable Reasoning / Thinking",
-                                );
-                            }
-                            ReasoningCapability::Tiered => {
-                                ui.horizontal(|ui| {
-                                    ui.label("Thinking level:");
-                                    egui::ComboBox::from_id_salt("thinking_mode")
-                                        .selected_text(match self.selected_thinking_mode {
-                                            ThinkingMode::Low => "Low",
-                                            ThinkingMode::Medium => "Medium",
-                                            ThinkingMode::High => "High",
-                                        })
-                                        .show_ui(ui, |ui| {
-                                            ui.selectable_value(
-                                                &mut self.selected_thinking_mode,
-                                                ThinkingMode::Low,
-                                                "Low",
-                                            );
-                                            ui.selectable_value(
-                                                &mut self.selected_thinking_mode,
-                                                ThinkingMode::Medium,
-                                                "Medium",
-                                            );
-                                            ui.selectable_value(
-                                                &mut self.selected_thinking_mode,
-                                                ThinkingMode::High,
-                                                "High",
-                                            );
-                                        });
-                                });
-                            }
+                    let reasoning_cfg = self.active_reasoning_config();
+                    match reasoning_cfg.capability {
+                        ReasoningCapability::None => {}
+                        ReasoningCapability::Binary => {
+                            ui.checkbox(
+                                &mut self.binary_reasoning_enabled,
+                                reasoning_cfg.binary_label,
+                            );
                         }
-                    });
+                        ReasoningCapability::Tiered => {
+                            ui.horizontal(|ui| {
+                                ui.label(reasoning_cfg.tiered_label);
+                                egui::ComboBox::from_id_salt("thinking_mode")
+                                    .selected_text(self.selected_thinking_mode.display_name())
+                                    .show_ui(ui, |ui| {
+                                        for mode in reasoning_cfg.tiered_modes {
+                                            ui.selectable_value(
+                                                &mut self.selected_thinking_mode,
+                                                *mode,
+                                                mode.display_name(),
+                                            );
+                                        }
+                                    });
+                            });
+                        }
+                    }
 
                     ui.separator();
                     ui.collapsing("Settings", |ui| {
@@ -3657,6 +4202,10 @@ impl eframe::App for ChatApp {
                             }
                         });
                     });
+
+                ui.add_space(6.0);
+                self.render_workflow_visualizer(ui);
+                ui.add_space(8.0);
 
                 let input_height = 100.0;
                 let msg_height = ui.available_height() - input_height;
