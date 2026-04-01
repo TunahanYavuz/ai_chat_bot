@@ -353,6 +353,41 @@ pub struct ChatApp {
 }
 
 impl ChatApp {
+    fn clean_copy_text(content: &str) -> String {
+        if let Some(plan_idx) = content.find("PLAN:") {
+            let before = &content[..plan_idx];
+            let plan_section = &content[plan_idx..];
+            if let Some(json_idx) = plan_section.find("```json") {
+                let cleaned_plan = &plan_section[..json_idx];
+                let merged = format!("{}{}", before, cleaned_plan);
+                return merged.trim().to_string();
+            }
+        }
+        content.trim().to_string()
+    }
+
+    fn copy_to_clipboard(&mut self, raw_content: &str) {
+        let text = Self::clean_copy_text(raw_content);
+        if text.is_empty() {
+            self.notify("Nothing to copy", NotificationKind::Info);
+            return;
+        }
+
+        match arboard::Clipboard::new() {
+            Ok(mut clipboard) => match clipboard.set_text(text) {
+                Ok(_) => self.notify("Copied to clipboard", NotificationKind::Info),
+                Err(err) => {
+                    eprintln!("Clipboard set_text failed: {err}");
+                    self.notify("Clipboard write failed", NotificationKind::Error);
+                }
+            },
+            Err(err) => {
+                eprintln!("Clipboard initialization failed: {err}");
+                self.notify("Clipboard unavailable", NotificationKind::Error);
+            }
+        }
+    }
+
     fn stored_role_from_role(role: &Role) -> StoredRole {
         match role {
             Role::System => StoredRole::System,
@@ -2705,6 +2740,12 @@ impl ChatApp {
                                 );
                             }
                         }
+
+                        ui.horizontal(|ui| {
+                            if ui.button("📋 Copy").clicked() {
+                                self.copy_to_clipboard(&msg.content);
+                            }
+                        });
 
                         ui.label(
                             RichText::new(msg.timestamp.format("%H:%M").to_string())

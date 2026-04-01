@@ -140,6 +140,53 @@ pub struct OpenAIClient {
     base_url: String,
 }
 
+fn chat_message_text_content(msg: &ChatMessage) -> String {
+    if let Some(text) = msg.content.as_str() {
+        return text.to_string();
+    }
+
+    if let Some(items) = msg.content.as_array() {
+        let mut out = String::new();
+        for item in items {
+            if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(t);
+            }
+        }
+        return out;
+    }
+
+    String::new()
+}
+
+fn normalize_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut normalized_non_system: Vec<ChatMessage> = Vec::new();
+
+    for msg in messages {
+        if msg.role == "system" {
+            let text = chat_message_text_content(&msg);
+            if !text.trim().is_empty() {
+                system_parts.push(text);
+            }
+        } else {
+            normalized_non_system.push(msg);
+        }
+    }
+
+    if system_parts.is_empty() {
+        return normalized_non_system;
+    }
+
+    let merged_system = system_parts.join("\n\n");
+    let mut normalized = Vec::with_capacity(normalized_non_system.len() + 1);
+    normalized.push(ChatMessage::text("system", &merged_system));
+    normalized.extend(normalized_non_system);
+    normalized
+}
+
 impl OpenAIClient {
     pub fn new(api_key: &str, base_url: &str) -> Self {
         Self {
@@ -186,6 +233,8 @@ impl OpenAIClient {
     ) -> Result<String> {
         use futures_util::StreamExt;
 
+        let normalized_messages = normalize_messages(messages);
+
         let is_thinking_model = model.contains("o1") || model.contains("o3");
         let supports_reasoning_effort = self
             .base_url
@@ -194,7 +243,7 @@ impl OpenAIClient {
 
         let request = ChatRequest {
             model: model.to_string(),
-            messages,
+            messages: normalized_messages,
             reasoning_effort: if is_thinking_model && supports_reasoning_effort {
                 thinking_mode
                     .and_then(|m| m.as_reasoning_effort())
