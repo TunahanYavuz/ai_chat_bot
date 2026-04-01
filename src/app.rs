@@ -260,9 +260,13 @@ pub struct ChatApp {
 }
 
 impl ChatApp {
-    fn sanitized_command_stdout(stdout: &str) -> String {
+    fn sanitized_command_stdout(stdout: &str, exit_code: i32) -> String {
         if stdout.trim().is_empty() {
-            "[Command executed successfully with no output]".to_string()
+            if exit_code == 0 {
+                "[Command executed successfully with no output]".to_string()
+            } else {
+                format!("[Command produced no stdout output (exit code: {})]", exit_code)
+            }
         } else {
             stdout.to_string()
         }
@@ -1459,7 +1463,7 @@ Do not fabricate directory listings, command outputs, or success messages.",
                 } => {
                     let mut continue_session: Option<usize> = None;
                     let mut system_result: Option<(usize, String)> = None;
-                    let sanitized_stdout = Self::sanitized_command_stdout(&stdout);
+                    let sanitized_stdout = Self::sanitized_command_stdout(&stdout, exit_code);
                     if let Some(term) = self.terminals.iter_mut().find(|t| t.id == terminal_id) {
                         term.running = false;
                         term.exit_code = Some(exit_code);
@@ -1765,10 +1769,10 @@ Do not fabricate directory listings, command outputs, or success messages.",
                         self.active_terminal_id = Some(id);
                     }
                         if let Some(active_id) = self.active_terminal_id.clone() {
-                        if ui.button("Terminate").clicked() {
+                        if ui.button("Terminate").on_hover_text("Stop the running process").clicked() {
                             self.terminate_terminal(&active_id);
                         }
-                        if ui.button("Close").clicked() {
+                        if ui.button("Close").on_hover_text("Close this terminal tab").clicked() {
                             self.remove_terminal(&active_id);
                         }
                     }
@@ -2505,6 +2509,7 @@ impl eframe::App for ChatApp {
                             }
                         });
                         if !self.remote_models.is_empty() {
+                            let mut picked_model_id: Option<String> = None;
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new("Quick pick:").small().color(TEXT_MUTED));
                                 for model in self.remote_models.iter().take(8) {
@@ -2516,11 +2521,14 @@ impl eframe::App for ChatApp {
                                         label.push_str(" [Gated]");
                                     }
                                     if ui.small_button(label).clicked() {
-                                        self.custom_model_id = model.id.clone();
-                                        self.refresh_model_access_outline();
+                                        picked_model_id = Some(model.id.clone());
                                     }
                                 }
                             });
+                            if let Some(model_id) = picked_model_id {
+                                self.custom_model_id = model_id;
+                                self.refresh_model_access_outline();
+                            }
                         }
 
                         let supports_thinking = self

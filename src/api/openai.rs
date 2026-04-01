@@ -51,8 +51,7 @@ pub fn builtin_models() -> Vec<ModelInfo> {
     }]
 }
 
-pub fn provider_models(provider: &str) -> Vec<ModelInfo> {
-    let _ = provider;
+pub fn provider_models(_provider: &str) -> Vec<ModelInfo> {
     vec![]
 }
 
