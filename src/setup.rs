@@ -77,6 +77,9 @@ impl SetupWizard {
                                     }
                                 }
                             });
+                        if !self.selected_provider.api_key_url().is_empty() {
+                            ui.hyperlink_to("Get API key", self.selected_provider.api_key_url());
+                        }
                         ui.label(self.selected_provider.description());
                     }
                     2 => {
