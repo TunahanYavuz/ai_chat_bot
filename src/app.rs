@@ -16,6 +16,7 @@ use crate::parser::{ActionKind, AgentAction, CommandParams};
 use crate::rag_engine::{EmbeddingProvider, RagConfig, RagEngine};
 use crate::setup::SetupWizard;
 use crate::storage::{ChatSession, Storage, StoredMessage, StoredRole};
+use crate::swarm::{get_system_prompt, parse_router_plan, AgentRole, RoutedTask};
 use crate::telemetry::collect_telemetry_cached;
 
 const BG_PRIMARY: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
@@ -116,6 +117,10 @@ pub enum AppEvent {
         error: Option<String>,
     },
     DbError(String),
+    SwarmStatus {
+        request_id: String,
+        status: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -335,6 +340,7 @@ pub struct ChatApp {
     editor_dirty: HashMap<String, bool>,
     show_left_sidebar: bool,
     show_activity_panel: bool,
+    swarm_status: String,
 }
 
 impl ChatApp {
@@ -1155,6 +1161,7 @@ impl ChatApp {
             editor_dirty: HashMap::new(),
             show_left_sidebar: true,
             show_activity_panel: false,
+            swarm_status: "✅ Ready".to_string(),
         };
 
         if let Some(idx) = app
@@ -1259,152 +1266,294 @@ impl ChatApp {
             self.custom_model_id.trim().to_string()
         };
 
-        if !self.agents.iter().any(|a| a.enabled) {
-            self.notify("Enable at least one agent", NotificationKind::Error);
+        if self
+            .sessions
+            .get(session_idx)
+            .map(|s| s.messages.iter().any(|m| m.role == Role::User))
+            .unwrap_or(false)
+            == false
+        {
             return;
         }
 
-        for agent_idx in 0..self.agents.len() {
-            if !self.agents[agent_idx].enabled {
-                continue;
-            }
-            let agent_name = self.agents[agent_idx].name.clone();
-            let agent_prompt = self.agents[agent_idx].system_prompt.clone();
-            let request_id = Uuid::new_v4().to_string();
-            let assistant_msg = Message {
-                id: Uuid::new_v4().to_string(),
-                role: Role::Assistant,
-                content: String::new(),
-                attachments: vec![],
-                timestamp: Utc::now(),
-                is_streaming: true,
-            };
-            let assistant_msg_id = assistant_msg.id.clone();
-            if let Some(session) = self.sessions.get_mut(session_idx) {
-                session.messages.push(assistant_msg);
-            }
+        let request_id = Uuid::new_v4().to_string();
+        let assistant_msg = Message {
+            id: Uuid::new_v4().to_string(),
+            role: Role::Assistant,
+            content: String::new(),
+            attachments: vec![],
+            timestamp: Utc::now(),
+            is_streaming: true,
+        };
+        let assistant_msg_id = assistant_msg.id.clone();
+        if let Some(session) = self.sessions.get_mut(session_idx) {
+            session.messages.push(assistant_msg);
+        }
 
-            self.active_requests.insert(
-                request_id.clone(),
-                ActiveRequest {
-                    session_idx,
-                    message_id: assistant_msg_id,
-                    agent_name: agent_name.clone(),
-                },
-            );
-            self.activity_log.push(format!("{} started response", agent_name));
+        self.active_requests.insert(
+            request_id.clone(),
+            ActiveRequest {
+                session_idx,
+                message_id: assistant_msg_id,
+                agent_name: "Swarm".to_string(),
+            },
+        );
+        self.activity_log.push("Swarm started response".to_string());
+        self.swarm_status = "🔄 Router is analyzing...".to_string();
 
-            let mut api_messages: Vec<ChatMessage> = vec![];
-            let system_prompt = format!(
-                "You are agent '{}'. {} Working directory: {}. Shell execution: {}. \
-Never claim file writes or shell commands succeeded unless they actually ran with user approval. \
-If user asks to create/edit a file, respond ONLY with <write_file path=\"relative/or/absolute/path\">FILE_CONTENT</write_file>. \
-If user asks to run a command and shell execution is enabled, respond ONLY with <execute_command>THE_COMMAND</execute_command>. \
-Do not fabricate directory listings, command outputs, or success messages.",
-                agent_name,
-                agent_prompt,
-                self.settings.working_directory,
-                if self.settings.shell_execution_enabled {
-                    "enabled"
+        let mut api_messages: Vec<ChatMessage> = vec![];
+        let telemetry_context =
+            collect_telemetry_cached(std::time::Duration::from_secs(2)).to_llm_system_context();
+        let api_key = self.settings.active_api_key();
+        let base_url = self.settings.active_base_url();
+        let query = self
+            .sessions
+            .get(session_idx)
+            .and_then(|s| {
+                s.messages
+                    .iter()
+                    .rev()
+                    .find(|m| matches!(m.role, Role::User))
+                    .map(|m| m.content.clone())
+            })
+            .unwrap_or_default();
+        let working_dir = self.settings.working_directory.clone();
+        let shell_enabled = self.settings.shell_execution_enabled;
+
+        if let Some(session) = self.sessions.get(session_idx) {
+            for msg in &session.messages {
+                if msg.is_streaming {
+                    continue;
+                }
+                let role = msg.role.as_str();
+                if msg.attachments.iter().any(|a| a.image_base64.is_some()) {
+                    for att in &msg.attachments {
+                        if let Some(b64) = &att.image_base64 {
+                            api_messages.push(ChatMessage::with_image(role, &msg.content, b64, &att.mime_type));
+                        }
+                    }
                 } else {
-                    "disabled"
-                }
-            );
-            let telemetry_context =
-                collect_telemetry_cached(std::time::Duration::from_secs(2)).to_llm_system_context();
-            let api_key = self.settings.active_api_key();
-            let base_url = self.settings.active_base_url();
-            let query = self
-                .sessions
-                .get(session_idx)
-                .and_then(|s| {
-                    s.messages
-                        .iter()
-                        .rev()
-                        .find(|m| matches!(m.role, Role::User))
-                        .map(|m| m.content.clone())
-                })
-                .unwrap_or_default();
-            let working_dir = self.settings.working_directory.clone();
-
-            if let Some(session) = self.sessions.get(session_idx) {
-                for msg in &session.messages {
-                    if msg.is_streaming {
-                        continue;
+                    let mut content = msg.content.clone();
+                    for att in &msg.attachments {
+                        if let Some(txt) = &att.text {
+                            content.push_str(&format!("\n\n[File: {}]\n{}", att.filename, txt));
+                        }
                     }
-                    let role = msg.role.as_str();
-                    if msg.attachments.iter().any(|a| a.image_base64.is_some()) {
-                        for att in &msg.attachments {
-                            if let Some(b64) = &att.image_base64 {
-                                api_messages.push(ChatMessage::with_image(role, &msg.content, b64, &att.mime_type));
-                            }
-                        }
-                    } else {
-                        let mut content = msg.content.clone();
-                        for att in &msg.attachments {
-                            if let Some(txt) = &att.text {
-                                content.push_str(&format!("\n\n[File: {}]\n{}", att.filename, txt));
-                            }
-                        }
-                        api_messages.push(ChatMessage::text(role, &content));
+                    api_messages.push(ChatMessage::text(role, &content));
+                }
+            }
+        }
+
+        let thinking_mode = if self.current_model().map(|m| m.supports_thinking()).unwrap_or(false) {
+            Some(self.selected_thinking_mode.clone())
+        } else {
+            None
+        };
+
+        let event_tx = self.event_tx.clone();
+        let req_id = request_id.clone();
+        let model_id = model_id.clone();
+
+        self.tokio_rt.spawn(async move {
+            let mut rag_context = "LOCAL REPOSITORY CONTEXT:\n- No relevant snippets found.".to_string();
+            if !api_key.is_empty() && !query.trim().is_empty() {
+                let provider = OpenAIEmbeddingProvider {
+                    api_key: api_key.clone(),
+                    base_url: base_url.clone(),
+                    model: "text-embedding-3-small".to_string(),
+                };
+                let rag_cfg = RagConfig::with_workspace(working_dir.clone(), 1536);
+                if let Ok(engine) = RagEngine::new(rag_cfg, provider).await {
+                    if let Ok(snippets) = engine.semantic_search(&query).await {
+                        rag_context = RagEngine::<OpenAIEmbeddingProvider>::format_repository_context(&snippets);
                     }
                 }
             }
 
-            let thinking_mode = if self.current_model().map(|m| m.supports_thinking()).unwrap_or(false) {
-                Some(self.selected_thinking_mode.clone())
-            } else {
-                None
+            let client = crate::api::OpenAIClient::new(&api_key, &base_url);
+            let _ = event_tx
+                .send(AppEvent::SwarmStatus {
+                    request_id: req_id.clone(),
+                    status: "🔄 Router is analyzing...".to_string(),
+                })
+                .await;
+
+            let mut router_messages = api_messages.clone();
+            let router_prompt = get_system_prompt(&AgentRole::Router);
+            let router_system_prompt = format!(
+                "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{rag_context}\n\n{router_prompt}\n\nUser request:\n{query}"
+            );
+            router_messages.insert(
+                0,
+                ChatMessage::with_cache_control("system", &router_system_prompt),
+            );
+
+            let router_result = client
+                .chat_completion(
+                    &model_id,
+                    router_messages,
+                    thinking_mode.as_ref(),
+                    |_| {},
+                )
+                .await;
+
+            let mut queue = match router_result {
+                Ok(raw) => parse_router_plan(&raw),
+                Err(e) => {
+                    let _ = event_tx
+                        .send(AppEvent::ResponseError(
+                            req_id,
+                            format!("Router failed: {}", e),
+                        ))
+                        .await;
+                    return;
+                }
             };
 
-            let event_tx = self.event_tx.clone();
-            let req_id = request_id.clone();
-            let model_id = model_id.clone();
+            if queue.is_empty() {
+                queue.push(RoutedTask {
+                    agent: "CodeArchitect".to_string(),
+                    task: query.clone(),
+                });
+            }
 
-            self.tokio_rt.spawn(async move {
-                let mut rag_context = "LOCAL REPOSITORY CONTEXT:\n- No relevant snippets found.".to_string();
-                if !api_key.is_empty() && !query.trim().is_empty() {
-                    let provider = OpenAIEmbeddingProvider {
-                        api_key: api_key.clone(),
-                        base_url: base_url.clone(),
-                        model: "text-embedding-3-small".to_string(),
-                    };
-                    let rag_cfg = RagConfig::with_workspace(working_dir, 1536);
-                    if let Ok(engine) = RagEngine::new(rag_cfg, provider).await {
-                        if let Ok(snippets) = engine.semantic_search(&query).await {
-                            rag_context = RagEngine::<OpenAIEmbeddingProvider>::format_repository_context(&snippets);
-                        }
-                    }
-                }
+            let mut swarm_memory = String::new();
+            let mut final_parts: Vec<String> = Vec::new();
+            let executor = ActionExecutor::new(working_dir);
 
-                let full_system_prompt = format!(
-                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{rag_context}\n\n{system_prompt}"
-                );
-                api_messages.insert(0, ChatMessage::with_cache_control("system", &full_system_prompt));
-                let client = crate::api::OpenAIClient::new(&api_key, &base_url);
-                let req_id_clone = req_id.clone();
-                let tx_clone = event_tx.clone();
+            for step in queue {
+                let Some(role) = AgentRole::from_plan_name(&step.agent) else {
+                    continue;
+                };
 
-                let result = client
-                    .chat_completion(&model_id, api_messages, thinking_mode.as_ref(), move |chunk| {
-                        if let Err(e) =
-                            tx_clone.try_send(AppEvent::ChunkReceived(req_id_clone.clone(), chunk))
-                        {
-                            eprintln!("Dropped stream chunk due to full event queue: {e}");
-                        }
+                let status = match role {
+                    AgentRole::Router => "🔄 Router is analyzing...".to_string(),
+                    AgentRole::SystemAdmin => "🛠️ SystemAdmin is working...".to_string(),
+                    AgentRole::CodeArchitect => "🧠 CodeArchitect is writing...".to_string(),
+                };
+                let _ = event_tx
+                    .send(AppEvent::SwarmStatus {
+                        request_id: req_id.clone(),
+                        status,
                     })
                     .await;
 
-                match result {
-                    Ok(_) => {
-                        let _ = event_tx.send(AppEvent::ResponseComplete(req_id)).await;
+                let mut role_messages = api_messages.clone();
+                let role_prompt = get_system_prompt(&role);
+                let memory_block = if swarm_memory.trim().is_empty() {
+                    "No prior agent outputs.".to_string()
+                } else {
+                    swarm_memory.clone()
+                };
+                let role_system_prompt = format!(
+                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{rag_context}\n\n{role_prompt}\n\nAssigned task:\n{}\n\nSwarm memory:\n{}",
+                    step.task, memory_block
+                );
+                role_messages.insert(0, ChatMessage::with_cache_control("system", &role_system_prompt));
+
+                let role_raw = match client
+                    .chat_completion(
+                        &model_id,
+                        role_messages,
+                        thinking_mode.as_ref(),
+                        |_| {},
+                    )
+                    .await
+                {
+                    Ok(resp) => resp,
+                    Err(e) => {
+                        swarm_memory.push_str(&format!(
+                            "\n[{} error]\n{}\n",
+                            role.as_str(),
+                            e
+                        ));
+                        continue;
+                    }
+                };
+
+                let parsed = crate::parser::parse_response(&role_raw);
+                let display_text = parsed
+                    .message
+                    .as_deref()
+                    .filter(|m| !m.trim().is_empty())
+                    .unwrap_or(parsed.fallback_text.as_str())
+                    .trim()
+                    .to_string();
+                if !display_text.is_empty() {
+                    final_parts.push(format!("{}: {}", role.as_str(), display_text));
+                }
+
+                if let Some(err) = parsed.json_parse_error.as_deref() {
+                    swarm_memory.push_str(&format!("\n[{} parse error]\n{}\n", role.as_str(), err));
+                }
+
+                let filtered_actions: Vec<crate::parser::AgentAction> = parsed
+                    .actions
+                    .into_iter()
+                    .filter(|a| match role {
+                        AgentRole::CodeArchitect => !matches!(a.action, ActionKind::RunCmd),
+                        AgentRole::SystemAdmin => {
+                            shell_enabled || !matches!(a.action, ActionKind::RunCmd)
+                        }
+                        AgentRole::Router => false,
+                    })
+                    .collect();
+
+                if filtered_actions.is_empty() {
+                    swarm_memory.push_str(&format!(
+                        "\n[{}]\nNo executable actions.\n",
+                        role.as_str()
+                    ));
+                    continue;
+                }
+
+                match executor.execute_actions(filtered_actions, true).await {
+                    Ok(statuses) => {
+                        swarm_memory.push_str(&format!("\n[{} execution]\n", role.as_str()));
+                        for status in statuses {
+                            match status {
+                                ExecutionStatus::Executed(report) => {
+                                    swarm_memory.push_str(&format!(
+                                        "action={} success={} exit_code={}\nstdout:\n{}\nstderr:\n{}\n",
+                                        report.action, report.success, report.exit_code, report.stdout, report.stderr
+                                    ));
+                                }
+                                ExecutionStatus::AwaitingApproval(req) => {
+                                    swarm_memory.push_str(&format!(
+                                        "action awaiting approval: {:?}\nreason: {}\n",
+                                        req.action.action, req.reason
+                                    ));
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
-                        let _ = event_tx.send(AppEvent::ResponseError(req_id, e.to_string())).await;
+                        swarm_memory.push_str(&format!(
+                            "\n[{} execution error]\n{}\n",
+                            role.as_str(),
+                            e
+                        ));
                     }
                 }
-            });
-        }
+            }
+
+            let final_output = if final_parts.is_empty() {
+                "Swarm completed. No additional assistant message.".to_string()
+            } else {
+                final_parts.join("\n\n")
+            };
+
+            let _ = event_tx
+                .send(AppEvent::ChunkReceived(req_id.clone(), final_output))
+                .await;
+            let _ = event_tx
+                .send(AppEvent::SwarmStatus {
+                    request_id: req_id.clone(),
+                    status: "✅ Swarm completed".to_string(),
+                })
+                .await;
+            let _ = event_tx.send(AppEvent::ResponseComplete(req_id)).await;
+        });
     }
 
     fn delete_session_by_index(&mut self, idx: usize) {
