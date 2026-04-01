@@ -140,13 +140,19 @@ fn parse_plan_items(plan_text: &str) -> Vec<String> {
         }
 
         // Accept common checklist/bullet formats and normalize to plain text.
-        let normalized = trimmed
-            .trim_start_matches("- [ ]")
-            .trim_start_matches("- [x]")
-            .trim_start_matches("- [X]")
-            .trim_start_matches("- ")
-            .trim_start_matches("* ")
-            .trim();
+        let normalized = if let Some(rest) = trimmed.strip_prefix("- [ ]") {
+            rest.trim()
+        } else if let Some(rest) = trimmed.strip_prefix("- [x]") {
+            rest.trim()
+        } else if let Some(rest) = trimmed.strip_prefix("- [X]") {
+            rest.trim()
+        } else if let Some(rest) = trimmed.strip_prefix("- ") {
+            rest.trim()
+        } else if let Some(rest) = trimmed.strip_prefix("* ") {
+            rest.trim()
+        } else {
+            trimmed
+        };
 
         if !normalized.is_empty() {
             items.push(normalized.to_string());
@@ -157,24 +163,22 @@ fn parse_plan_items(plan_text: &str) -> Vec<String> {
 }
 
 fn clean_inline_section(text: &str) -> String {
-    text.trim().trim_matches('\n').trim().to_string()
+    text.trim().to_string()
 }
 
 fn extract_json_block(text: &str) -> Option<&str> {
-    let captures = json_block_regex().captures(text)?;
-    captures.name("json").map(|m| m.as_str())
+    let captures = json_fence_regex().captures(text)?;
+    let fenced_body = captures.name("body")?.as_str();
+    extract_balanced_json_object(fenced_body)
 }
 
 fn strip_json_block(text: &str) -> String {
-    json_block_regex().replace_all(text, "").to_string()
+    json_fence_regex().replace_all(text, "").to_string()
 }
 
-fn json_block_regex() -> &'static Regex {
+fn json_fence_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"```json\s*(?P<json>\{[\s\S]*?\})\s*```")
-            .expect("json block regex must be valid")
-    })
+    RE.get_or_init(|| Regex::new(r"(?is)```json\s*(?P<body>[\s\S]*?)```").expect("json fence regex must be valid"))
 }
 
 fn tag_matcher_message() -> &'static Regex {
@@ -185,4 +189,51 @@ fn tag_matcher_message() -> &'static Regex {
 fn tag_matcher_plan() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?im)^\s*PLAN:\s*").expect("plan regex must be valid"))
+}
+
+fn extract_balanced_json_object(input: &str) -> Option<&str> {
+    let bytes = input.as_bytes();
+    let mut idx = 0usize;
+
+    while idx < bytes.len() && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    if idx >= bytes.len() || bytes[idx] != b'{' {
+        return None;
+    }
+
+    let start = idx;
+    let mut depth = 1i32;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, ch) in input[start + 1..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let end = start + offset + ch.len_utf8() + 1;
+                    return input.get(start..end);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }

@@ -11,7 +11,7 @@ use crate::api::{builtin_models, provider_models, ChatMessage, ModelInfo, Remote
 use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT_MODEL_ID};
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
 use crate::setup::SetupWizard;
-use crate::telemetry::collect_telemetry;
+use crate::telemetry::collect_telemetry_cached;
 
 const BG_PRIMARY: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
 const BG_SURFACE: Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);
@@ -354,11 +354,6 @@ impl ChatApp {
             .or(Some(false));
     }
 
-    fn execution_json_block_regex() -> &'static Regex {
-        static RE: OnceLock<Regex> = OnceLock::new();
-        RE.get_or_init(|| Regex::new(r"```json\s*(?P<json>\{[\s\S]*?\})\s*```").expect("valid regex"))
-    }
-
     fn extract_tag_block<'a>(text: &'a str, open_tag: &str, close_tag: &str) -> Option<&'a str> {
         let start = text.find(open_tag)?;
         let content_start = start + open_tag.len();
@@ -404,94 +399,6 @@ impl ChatApp {
         None
     }
 
-    fn parse_json_actions_actions_only(message: &str) -> Option<Vec<PendingAction>> {
-        let captures = Self::execution_json_block_regex().captures(message)?;
-        let json = captures.name("json")?.as_str();
-        let value: serde_json::Value = match serde_json::from_str(json) {
-            Ok(v) => v,
-            Err(_) => {
-                eprintln!("Invalid JSON execution block from model");
-                return None;
-            }
-        };
-        let actions = value.get("actions")?.as_array()?;
-
-        let mut parsed = Vec::new();
-        for action_item in actions {
-            let action_name = action_item.get("action")?.as_str()?.trim().to_string();
-            let params = action_item
-                .get("parameters")
-                .and_then(|p| p.as_object())
-                .cloned()
-                .unwrap_or_default();
-
-            match action_name.as_str() {
-                "create_folder" => {
-                    let path = params.get("path")?.as_str()?.trim().to_string();
-                    if !path.is_empty() {
-                        parsed.push(PendingAction::CreateFolder { path });
-                    }
-                }
-                "create_file" => {
-                    let path = params.get("path")?.as_str()?.trim().to_string();
-                    let content = params
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if !path.is_empty() {
-                        parsed.push(PendingAction::WriteFile { path, content });
-                    }
-                }
-                "edit_file" => {
-                    let path = params.get("path")?.as_str()?.trim().to_string();
-                    let mode = params.get("mode")?.as_str()?.trim().to_string();
-                    let content = params
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if !path.is_empty() && (mode == "overwrite" || mode == "append") {
-                        parsed.push(PendingAction::EditFile {
-                            path,
-                            mode,
-                            content,
-                        });
-                    }
-                }
-                "create_pdf" => {
-                    let path = params.get("path")?.as_str()?.trim().to_string();
-                    let title = params
-                        .get("title")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    let content = params
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_string();
-                    if !path.is_empty() {
-                        parsed.push(PendingAction::CreatePdf {
-                            path,
-                            title,
-                            content,
-                        });
-                    }
-                }
-                "run_cmd" => {
-                    let command = params.get("command")?.as_str()?.trim().to_string();
-                    if !command.is_empty() {
-                        parsed.push(PendingAction::ExecuteCommand { command });
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        Some(parsed)
-    }
-
     fn load_message_attachments(&self, message_id: &str) -> Vec<Attachment> {
         if let Ok(guard) = self.db.lock() {
             if let Some(database) = guard.as_ref() {
@@ -526,13 +433,6 @@ impl ChatApp {
             }
         }
         vec![]
-    }
-
-    fn strip_json_execution_block(message: &str) -> String {
-        let cleaned = Self::execution_json_block_regex()
-            .replace_all(message, "")
-            .to_string();
-        cleaned.trim().to_string()
     }
 
     fn resolve_action_path(&self, raw_path: &str) -> std::path::PathBuf {
@@ -943,7 +843,8 @@ Do not fabricate directory listings, command outputs, or success messages.",
                     "disabled"
                 }
             );
-            let telemetry_context = collect_telemetry().to_llm_system_context();
+            let telemetry_context =
+                collect_telemetry_cached(std::time::Duration::from_secs(2)).to_llm_system_context();
             let full_system_prompt = format!("{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{system_prompt}");
             api_messages.push(ChatMessage::with_cache_control("system", &full_system_prompt));
 
@@ -1443,6 +1344,7 @@ Do not fabricate directory listings, command outputs, or success messages.",
                 AppEvent::ResponseComplete(req_id) => {
                     if let Some(active) = self.active_requests.remove(&req_id) {
                         let mut to_save: Option<(String, Message)> = None;
+                        let mut parse_error_notification: Option<String> = None;
                         if let Some(session) = self.sessions.get_mut(active.session_idx) {
                             let session_id = session.id.clone();
                             if let Some(msg) = session.messages.iter_mut().find(|m| m.id == active.message_id) {
@@ -1469,15 +1371,16 @@ Do not fabricate directory listings, command outputs, or success messages.",
                                 }
 
                                 if let Some(err) = parsed.json_parse_error.as_deref() {
-                                    self.notify(format!("Execution block parse error: {err}"), NotificationKind::Error);
+                                    parse_error_notification =
+                                        Some(format!("Execution block parse error: {err}"));
                                 }
 
                                 msg.content = rendered;
 
                                 if self.pending_action.is_none() {
-                                    let parsed_actions = Self::pending_actions_from_agent_actions(parsed.actions);
-                                    if !parsed_actions.is_empty() {
-                                        let mut iter = parsed_actions.into_iter();
+                                    let pending_actions = Self::pending_actions_from_agent_actions(parsed.actions);
+                                    if !pending_actions.is_empty() {
+                                        let mut iter = pending_actions.into_iter();
                                         if let Some(action) = iter.next() {
                                             self.pending_action = Some(action);
                                             self.pending_action_session_idx = Some(active.session_idx);
@@ -1490,6 +1393,9 @@ Do not fabricate directory listings, command outputs, or success messages.",
                                 }
                                 to_save = Some((session_id, msg.clone()));
                             }
+                        }
+                        if let Some(error_text) = parse_error_notification {
+                            self.notify(error_text, NotificationKind::Error);
                         }
                         if let Some((session_id, msg)) = to_save {
                             self.save_message(&session_id, &msg);

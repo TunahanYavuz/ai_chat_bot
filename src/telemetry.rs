@@ -1,3 +1,6 @@
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 use nvml_wrapper::Nvml;
 use sysinfo::System;
@@ -67,10 +70,6 @@ pub fn collect_telemetry() -> TelemetrySnapshot {
     system.refresh_memory();
     system.refresh_cpu_usage();
 
-    // A second refresh gives a more meaningful CPU usage sample.
-    std::thread::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL);
-    system.refresh_cpu_usage();
-
     let total_memory_bytes = system.total_memory();
     let available_memory_bytes = system.available_memory();
     let cpu_usage_percent = system.global_cpu_usage();
@@ -90,6 +89,38 @@ pub fn collect_telemetry() -> TelemetrySnapshot {
         gpus,
         warnings,
     }
+}
+
+/// Returns a cached telemetry snapshot to avoid repeated heavy polling on each prompt dispatch.
+///
+/// The snapshot is refreshed at most once per `ttl`; otherwise a cloned cached value is returned.
+/// This keeps prompt construction responsive while still giving recent hardware context.
+pub fn collect_telemetry_cached(ttl: Duration) -> TelemetrySnapshot {
+    #[derive(Clone)]
+    struct CacheEntry {
+        snapshot: TelemetrySnapshot,
+        collected_at: Instant,
+    }
+
+    static CACHE: OnceLock<Mutex<Option<CacheEntry>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(None));
+
+    if let Ok(mut guard) = cache.lock() {
+        if let Some(entry) = guard.as_ref() {
+            if entry.collected_at.elapsed() < ttl {
+                return entry.snapshot.clone();
+            }
+        }
+
+        let fresh = collect_telemetry();
+        *guard = Some(CacheEntry {
+            snapshot: fresh.clone(),
+            collected_at: Instant::now(),
+        });
+        return fresh;
+    }
+
+    collect_telemetry()
 }
 
 fn collect_nvidia_gpu_telemetry() -> Result<Vec<GpuTelemetry>> {
