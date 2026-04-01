@@ -92,12 +92,14 @@ impl Storage {
         fs::write(&tmp_path, &serialized)
             .await
             .with_context(|| format!("failed to write temp session file {}", tmp_path.display()))?;
-        fs::rename(&tmp_path, &self.paths.latest_session_path).await.with_context(|| {
-            format!(
-                "failed to replace latest session file {}",
-                self.paths.latest_session_path.display()
-            )
-        })?;
+        fs::rename(&tmp_path, &self.paths.latest_session_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to replace latest session file {}",
+                    self.paths.latest_session_path.display()
+                )
+            })?;
         Ok(())
     }
 
@@ -115,8 +117,8 @@ impl Storage {
                     self.paths.latest_session_path.display()
                 )
             })?;
-        let parsed =
-            serde_json::from_slice::<ChatSession>(&bytes).context("failed to parse session JSON")?;
+        let parsed = serde_json::from_slice::<ChatSession>(&bytes)
+            .context("failed to parse session JSON")?;
         Ok(Some(parsed))
     }
 }

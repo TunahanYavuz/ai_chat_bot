@@ -31,12 +31,18 @@ impl TelemetrySnapshot {
         let mut lines = vec![
             "SYSTEM TELEMETRY:".to_string(),
             format!("- CPU usage (total): {:.2}%", self.cpu_usage_percent),
-            format!("- Memory available: {}", format_bytes(self.available_memory_bytes)),
+            format!(
+                "- Memory available: {}",
+                format_bytes(self.available_memory_bytes)
+            ),
             format!("- Memory total: {}", format_bytes(self.total_memory_bytes)),
         ];
 
         if self.gpus.is_empty() {
-            lines.push("- NVIDIA VRAM: unavailable (no supported NVIDIA GPU detected or NVML unavailable)".to_string());
+            lines.push(
+                "- NVIDIA VRAM: unavailable (no supported NVIDIA GPU detected or NVML unavailable)"
+                    .to_string(),
+            );
         } else {
             lines.push("- NVIDIA VRAM:".to_string());
             for gpu in &self.gpus {

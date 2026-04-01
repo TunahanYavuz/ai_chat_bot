@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
 use anyhow::Result;
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 pub const DEFAULT_MODEL_ID: &str = "gpt-4o";
 const OLD_HUGGINGFACE_BASE_URL: &str = "https://api-inference.huggingface.co/v1";
@@ -130,7 +130,9 @@ pub struct Settings {
     pub dark_mode: bool,
 }
 
-fn default_dark_mode() -> bool { true }
+fn default_dark_mode() -> bool {
+    true
+}
 
 impl Settings {
     /// API key for the currently selected provider.
@@ -169,7 +171,10 @@ impl Settings {
         };
         self.provider_configs.insert(
             provider.key().to_string(),
-            ProviderConfig { api_key: api_key.to_string(), base_url: url.clone() },
+            ProviderConfig {
+                api_key: api_key.to_string(),
+                base_url: url.clone(),
+            },
         );
         // Keep legacy fields in sync for OpenAI.
         if *provider == ApiProvider::OpenAI {
@@ -183,7 +188,10 @@ impl Settings {
         let default_url = provider.default_base_url().to_string();
         self.provider_configs
             .entry(provider.key().to_string())
-            .or_insert_with(|| ProviderConfig { api_key: String::new(), base_url: default_url })
+            .or_insert_with(|| ProviderConfig {
+                api_key: String::new(),
+                base_url: default_url,
+            })
     }
 
     /// Read-only API key for any provider (used in the settings dialog).

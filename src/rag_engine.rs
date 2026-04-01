@@ -167,7 +167,10 @@ where
     }
 
     /// Splits documents into overlap-preserving chunks and computes embeddings for each chunk.
-    pub async fn chunk_and_embed(&self, docs: &[WorkspaceDocument]) -> Result<Vec<(ChunkRecord, Vec<f32>)>> {
+    pub async fn chunk_and_embed(
+        &self,
+        docs: &[WorkspaceDocument],
+    ) -> Result<Vec<(ChunkRecord, Vec<f32>)>> {
         let chunks = self.chunk_documents(docs);
         let mut result = Vec::with_capacity(chunks.len());
 
@@ -374,7 +377,10 @@ fn is_allowed_extension(path: &Path) -> bool {
         return false;
     };
 
-    matches!(ext.to_ascii_lowercase().as_str(), "rs" | "py" | "md" | "txt")
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "rs" | "py" | "md" | "txt"
+    )
 }
 
 fn payload_value_to_string(value: &Value) -> Option<String> {

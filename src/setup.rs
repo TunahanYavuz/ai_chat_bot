@@ -125,7 +125,10 @@ impl SetupWizard {
                     }
                     _ => {
                         ui.label("Review configuration:");
-                        ui.label(format!("Provider: {}", self.selected_provider.display_name()));
+                        ui.label(format!(
+                            "Provider: {}",
+                            self.selected_provider.display_name()
+                        ));
                         ui.label(format!("Base URL: {}", self.base_url));
                         ui.label(format!("Default model: {}", self.default_model));
                         ui.label(format!("Working directory: {}", self.working_directory));

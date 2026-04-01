@@ -141,7 +141,9 @@ impl ActionExecutor {
                     "overwrite" => {
                         tokio::fs::write(&full_path, content)
                             .await
-                            .with_context(|| format!("failed to overwrite file {}", full_path.display()))?;
+                            .with_context(|| {
+                                format!("failed to overwrite file {}", full_path.display())
+                            })?;
                     }
                     "append" => {
                         let mut file = tokio::fs::OpenOptions::new()
@@ -149,10 +151,12 @@ impl ActionExecutor {
                             .append(true)
                             .open(&full_path)
                             .await
-                            .with_context(|| format!("failed to open file for append {}", full_path.display()))?;
-                        file.write_all(content.as_bytes())
-                            .await
-                            .with_context(|| format!("failed to append file {}", full_path.display()))?;
+                            .with_context(|| {
+                                format!("failed to open file for append {}", full_path.display())
+                            })?;
+                        file.write_all(content.as_bytes()).await.with_context(|| {
+                            format!("failed to append file {}", full_path.display())
+                        })?;
                     }
                     _ => {
                         return Err(anyhow!(
@@ -172,7 +176,10 @@ impl ActionExecutor {
             }
             ActionKind::CreatePdf => {
                 let path = required_non_empty(action.parameters.path.as_deref(), "path")?;
-                let title = action.parameters.title.unwrap_or_else(|| "Untitled".to_string());
+                let title = action
+                    .parameters
+                    .title
+                    .unwrap_or_else(|| "Untitled".to_string());
                 let content = action.parameters.content.unwrap_or_default();
                 let full_path = self.resolve_path(&path);
 

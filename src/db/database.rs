@@ -1,6 +1,6 @@
 use anyhow::Result;
-use rusqlite::{Connection, params};
 use chrono::{DateTime, Utc};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,28 +93,32 @@ impl Database {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<DbSession>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, created_at FROM sessions ORDER BY created_at DESC",
-        )?;
-        let sessions = stmt.query_map([], |row| {
-            let created_str: String = row.get(2)?;
-            Ok(DbSession {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                created_at: created_str
-                    .parse::<DateTime<Utc>>()
-                    .unwrap_or_else(|_| Utc::now()),
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, created_at FROM sessions ORDER BY created_at DESC")?;
+        let sessions = stmt
+            .query_map([], |row| {
+                let created_str: String = row.get(2)?;
+                Ok(DbSession {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    created_at: created_str
+                        .parse::<DateTime<Utc>>()
+                        .unwrap_or_else(|_| Utc::now()),
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
         Ok(sessions)
     }
 
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM attachments WHERE message_id IN (SELECT id FROM messages WHERE session_id = ?1)", params![session_id])?;
-        tx.execute("DELETE FROM messages WHERE session_id = ?1", params![session_id])?;
+        tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1",
+            params![session_id],
+        )?;
         tx.execute("DELETE FROM sessions WHERE id = ?1", params![session_id])?;
         tx.commit()?;
         Ok(())
@@ -132,20 +136,21 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, role, content, created_at FROM messages WHERE session_id = ?1 ORDER BY created_at ASC",
         )?;
-        let messages = stmt.query_map(params![session_id], |row| {
-            let created_str: String = row.get(4)?;
-            Ok(DbMessage {
-                id: row.get(0)?,
-                session_id: row.get(1)?,
-                role: row.get(2)?,
-                content: row.get(3)?,
-                created_at: created_str
-                    .parse::<DateTime<Utc>>()
-                    .unwrap_or_else(|_| Utc::now()),
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+        let messages = stmt
+            .query_map(params![session_id], |row| {
+                let created_str: String = row.get(4)?;
+                Ok(DbMessage {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    role: row.get(2)?,
+                    content: row.get(3)?,
+                    created_at: created_str
+                        .parse::<DateTime<Utc>>()
+                        .unwrap_or_else(|_| Utc::now()),
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
         Ok(messages)
     }
 
@@ -161,17 +166,18 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT id, message_id, filename, data, mime_type FROM attachments WHERE message_id = ?1",
         )?;
-        let atts = stmt.query_map(params![message_id], |row| {
-            Ok(DbAttachment {
-                id: row.get(0)?,
-                message_id: row.get(1)?,
-                filename: row.get(2)?,
-                data: row.get(3)?,
-                mime_type: row.get(4)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+        let atts = stmt
+            .query_map(params![message_id], |row| {
+                Ok(DbAttachment {
+                    id: row.get(0)?,
+                    message_id: row.get(1)?,
+                    filename: row.get(2)?,
+                    data: row.get(3)?,
+                    mime_type: row.get(4)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
         Ok(atts)
     }
 
@@ -198,7 +204,9 @@ impl Database {
                 id: row.get(0)?,
                 file_path: row.get(1)?,
                 content: row.get(2)?,
-                created_at: created_str.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
+                created_at: created_str
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -215,7 +223,9 @@ impl Database {
                 id: row.get(0)?,
                 file_path: row.get(1)?,
                 content: row.get(2)?,
-                created_at: created_str.parse::<DateTime<Utc>>().unwrap_or_else(|_| Utc::now()),
+                created_at: created_str
+                    .parse::<DateTime<Utc>>()
+                    .unwrap_or_else(|_| Utc::now()),
             }));
         }
         Ok(None)

@@ -1,6 +1,6 @@
-use serde::{Deserialize, Serialize};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThinkingMode {
@@ -20,7 +20,6 @@ impl ThinkingMode {
             ThinkingMode::High => Some("high"),
         }
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -197,7 +196,9 @@ impl OpenAIClient {
             model: model.to_string(),
             messages,
             reasoning_effort: if is_thinking_model && supports_reasoning_effort {
-                thinking_mode.and_then(|m| m.as_reasoning_effort()).map(str::to_string)
+                thinking_mode
+                    .and_then(|m| m.as_reasoning_effort())
+                    .map(str::to_string)
             } else {
                 None
             },

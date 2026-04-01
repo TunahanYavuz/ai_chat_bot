@@ -1,14 +1,16 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, TextFormat, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use serde::Deserialize;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use uuid::Uuid;
 
-use crate::api::{builtin_models, provider_models, ChatMessage, ModelInfo, RemoteModelInfo, ThinkingMode};
+use crate::api::{
+    builtin_models, provider_models, ChatMessage, ModelInfo, RemoteModelInfo, ThinkingMode,
+};
 use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT_MODEL_ID};
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
 use crate::executor::{ActionExecutor, ExecutionStatus};
@@ -178,9 +180,16 @@ impl Session {
 
 #[derive(Debug, Clone)]
 pub enum PendingAction {
-    WriteFile { path: String, content: String },
-    ExecuteCommand { command: String },
-    CreateFolder { path: String },
+    WriteFile {
+        path: String,
+        content: String,
+    },
+    ExecuteCommand {
+        command: String,
+    },
+    CreateFolder {
+        path: String,
+    },
     EditFile {
         path: String,
         mode: String,
@@ -414,7 +423,12 @@ impl ChatApp {
 
             match result {
                 Ok(Ok(sessions)) => {
-                    let _ = tx.send(AppEvent::InitialSessionsLoaded { sessions, error: None }).await;
+                    let _ = tx
+                        .send(AppEvent::InitialSessionsLoaded {
+                            sessions,
+                            error: None,
+                        })
+                        .await;
                 }
                 Ok(Err(e)) => {
                     let _ = tx
@@ -506,7 +520,8 @@ impl ChatApp {
                                     .and_then(|s| s.to_str())
                                     .unwrap_or_default()
                                     .to_lowercase();
-                                let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp");
+                                let is_image =
+                                    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp");
                                 Attachment {
                                     filename: att.filename,
                                     text: if is_image {
@@ -579,14 +594,19 @@ impl ChatApp {
             if exit_code == 0 {
                 "[Command executed successfully with no output]".to_string()
             } else {
-                format!("[Command produced no stdout output (exit code: {})]", exit_code)
+                format!(
+                    "[Command produced no stdout output (exit code: {})]",
+                    exit_code
+                )
             }
         } else {
             stdout.to_string()
         }
     }
 
-    fn pending_actions_from_agent_actions(actions: Vec<crate::parser::AgentAction>) -> Vec<PendingAction> {
+    fn pending_actions_from_agent_actions(
+        actions: Vec<crate::parser::AgentAction>,
+    ) -> Vec<PendingAction> {
         actions
             .into_iter()
             .filter_map(|item| match item.action {
@@ -934,9 +954,13 @@ impl ChatApp {
             .await;
 
             if let Ok(Err(e)) = result {
-                let _ = tx.send(AppEvent::DbError(format!("Failed to save message: {e}"))).await;
+                let _ = tx
+                    .send(AppEvent::DbError(format!("Failed to save message: {e}")))
+                    .await;
             } else if let Err(e) = result {
-                let _ = tx.send(AppEvent::DbError(format!("Failed to save message: {e}"))).await;
+                let _ = tx
+                    .send(AppEvent::DbError(format!("Failed to save message: {e}")))
+                    .await;
             }
         });
     }
@@ -957,9 +981,17 @@ impl ChatApp {
             .await;
 
             if let Ok(Err(e)) = result {
-                let _ = tx.send(AppEvent::DbError(format!("Failed to create DB session: {e}"))).await;
+                let _ = tx
+                    .send(AppEvent::DbError(format!(
+                        "Failed to create DB session: {e}"
+                    )))
+                    .await;
             } else if let Err(e) = result {
-                let _ = tx.send(AppEvent::DbError(format!("Failed to create DB session: {e}"))).await;
+                let _ = tx
+                    .send(AppEvent::DbError(format!(
+                        "Failed to create DB session: {e}"
+                    )))
+                    .await;
             }
         });
     }
@@ -975,9 +1007,17 @@ impl ChatApp {
             .await;
 
             if let Ok(Err(e)) = result {
-                let _ = tx.send(AppEvent::DbError(format!("Failed to delete conversation: {e}"))).await;
+                let _ = tx
+                    .send(AppEvent::DbError(format!(
+                        "Failed to delete conversation: {e}"
+                    )))
+                    .await;
             } else if let Err(e) = result {
-                let _ = tx.send(AppEvent::DbError(format!("Failed to delete conversation: {e}"))).await;
+                let _ = tx
+                    .send(AppEvent::DbError(format!(
+                        "Failed to delete conversation: {e}"
+                    )))
+                    .await;
             }
         });
     }
@@ -993,11 +1033,15 @@ impl ChatApp {
             .await;
             if let Ok(Err(e)) = result {
                 let _ = tx
-                    .send(AppEvent::DbError(format!("Failed to persist file snapshot: {e}")))
+                    .send(AppEvent::DbError(format!(
+                        "Failed to persist file snapshot: {e}"
+                    )))
                     .await;
             } else if let Err(e) = result {
                 let _ = tx
-                    .send(AppEvent::DbError(format!("Failed to persist file snapshot: {e}")))
+                    .send(AppEvent::DbError(format!(
+                        "Failed to persist file snapshot: {e}"
+                    )))
                     .await;
             }
         });
@@ -1007,11 +1051,12 @@ impl ChatApp {
         let db_path = self.db_path.clone();
         let tx = self.event_tx.clone();
         self.tokio_rt.spawn(async move {
-            let result = tokio::task::spawn_blocking(move || -> Result<Vec<DbFileSnapshot>, String> {
-                let db = Database::new(&db_path).map_err(|e| e.to_string())?;
-                db.list_file_snapshots(50).map_err(|e| e.to_string())
-            })
-            .await;
+            let result =
+                tokio::task::spawn_blocking(move || -> Result<Vec<DbFileSnapshot>, String> {
+                    let db = Database::new(&db_path).map_err(|e| e.to_string())?;
+                    db.list_file_snapshots(50).map_err(|e| e.to_string())
+                })
+                .await;
             match result {
                 Ok(Ok(snapshots)) => {
                     let _ = tx
@@ -1266,12 +1311,11 @@ impl ChatApp {
             self.custom_model_id.trim().to_string()
         };
 
-        if self
+        if !self
             .sessions
             .get(session_idx)
             .map(|s| s.messages.iter().any(|m| m.role == Role::User))
             .unwrap_or(false)
-            == false
         {
             return;
         }
@@ -1329,7 +1373,12 @@ impl ChatApp {
                 if msg.attachments.iter().any(|a| a.image_base64.is_some()) {
                     for att in &msg.attachments {
                         if let Some(b64) = &att.image_base64 {
-                            api_messages.push(ChatMessage::with_image(role, &msg.content, b64, &att.mime_type));
+                            api_messages.push(ChatMessage::with_image(
+                                role,
+                                &msg.content,
+                                b64,
+                                &att.mime_type,
+                            ));
                         }
                     }
                 } else {
@@ -1344,7 +1393,11 @@ impl ChatApp {
             }
         }
 
-        let thinking_mode = if self.current_model().map(|m| m.supports_thinking()).unwrap_or(false) {
+        let thinking_mode = if self
+            .current_model()
+            .map(|m| m.supports_thinking())
+            .unwrap_or(false)
+        {
             Some(self.selected_thinking_mode.clone())
         } else {
             None
@@ -1492,10 +1545,13 @@ impl ChatApp {
                     .into_iter()
                     .filter(|a| match role {
                         AgentRole::CodeArchitect => !matches!(a.action, ActionKind::RunCmd),
-                        AgentRole::SystemAdmin => {
-                            shell_enabled || !matches!(a.action, ActionKind::RunCmd)
+                        AgentRole::SystemAdmin => !matches!(a.action, ActionKind::RunCmd) || shell_enabled,
+                        AgentRole::Router => {
+                            swarm_memory.push_str(
+                                "\n[Router warning]\nRouter emitted actions unexpectedly; actions were ignored.\n",
+                            );
+                            false
                         }
-                        AgentRole::Router => false,
                     })
                     .collect();
 
@@ -1570,7 +1626,8 @@ impl ChatApp {
             Some(current) if current > idx => Some(current - 1),
             other => other,
         };
-        self.activity_log.push(format!("Deleted conversation: {}", session_name));
+        self.activity_log
+            .push(format!("Deleted conversation: {}", session_name));
         self.notify("Conversation deleted", NotificationKind::Info);
     }
 
@@ -1580,7 +1637,8 @@ impl ChatApp {
 
         self.sessions.insert(0, session);
         self.current_session_idx = Some(0);
-        self.activity_log.push("Created new conversation".to_string());
+        self.activity_log
+            .push("Created new conversation".to_string());
     }
 
     fn load_session_messages(&mut self, idx: usize) {
@@ -1603,7 +1661,10 @@ impl ChatApp {
         let content = match std::fs::read(full_path) {
             Ok(content) => content,
             Err(e) => {
-                self.notify(format!("Could not snapshot file before write: {e}"), NotificationKind::Error);
+                self.notify(
+                    format!("Could not snapshot file before write: {e}"),
+                    NotificationKind::Error,
+                );
                 return;
             }
         };
@@ -1685,16 +1746,60 @@ impl ChatApp {
             let is_keyword = match ext.as_str() {
                 "rs" => matches!(
                     word_buffer.as_str(),
-                    "fn" | "let" | "mut" | "pub" | "impl" | "struct" | "enum" | "match" | "if"
-                        | "else" | "for" | "while" | "use" | "mod" | "return" | "const"
-                        | "static" | "trait" | "type" | "async" | "await" | "unsafe" | "where"
+                    "fn" | "let"
+                        | "mut"
+                        | "pub"
+                        | "impl"
+                        | "struct"
+                        | "enum"
+                        | "match"
+                        | "if"
+                        | "else"
+                        | "for"
+                        | "while"
+                        | "use"
+                        | "mod"
+                        | "return"
+                        | "const"
+                        | "static"
+                        | "trait"
+                        | "type"
+                        | "async"
+                        | "await"
+                        | "unsafe"
+                        | "where"
                 ),
                 "py" => matches!(
                     word_buffer.as_str(),
-                    "def" | "class" | "if" | "elif" | "else" | "for" | "while" | "import" | "from"
-                        | "return" | "with" | "as" | "try" | "except" | "lambda" | "async"
-                        | "await" | "yield" | "finally" | "raise" | "assert" | "pass"
-                        | "break" | "continue" | "global" | "nonlocal" | "and" | "or" | "not"
+                    "def"
+                        | "class"
+                        | "if"
+                        | "elif"
+                        | "else"
+                        | "for"
+                        | "while"
+                        | "import"
+                        | "from"
+                        | "return"
+                        | "with"
+                        | "as"
+                        | "try"
+                        | "except"
+                        | "lambda"
+                        | "async"
+                        | "await"
+                        | "yield"
+                        | "finally"
+                        | "raise"
+                        | "assert"
+                        | "pass"
+                        | "break"
+                        | "continue"
+                        | "global"
+                        | "nonlocal"
+                        | "and"
+                        | "or"
+                        | "not"
                 ),
                 "md" => word_buffer.starts_with('#') || word_buffer == "```",
                 _ => false,
@@ -1789,7 +1894,10 @@ impl ChatApp {
                 self.ensure_changed_file_tracked(path.clone());
                 self.notify(format!("Saved {}", path), NotificationKind::Info);
             }
-            Err(e) => self.notify(format!("Save failed for {}: {}", path, e), NotificationKind::Error),
+            Err(e) => self.notify(
+                format!("Save failed for {}: {}", path, e),
+                NotificationKind::Error,
+            ),
         }
     }
 
@@ -1847,7 +1955,11 @@ impl ChatApp {
                 AppEvent::ChunkReceived(req_id, chunk) => {
                     if let Some(active) = self.active_requests.get(&req_id).cloned() {
                         if let Some(session) = self.sessions.get_mut(active.session_idx) {
-                            if let Some(msg) = session.messages.iter_mut().find(|m| m.id == active.message_id) {
+                            if let Some(msg) = session
+                                .messages
+                                .iter_mut()
+                                .find(|m| m.id == active.message_id)
+                            {
                                 msg.content.push_str(&chunk);
                             }
                         }
@@ -1859,7 +1971,11 @@ impl ChatApp {
                         let mut parse_error_notification: Option<String> = None;
                         if let Some(session) = self.sessions.get_mut(active.session_idx) {
                             let session_id = session.id.clone();
-                            if let Some(msg) = session.messages.iter_mut().find(|m| m.id == active.message_id) {
+                            if let Some(msg) = session
+                                .messages
+                                .iter_mut()
+                                .find(|m| m.id == active.message_id)
+                            {
                                 msg.is_streaming = false;
                                 let parsed = crate::parser::parse_response(&msg.content);
                                 let mut rendered = String::new();
@@ -1890,15 +2006,19 @@ impl ChatApp {
                                 msg.content = rendered;
 
                                 if self.pending_action.is_none() {
-                                    let parsed_actions = Self::pending_actions_from_agent_actions(parsed.actions);
+                                    let parsed_actions =
+                                        Self::pending_actions_from_agent_actions(parsed.actions);
                                     if !parsed_actions.is_empty() {
                                         let mut iter = parsed_actions.into_iter();
                                         if let Some(action) = iter.next() {
                                             self.pending_action = Some(action);
-                                            self.pending_action_session_idx = Some(active.session_idx);
+                                            self.pending_action_session_idx =
+                                                Some(active.session_idx);
                                             self.pending_actions_queue = iter.collect();
                                         }
-                                    } else if let Some(action) = Self::parse_pending_action(&msg.content) {
+                                    } else if let Some(action) =
+                                        Self::parse_pending_action(&msg.content)
+                                    {
                                         self.pending_action = Some(action);
                                         self.pending_action_session_idx = Some(active.session_idx);
                                     }
@@ -1913,18 +2033,33 @@ impl ChatApp {
                             self.save_message(&session_id, &msg);
                         }
                         self.persist_session_snapshot_async(active.session_idx);
-                        self.activity_log.push(format!("{} finished response", active.agent_name));
+                        self.activity_log
+                            .push(format!("{} finished response", active.agent_name));
+                        self.swarm_status = "✅ Ready".to_string();
                     }
                 }
                 AppEvent::ResponseError(req_id, err) => {
                     if let Some(active) = self.active_requests.remove(&req_id) {
                         if let Some(session) = self.sessions.get_mut(active.session_idx) {
-                            if let Some(msg) = session.messages.iter_mut().find(|m| m.id == active.message_id) {
+                            if let Some(msg) = session
+                                .messages
+                                .iter_mut()
+                                .find(|m| m.id == active.message_id)
+                            {
                                 msg.content = format!("❌ Error: {}", err);
                                 msg.is_streaming = false;
                             }
                         }
-                        self.notify(format!("{} failed: {}", active.agent_name, err), NotificationKind::Error);
+                        self.notify(
+                            format!("{} failed: {}", active.agent_name, err),
+                            NotificationKind::Error,
+                        );
+                        self.swarm_status = "⚠️ Swarm failed".to_string();
+                    }
+                }
+                AppEvent::SwarmStatus { request_id, status } => {
+                    if self.active_requests.contains_key(&request_id) {
+                        self.swarm_status = status;
                     }
                 }
                 AppEvent::ModelsLoaded(model_ids) => {
@@ -1984,7 +2119,8 @@ impl ChatApp {
                                 term.output.push('\n');
                             }
                         }
-                        term.output.push_str(&format!("\n[exit code: {}]\n", exit_code));
+                        term.output
+                            .push_str(&format!("\n[exit code: {}]\n", exit_code));
                         if term.owner == TerminalOwner::AI && self.model_waiting_command_output {
                             if let Some(session_idx) = term.linked_session_idx {
                                 let mut result = format!(
@@ -2025,16 +2161,24 @@ impl ChatApp {
                         }
                     }
                 }
-                AppEvent::SessionMessagesLoaded { idx, messages, error } => {
+                AppEvent::SessionMessagesLoaded {
+                    idx,
+                    messages,
+                    error,
+                } => {
                     if let Some(err) = error {
-                        self.notify(format!("Failed to load messages: {err}"), NotificationKind::Error);
+                        self.notify(
+                            format!("Failed to load messages: {err}"),
+                            NotificationKind::Error,
+                        );
                     } else if let Some(session) = self.sessions.get_mut(idx) {
                         session.messages = messages;
                     }
                 }
                 AppEvent::StoredSessionLoaded { session, error } => {
                     if let Some(err) = error {
-                        self.activity_log.push(format!("Failed to load stored session: {err}"));
+                        self.activity_log
+                            .push(format!("Failed to load stored session: {err}"));
                     } else if self.sessions.is_empty() {
                         if let Some(stored) = session {
                             self.sessions.push(stored);
@@ -2047,7 +2191,10 @@ impl ChatApp {
                 AppEvent::SnapshotsLoaded { snapshots, error } => {
                     if let Some(err) = error {
                         self.snapshots.clear();
-                        self.notify(format!("Failed to load snapshots: {err}"), NotificationKind::Error);
+                        self.notify(
+                            format!("Failed to load snapshots: {err}"),
+                            NotificationKind::Error,
+                        );
                     } else {
                         self.snapshots = snapshots;
                     }
@@ -2090,9 +2237,15 @@ impl ChatApp {
     }
 
     fn download_image(&mut self, att: &Attachment) {
-        if let Some(path) = rfd::FileDialog::new().set_file_name(&att.filename).save_file() {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name(&att.filename)
+            .save_file()
+        {
             if let Err(e) = std::fs::write(&path, &att.raw_bytes) {
-                self.notify(format!("Failed to save image: {e}"), NotificationKind::Error);
+                self.notify(
+                    format!("Failed to save image: {e}"),
+                    NotificationKind::Error,
+                );
             } else {
                 self.notify("Image saved", NotificationKind::Info);
             }
@@ -2103,7 +2256,10 @@ impl ChatApp {
         if let Some(path) = rfd::FileDialog::new().pick_folder() {
             self.settings.working_directory = path.to_string_lossy().to_string();
             if let Err(e) = save_settings(&self.settings) {
-                self.notify(format!("Failed to save settings: {e}"), NotificationKind::Error);
+                self.notify(
+                    format!("Failed to save settings: {e}"),
+                    NotificationKind::Error,
+                );
             }
         }
     }
@@ -2181,7 +2337,11 @@ impl ChatApp {
             .resizable(true)
             .default_width(280.0)
             .min_width(200.0)
-            .frame(egui::Frame::new().fill(BURGUNDY_DARK).inner_margin(egui::Margin::same(8)))
+            .frame(
+                egui::Frame::new()
+                    .fill(BURGUNDY_DARK)
+                    .inner_margin(egui::Margin::same(8)),
+            )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new("Editor").color(TEXT_PRIMARY).strong());
@@ -2204,7 +2364,11 @@ impl ChatApp {
                             });
                         }
                         if self.changed_files.is_empty() {
-                            ui.label(RichText::new("No changed files yet").small().color(TEXT_MUTED));
+                            ui.label(
+                                RichText::new("No changed files yet")
+                                    .small()
+                                    .color(TEXT_MUTED),
+                            );
                         }
                     });
                 });
@@ -2230,16 +2394,23 @@ impl ChatApp {
                         } else {
                             filename
                         };
-                        let button = egui::Button::new(
-                            RichText::new(label)
-                                .small()
-                                .color(if selected { DARK_TEXT } else { LIGHT_TEXT }),
-                        )
-                        .sense(egui::Sense::click())
-                        .fill(if selected { GOLD } else { SKY_BLUE_DARK });
-                        let response = ui
-                            .add(button)
-                            .on_hover_text(if is_dirty { "Unsaved changes" } else { "Saved" });
+                        let button =
+                            egui::Button::new(RichText::new(label).small().color(if selected {
+                                DARK_TEXT
+                            } else {
+                                LIGHT_TEXT
+                            }))
+                            .sense(egui::Sense::click())
+                            .fill(if selected {
+                                GOLD
+                            } else {
+                                SKY_BLUE_DARK
+                            });
+                        let response = ui.add(button).on_hover_text(if is_dirty {
+                            "Unsaved changes"
+                        } else {
+                            "Saved"
+                        });
                         if response.clicked() {
                             self.active_open_file = Some(path.clone());
                         }
@@ -2308,11 +2479,19 @@ impl ChatApp {
                         );
                         self.active_terminal_id = Some(id);
                     }
-                        if let Some(active_id) = self.active_terminal_id.clone() {
-                        if ui.button("Terminate").on_hover_text("Stop the running process").clicked() {
+                    if let Some(active_id) = self.active_terminal_id.clone() {
+                        if ui
+                            .button("Terminate")
+                            .on_hover_text("Stop the running process")
+                            .clicked()
+                        {
                             self.terminate_terminal(&active_id);
                         }
-                        if ui.button("Close").on_hover_text("Close this terminal tab").clicked() {
+                        if ui
+                            .button("Close")
+                            .on_hover_text("Close this terminal tab")
+                            .clicked()
+                        {
                             self.remove_terminal(&active_id);
                         }
                     }
@@ -2324,15 +2503,24 @@ impl ChatApp {
                         let selected = self.active_terminal_id.as_deref() == Some(term.id.as_str());
                         let label = format!(
                             "{} {}",
-                            if term.owner == TerminalOwner::AI { "🤖" } else { "👤" },
+                            if term.owner == TerminalOwner::AI {
+                                "🤖"
+                            } else {
+                                "👤"
+                            },
                             term.name
                         );
-                        let button = egui::Button::new(
-                            RichText::new(label)
-                                .small()
-                                .color(if selected { DARK_TEXT } else { LIGHT_TEXT }),
-                        )
-                        .fill(if selected { GOLD } else { SKY_BLUE_DARK });
+                        let button =
+                            egui::Button::new(RichText::new(label).small().color(if selected {
+                                DARK_TEXT
+                            } else {
+                                LIGHT_TEXT
+                            }))
+                            .fill(if selected {
+                                GOLD
+                            } else {
+                                SKY_BLUE_DARK
+                            });
                         if ui.add(button).clicked() {
                             self.active_terminal_id = Some(term.id.clone());
                         }
@@ -2367,7 +2555,10 @@ impl ChatApp {
                         let term_input = ui.add(
                             TextEdit::multiline(&mut term.input_buffer)
                                 .desired_rows(2)
-                                .desired_width((ui.available_width() - TERMINAL_INPUT_RESERVED_WIDTH).max(120.0))
+                                .desired_width(
+                                    (ui.available_width() - TERMINAL_INPUT_RESERVED_WIDTH)
+                                        .max(120.0),
+                                )
                                 .hint_text("command"),
                         );
                         let submit_on_enter = term_input.has_focus()
@@ -2438,7 +2629,11 @@ impl ChatApp {
                             style.visuals.override_text_color = Some(text_color);
                             ui.scope(|ui| {
                                 ui.set_style(style);
-                                CommonMarkViewer::new().show(ui, &mut self.markdown_cache, &msg.content);
+                                CommonMarkViewer::new().show(
+                                    ui,
+                                    &mut self.markdown_cache,
+                                    &msg.content,
+                                );
                             });
                         }
 
@@ -2447,16 +2642,23 @@ impl ChatApp {
                             if att.image_base64.is_some() {
                                 if ui
                                     .button(
-                                        RichText::new(format!("🖼 {} (click to download)", att.filename))
-                                            .color(SKY_BLUE)
-                                            .small(),
+                                        RichText::new(format!(
+                                            "🖼 {} (click to download)",
+                                            att.filename
+                                        ))
+                                        .color(SKY_BLUE)
+                                        .small(),
                                     )
                                     .clicked()
                                 {
                                     self.download_image(att);
                                 }
                             } else {
-                                ui.label(RichText::new(format!("📄 {}", att.filename)).color(SKY_BLUE).small());
+                                ui.label(
+                                    RichText::new(format!("📄 {}", att.filename))
+                                        .color(SKY_BLUE)
+                                        .small(),
+                                );
                             }
                         }
 
@@ -2488,7 +2690,10 @@ impl eframe::App for ChatApp {
                 self.setup_wizard = None;
                 self.load_models_from_provider();
                 if let Err(e) = save_settings(&self.settings) {
-                    self.notify(format!("Failed to save settings: {e}"), NotificationKind::Error);
+                    self.notify(
+                        format!("Failed to save settings: {e}"),
+                        NotificationKind::Error,
+                    );
                 } else {
                     self.notify("Setup complete", NotificationKind::Info);
                 }
@@ -2545,10 +2750,16 @@ impl eframe::App for ChatApp {
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.button(RichText::new("✅ Approve").color(LIGHT_TEXT)).clicked() {
+                        if ui
+                            .button(RichText::new("✅ Approve").color(LIGHT_TEXT))
+                            .clicked()
+                        {
                             approved = true;
                         }
-                        if ui.button(RichText::new("❌ Reject").color(LIGHT_TEXT)).clicked() {
+                        if ui
+                            .button(RichText::new("❌ Reject").color(LIGHT_TEXT))
+                            .clicked()
+                        {
                             rejected = true;
                         }
                     });
@@ -2565,13 +2776,20 @@ impl eframe::App for ChatApp {
                             self.notify(format!("Write failed: {e}"), NotificationKind::Error);
                             self.append_system_message(
                                 action_session_idx,
-                                format!("❌ File write failed for `{}`: {}", full_path.display(), e),
+                                format!(
+                                    "❌ File write failed for `{}`: {}",
+                                    full_path.display(),
+                                    e
+                                ),
                             );
                             if let Some(idx) = action_session_idx {
                                 self.dispatch_agent_requests(idx);
                             }
                         } else {
-                            self.notify(format!("File written: {}", full_path.display()), NotificationKind::Info);
+                            self.notify(
+                                format!("File written: {}", full_path.display()),
+                                NotificationKind::Info,
+                            );
                             self.ensure_changed_file_tracked(full_path_str.clone());
                             self.open_file_in_workspace(full_path_str.clone());
                             self.append_system_message(
@@ -2589,7 +2807,8 @@ impl eframe::App for ChatApp {
                             self.notify("Shell execution is disabled", NotificationKind::Error);
                             self.append_system_message(
                                 action_session_idx,
-                                "❌ Command not executed: shell execution is disabled in settings.".to_string(),
+                                "❌ Command not executed: shell execution is disabled in settings."
+                                    .to_string(),
                             );
                             if let Some(idx) = action_session_idx {
                                 self.dispatch_agent_requests(idx);
@@ -2610,7 +2829,10 @@ impl eframe::App for ChatApp {
                             );
                             self.model_waiting_command_output = true;
                             self.spawn_terminal_command(&tid, command.clone());
-                            self.notify("AI command started in dedicated terminal", NotificationKind::Info);
+                            self.notify(
+                                "AI command started in dedicated terminal",
+                                NotificationKind::Info,
+                            );
                         }
                     }
                     PendingAction::CreateFolder { path } => {
@@ -2630,10 +2852,17 @@ impl eframe::App for ChatApp {
                                 }
                             }
                             Err(e) => {
-                                self.notify(format!("Create folder failed: {e}"), NotificationKind::Error);
+                                self.notify(
+                                    format!("Create folder failed: {e}"),
+                                    NotificationKind::Error,
+                                );
                                 self.append_system_message(
                                     action_session_idx,
-                                    format!("❌ Folder create failed for `{}`: {}", full_path.display(), e),
+                                    format!(
+                                        "❌ Folder create failed for `{}`: {}",
+                                        full_path.display(),
+                                        e
+                                    ),
                                 );
                                 if let Some(idx) = action_session_idx {
                                     self.dispatch_agent_requests(idx);
@@ -2667,7 +2896,10 @@ impl eframe::App for ChatApp {
                         };
                         match result {
                             Ok(_) => {
-                                self.notify(format!("File edited: {}", full_path.display()), NotificationKind::Info);
+                                self.notify(
+                                    format!("File edited: {}", full_path.display()),
+                                    NotificationKind::Info,
+                                );
                                 self.ensure_changed_file_tracked(full_path_str.clone());
                                 self.open_file_in_workspace(full_path_str.clone());
                                 self.append_system_message(
@@ -2683,7 +2915,11 @@ impl eframe::App for ChatApp {
                                 self.notify(format!("Edit failed: {e}"), NotificationKind::Error);
                                 self.append_system_message(
                                     action_session_idx,
-                                    format!("❌ File edit failed for `{}`: {}", full_path.display(), e),
+                                    format!(
+                                        "❌ File edit failed for `{}`: {}",
+                                        full_path.display(),
+                                        e
+                                    ),
                                 );
                                 if let Some(idx) = action_session_idx {
                                     self.dispatch_agent_requests(idx);
@@ -2730,14 +2966,16 @@ impl eframe::App for ChatApp {
                             let obj1 = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
                             offsets.push(pdf.len());
                             pdf.push_str(obj1);
-                            let obj2 = "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n";
+                            let obj2 =
+                                "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n";
                             offsets.push(pdf.len());
                             pdf.push_str(obj2);
                             let obj3 =
                                 "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>\nendobj\n";
                             offsets.push(pdf.len());
                             pdf.push_str(obj3);
-                            let stream_cmd = format!("BT /F1 12 Tf 72 720 Td ({normalized}) Tj ET\n");
+                            let stream_cmd =
+                                format!("BT /F1 12 Tf 72 720 Td ({normalized}) Tj ET\n");
                             let obj4 = format!(
                                 "4 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
                                 stream_cmd.len(),
@@ -2771,10 +3009,17 @@ impl eframe::App for ChatApp {
                                     }
                                 }
                                 Err(e) => {
-                                    self.notify(format!("Create PDF failed: {e}"), NotificationKind::Error);
+                                    self.notify(
+                                        format!("Create PDF failed: {e}"),
+                                        NotificationKind::Error,
+                                    );
                                     self.append_system_message(
                                         action_session_idx,
-                                        format!("❌ PDF create failed for `{}`: {}", full_path.display(), e),
+                                        format!(
+                                            "❌ PDF create failed for `{}`: {}",
+                                            full_path.display(),
+                                            e
+                                        ),
                                     );
                                     if let Some(idx) = action_session_idx {
                                         self.dispatch_agent_requests(idx);
@@ -2794,7 +3039,8 @@ impl eframe::App for ChatApp {
             if rejected {
                 self.append_system_message(
                     self.pending_action_session_idx,
-                    "❌ Action rejected by user. No file write or command execution was performed.".to_string(),
+                    "❌ Action rejected by user. No file write or command execution was performed."
+                        .to_string(),
                 );
                 if let Some(idx) = self.pending_action_session_idx {
                     self.dispatch_agent_requests(idx);
@@ -2822,7 +3068,11 @@ impl eframe::App for ChatApp {
                                 .selected_text(selected_provider.display_name())
                                 .show_ui(ui, |ui| {
                                     for p in ApiProvider::all() {
-                                        ui.selectable_value(&mut selected_provider, p.clone(), p.display_name());
+                                        ui.selectable_value(
+                                            &mut selected_provider,
+                                            p.clone(),
+                                            p.display_name(),
+                                        );
                                     }
                                 });
                             ui.end_row();
@@ -2862,7 +3112,10 @@ impl eframe::App for ChatApp {
                                     .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
                             }
                             if let Err(e) = save_settings(&self.settings) {
-                                self.notify(format!("Failed to save settings: {e}"), NotificationKind::Error);
+                                self.notify(
+                                    format!("Failed to save settings: {e}"),
+                                    NotificationKind::Error,
+                                );
                             } else {
                                 self.notify("Settings saved", NotificationKind::Info);
                                 Self::apply_theme(ctx, self.settings.dark_mode);
@@ -2911,7 +3164,11 @@ impl eframe::App for ChatApp {
                 .resizable(true)
                 .default_width(260.0)
                 .min_width(180.0)
-                .frame(egui::Frame::new().fill(BG_SURFACE).inner_margin(egui::Margin::same(8)))
+                .frame(
+                    egui::Frame::new()
+                        .fill(BG_SURFACE)
+                        .inner_margin(egui::Margin::same(8)),
+                )
                 .show(ctx, |ui| {
                     ui.label(
                         RichText::new("🤖 AI Chat Bot")
@@ -2924,7 +3181,8 @@ impl eframe::App for ChatApp {
                     if ui
                         .add_sized(
                             [ui.available_width(), 32.0],
-                            egui::Button::new(RichText::new("＋ New Chat").color(TEXT_DARK)).fill(GOLD),
+                            egui::Button::new(RichText::new("＋ New Chat").color(TEXT_DARK))
+                                .fill(GOLD),
                         )
                         .clicked()
                     {
@@ -2988,7 +3246,9 @@ impl eframe::App for ChatApp {
                             .stroke(egui::Stroke::new(1.0, outline_color))
                             .show(ui, |ui| {
                                 egui::ComboBox::from_id_salt("model_selector")
-                                    .selected_text(RichText::new(selected_model_name).color(TEXT_PRIMARY))
+                                    .selected_text(
+                                        RichText::new(selected_model_name).color(TEXT_PRIMARY),
+                                    )
                                     .width(ui.available_width())
                                     .show_ui(ui, |ui| {
                                         for (i, m) in self.models.iter().enumerate() {
@@ -3000,7 +3260,10 @@ impl eframe::App for ChatApp {
                                         }
                                         if !self.remote_models.is_empty() {
                                             ui.separator();
-                                            ui.label(RichText::new("Remote model IDs:").color(TEXT_PRIMARY));
+                                            ui.label(
+                                                RichText::new("Remote model IDs:")
+                                                    .color(TEXT_PRIMARY),
+                                            );
                                             for m in self.remote_models.iter().take(5) {
                                                 let mut extra = String::new();
                                                 if m.premium {
@@ -3034,7 +3297,8 @@ impl eframe::App for ChatApp {
                                         .map(|m| m.id.clone())
                                         .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
                                 }
-                                self.settings.default_model = self.custom_model_id.trim().to_string();
+                                self.settings.default_model =
+                                    self.custom_model_id.trim().to_string();
                                 let _ = save_settings(&self.settings);
                                 self.refresh_model_access_outline();
                             }
@@ -3123,7 +3387,10 @@ impl eframe::App for ChatApp {
                             ui.checkbox(&mut agent.enabled, &agent.name);
                         }
                         ui.separator();
-                        ui.checkbox(&mut self.settings.shell_execution_enabled, "Shell execution");
+                        ui.checkbox(
+                            &mut self.settings.shell_execution_enabled,
+                            "Shell execution",
+                        );
                         ui.checkbox(&mut self.settings.dark_mode, "Dark mode");
                         if ui.button("Apply theme").clicked() {
                             Self::apply_theme(ctx, self.settings.dark_mode);
@@ -3152,7 +3419,11 @@ impl eframe::App for ChatApp {
             egui::SidePanel::right("activity")
                 .resizable(true)
                 .default_width(220.0)
-                .frame(egui::Frame::new().fill(BURGUNDY_DARK).inner_margin(egui::Margin::same(8)))
+                .frame(
+                    egui::Frame::new()
+                        .fill(BURGUNDY_DARK)
+                        .inner_margin(egui::Margin::same(8)),
+                )
                 .show(ctx, |ui| {
                     ui.collapsing("Activity Monitor", |ui| {
                         for req in self.active_requests.values() {
@@ -3174,7 +3445,11 @@ impl eframe::App for ChatApp {
         self.render_bottom_terminal_panel(ctx);
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(BURGUNDY).inner_margin(egui::Margin::same(0)))
+            .frame(
+                egui::Frame::new()
+                    .fill(BURGUNDY)
+                    .inner_margin(egui::Margin::same(0)),
+            )
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .fill(BURGUNDY_DARK)
@@ -3193,7 +3468,7 @@ impl eframe::App for ChatApp {
                             );
                             if !self.active_requests.is_empty() {
                                 ui.spinner();
-                                ui.label(RichText::new("Agents thinking...").color(GOLD).italics());
+                                ui.label(RichText::new(&self.swarm_status).color(GOLD).italics());
                             }
                         });
                     });
@@ -3229,9 +3504,11 @@ impl eframe::App for ChatApp {
                                 } else {
                                     ui.centered_and_justified(|ui| {
                                         ui.label(
-                                            RichText::new("Select or create a conversation to begin")
-                                                .color(Color32::from_rgb(180, 130, 135))
-                                                .font(FontId::proportional(16.0)),
+                                            RichText::new(
+                                                "Select or create a conversation to begin",
+                                            )
+                                            .color(Color32::from_rgb(180, 130, 135))
+                                            .font(FontId::proportional(16.0)),
                                         );
                                     });
                                 }
@@ -3277,7 +3554,10 @@ impl eframe::App for ChatApp {
                                 if ui
                                     .add_sized(
                                         [110.0, 36.0],
-                                        egui::Button::new(RichText::new("📤 Send").color(DARK_TEXT)).fill(GOLD),
+                                        egui::Button::new(
+                                            RichText::new("📤 Send").color(DARK_TEXT),
+                                        )
+                                        .fill(GOLD),
                                     )
                                     .clicked()
                                 {
@@ -3286,7 +3566,10 @@ impl eframe::App for ChatApp {
                                 if ui
                                     .add_sized(
                                         [110.0, 28.0],
-                                        egui::Button::new(RichText::new("📎 Attach").color(LIGHT_TEXT)).fill(SKY_BLUE_DARK),
+                                        egui::Button::new(
+                                            RichText::new("📎 Attach").color(LIGHT_TEXT),
+                                        )
+                                        .fill(SKY_BLUE_DARK),
                                     )
                                     .clicked()
                                 {

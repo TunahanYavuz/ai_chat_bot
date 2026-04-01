@@ -35,8 +35,7 @@ pub struct RoutedTask {
 
 pub fn get_system_prompt(role: &AgentRole) -> String {
     match role {
-        AgentRole::Router => {
-            r#"You are the Router in a multi-agent swarm.
+        AgentRole::Router => r#"You are the Router in a multi-agent swarm.
 Your ONLY job is to create a routing plan and return STRICT JSON.
 Output ONLY a JSON array with no markdown, no prose, no code fences.
 Array schema:
@@ -48,13 +47,13 @@ Rules:
 - Allowed agent values: "SystemAdmin", "CodeArchitect"
 - Keep task text concise and executable.
 - Keep order exactly as execution order.
-- If no execution is needed, return []"#
-                .to_string()
-        }
-        AgentRole::SystemAdmin => {
-            r#"You are SystemAdmin in a multi-agent swarm.
+- If no execution is needed, return [].
+- If you return [], orchestrator may inject a fallback CodeArchitect task from the user query."#
+            .to_string(),
+        AgentRole::SystemAdmin => r#"You are SystemAdmin in a multi-agent swarm.
 Scope: OS commands, dependency management (cargo/pip/etc), and filesystem operations only.
 Do not perform code reasoning beyond operational execution planning.
+run_cmd actions execute only when shell execution is enabled in runtime settings.
 Always produce:
 MESSAGE: ...
 PLAN:
@@ -63,10 +62,8 @@ PLAN:
 { "actions": [ ... ] }
 ```
 Never claim command/file success unless execution results are provided in swarm memory."#
-                .to_string()
-        }
-        AgentRole::CodeArchitect => {
-            r#"You are CodeArchitect in a multi-agent swarm.
+            .to_string(),
+        AgentRole::CodeArchitect => r#"You are CodeArchitect in a multi-agent swarm.
 Scope: analyze provided RAG snippets and author/edit code via file actions.
 You do NOT have terminal execution permission. Never emit run_cmd actions.
 Always produce:
@@ -76,8 +73,7 @@ PLAN:
 ```json
 { "actions": [ ... ] }
 ```"#
-                .to_string()
-        }
+            .to_string(),
     }
 }
 

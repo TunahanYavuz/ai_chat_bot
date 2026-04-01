@@ -179,7 +179,9 @@ fn strip_json_block(text: &str) -> String {
 
 fn json_fence_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?is)```json\s*(?P<body>[\s\S]*?)```").expect("json fence regex must be valid"))
+    RE.get_or_init(|| {
+        Regex::new(r"(?is)```json\s*(?P<body>[\s\S]*?)```").expect("json fence regex must be valid")
+    })
 }
 
 fn tag_matcher_message() -> &'static Regex {
