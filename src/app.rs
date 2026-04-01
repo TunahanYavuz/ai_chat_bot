@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::sync::OnceLock;
 
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
@@ -27,6 +28,8 @@ const CUSTOM_MODEL_INPUT_RESERVED_WIDTH: f32 = 132.0;
 const DELETE_CHAT_BUTTON_WIDTH: f32 = 36.0;
 const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
 const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
+/// Prepended as the first system prompt for API requests so responses include
+/// a user-facing message plus a machine-readable ```json ... ``` execution block.
 const CORE_OS_SYSTEM_PROMPT: &str = r#"You are 'CoreOS', an advanced local File System and Command Line Interface (CLI) Agent. Your purpose is to assist the user by generating precise, executable commands while maintaining a helpful, conversational tone.
 
 YOUR WORKFLOW:
@@ -224,7 +227,7 @@ pub struct ChatApp {
 
     db: Arc<Mutex<Option<Database>>>,
     pending_action: Option<PendingAction>,
-    pending_actions_queue: Vec<PendingAction>,
+    pending_actions_queue: VecDeque<PendingAction>,
     pending_action_session_idx: Option<usize>,
 
     markdown_cache: CommonMarkCache,
@@ -243,6 +246,11 @@ pub struct ChatApp {
 }
 
 impl ChatApp {
+    fn execution_json_block_regex() -> &'static Regex {
+        static RE: OnceLock<Regex> = OnceLock::new();
+        RE.get_or_init(|| Regex::new(r"```json\s*(?P<json>\{[\s\S]*?\})\s*```").expect("valid regex"))
+    }
+
     fn extract_tag_block<'a>(text: &'a str, open_tag: &str, close_tag: &str) -> Option<&'a str> {
         let start = text.find(open_tag)?;
         let content_start = start + open_tag.len();
@@ -289,10 +297,15 @@ impl ChatApp {
     }
 
     fn parse_json_actions_actions_only(message: &str) -> Option<Vec<PendingAction>> {
-        let pattern = Regex::new(r"```json\s*(?P<json>\{[\s\S]*?\})\s*```").ok()?;
-        let captures = pattern.captures(message)?;
+        let captures = Self::execution_json_block_regex().captures(message)?;
         let json = captures.name("json")?.as_str();
-        let value: serde_json::Value = serde_json::from_str(json).ok()?;
+        let value: serde_json::Value = match serde_json::from_str(json) {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!("Invalid JSON execution block from model");
+                return None;
+            }
+        };
         let actions = value.get("actions")?.as_array()?;
 
         let mut parsed = Vec::new();
@@ -408,11 +421,9 @@ impl ChatApp {
     }
 
     fn strip_json_execution_block(message: &str) -> String {
-        let pattern = match Regex::new(r"```json\s*\{[\s\S]*?\}\s*```") {
-            Ok(p) => p,
-            Err(_) => return message.trim().to_string(),
-        };
-        let cleaned = pattern.replace_all(message, "").to_string();
+        let cleaned = Self::execution_json_block_regex()
+            .replace_all(message, "")
+            .to_string();
         cleaned.trim().to_string()
     }
 
@@ -628,7 +639,7 @@ impl ChatApp {
             active_requests: HashMap::new(),
             db,
             pending_action: None,
-            pending_actions_queue: vec![],
+            pending_actions_queue: VecDeque::new(),
             pending_action_session_idx: None,
             markdown_cache: CommonMarkCache::default(),
             notifications: vec![],
@@ -1850,8 +1861,40 @@ impl eframe::App for ChatApp {
                         } else {
                             let full_path_str = full_path.to_string_lossy().to_string();
                             self.save_snapshot_if_exists(&full_path_str);
-                            let pdf_content = format!("{title}\n\n{content}");
-                            match crate::files::write_text_file(&full_path, &pdf_content) {
+                            let normalized = format!("{title}\n\n{content}")
+                                .replace('\\', "\\\\")
+                                .replace('(', "\\(")
+                                .replace(')', "\\)");
+                            let mut pdf = String::new();
+                            pdf.push_str("%PDF-1.4\n");
+                            let mut offsets = vec![0usize];
+                            let obj1 = "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n";
+                            offsets.push(pdf.len());
+                            pdf.push_str(obj1);
+                            let obj2 = "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n";
+                            offsets.push(pdf.len());
+                            pdf.push_str(obj2);
+                            let obj3 =
+                                "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << >> >>\nendobj\n";
+                            offsets.push(pdf.len());
+                            pdf.push_str(obj3);
+                            let stream_cmd = format!("BT /F1 12 Tf 72 720 Td ({normalized}) Tj ET\n");
+                            let obj4 = format!(
+                                "4 0 obj\n<< /Length {} >>\nstream\n{}endstream\nendobj\n",
+                                stream_cmd.len(),
+                                stream_cmd
+                            );
+                            offsets.push(pdf.len());
+                            pdf.push_str(&obj4);
+                            let xref_start = pdf.len();
+                            pdf.push_str("xref\n0 5\n");
+                            pdf.push_str("0000000000 65535 f \n");
+                            for off in offsets.into_iter().skip(1) {
+                                pdf.push_str(&format!("{off:010} 00000 n \n"));
+                            }
+                            pdf.push_str("trailer\n<< /Size 5 /Root 1 0 R >>\n");
+                            pdf.push_str(&format!("startxref\n{xref_start}\n%%EOF\n"));
+                            match std::fs::write(&full_path, pdf.as_bytes()) {
                                 Ok(_) => {
                                     self.notify(
                                         format!("PDF file created: {}", full_path.display()),
@@ -1883,9 +1926,8 @@ impl eframe::App for ChatApp {
                     }
                 }
                 self.pending_action = None;
-                if let Some(next_action) = self.pending_actions_queue.first().cloned() {
+                if let Some(next_action) = self.pending_actions_queue.pop_front() {
                     self.pending_action = Some(next_action);
-                    self.pending_actions_queue.remove(0);
                 } else {
                     self.pending_action_session_idx = None;
                 }

@@ -21,9 +21,6 @@ impl ThinkingMode {
         }
     }
 
-    pub fn is_enabled(&self) -> bool {
-        !matches!(self, ThinkingMode::Disabled)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -229,7 +226,6 @@ pub struct ChatChoice {
 
 #[derive(Debug, Deserialize)]
 pub struct ChatResponseMessage {
-    pub role: String,
     pub content: Option<String>,
 }
 
@@ -292,10 +288,7 @@ impl OpenAIClient {
             .choices
             .into_iter()
             .next()
-            .and_then(|choice| {
-                let _ = choice.message.role;
-                choice.message.content
-            })
+            .and_then(|choice| choice.message.content)
             .unwrap_or_default();
         Ok(text)
     }
@@ -319,10 +312,7 @@ impl OpenAIClient {
             model: model.to_string(),
             messages,
             reasoning_effort: if is_thinking_model && supports_reasoning_effort {
-                thinking_mode
-                    .filter(|m| m.is_enabled())
-                    .and_then(|m| m.as_reasoning_effort())
-                    .map(str::to_string)
+                thinking_mode.and_then(|m| m.as_reasoning_effort()).map(str::to_string)
             } else {
                 None
             },
@@ -379,7 +369,8 @@ impl OpenAIClient {
             }
         }
 
-        if full_content.trim().is_empty() {
+        if full_content.trim().is_empty() && stream_finished {
+            eprintln!("Streaming response completed empty; retrying once with non-stream request");
             let fallback_text = self.chat_completion_non_stream(request).await?;
             if !fallback_text.is_empty() {
                 on_chunk(fallback_text.clone());
