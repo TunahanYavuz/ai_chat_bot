@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use scraper::{Html, Selector};
 use std::sync::OnceLock;
@@ -54,10 +54,12 @@ impl WebEngine {
         let body = resp.text().await.context("failed to read search body")?;
 
         let doc = Html::parse_document(&body);
-        let result_sel = Selector::parse("div.result").expect("valid selector");
-        let title_sel = Selector::parse("a.result__a").expect("valid selector");
-        let snippet_sel =
-            Selector::parse("a.result__snippet, .result__snippet").expect("valid selector");
+        let result_sel = Selector::parse("div.result")
+            .map_err(|e| anyhow!("invalid search result selector: {e}"))?;
+        let title_sel = Selector::parse("a.result__a")
+            .map_err(|e| anyhow!("invalid search title selector: {e}"))?;
+        let snippet_sel = Selector::parse("a.result__snippet, .result__snippet")
+            .map_err(|e| anyhow!("invalid search snippet selector: {e}"))?;
 
         let mut out = Vec::new();
         for node in doc.select(&result_sel) {

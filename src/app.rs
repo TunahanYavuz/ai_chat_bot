@@ -5,15 +5,18 @@ use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, TextFormat, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+use chrono::Timelike;
 
 use crate::api::{
     builtin_models, provider_models, ChatMessage, ModelInfo, RemoteModelInfo,
 };
 use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT_MODEL_ID};
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
-use crate::executor::{ActionExecutor, ExecutionPolicy, ExecutionStatus};
+use crate::executor::{
+    ActionExecutor, ApprovalDecision, ApprovalRequest, ExecutionPolicy, ExecutionStatus,
+};
 use crate::models::{
     get_model_capability, reasoning_config_for_model, ModelReasoningConfig, ReasoningCapability,
     ThinkingMode,
@@ -53,6 +56,17 @@ const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const WORKFLOW_STEP_DETAIL_MAX_CHARS: usize = 1200;
 const QDRANT_URL: &str = "http://127.0.0.1:6334";
+const AUTONOMOUS_SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
+const AUTONOMOUS_WORKFLOW_PREFIX: &str = "[AUTONOMOUS CRON-SWARM]";
+const AUTONOMOUS_SESSION_NAME: &str = "Autonomous Briefing";
+const AUTONOMOUS_TRIGGER_KEYWORDS: [&str; 6] = [
+    "every day",
+    "every morning",
+    "schedule",
+    "every weekday",
+    "her gün",
+    "zamanla",
+];
 const SWARM_SYNTH_ROLE_PROMPT: &str = r#"You are Synthesizer in a multi-agent swarm.
 Output format:
 MESSAGE: ...
@@ -77,6 +91,7 @@ You can output the following actions inside the JSON array:
 - "create_file": Creates a new text-based file (.txt, .rs, .py, etc.). (Requires: 'path', 'content')
 - "edit_file": Appends or overwrites text in an existing file. (Requires: 'path', 'mode' [overwrite/append], 'content')
 - "create_pdf": Generates a PDF file. (Requires: 'path', 'title', 'content')
+- "generate_document": Generates a PDF or DOCX from markdown. (Requires: 'format' [pdf/docx], 'path', 'markdown_content')
 - "run_cmd": Executes a terminal command. (Requires: 'command')
 
 JSON SCHEMA OBLIGATION:
@@ -147,9 +162,10 @@ pub enum AppEvent {
         title: String,
         details: String,
     },
-    PolicyBlocked {
+    ExecutionApprovalRequested {
         request_id: String,
-        reason: String,
+        approval_id: String,
+        request: ApprovalRequest,
     },
     WorkspaceTreeLoaded {
         root: crate::storage::FileNode,
@@ -160,6 +176,7 @@ pub enum AppEvent {
         content: String,
         error: Option<String>,
     },
+    AutonomousScheduleTick,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,6 +327,22 @@ struct WorkspaceNodeUiState {
     expanded: bool,
 }
 
+#[derive(Debug, Clone)]
+struct PendingExecutionApproval {
+    request_id: String,
+    approval_id: String,
+    request: ApprovalRequest,
+}
+
+#[derive(Debug, Clone)]
+struct AutonomousSchedule {
+    id: String,
+    time_24h: String,
+    prompt: String,
+    enabled: bool,
+    last_run_date_utc: Option<String>,
+}
+
 #[derive(Clone)]
 struct OpenAIEmbeddingProvider {
     api_key: String,
@@ -420,6 +453,12 @@ pub struct ChatApp {
     workspace_refresh_rx: tokio::sync::mpsc::Receiver<()>,
     workspace_watcher_task: Option<tokio::task::JoinHandle<()>>,
     policy_block_dialog: Option<String>,
+    pending_execution_approval: Option<PendingExecutionApproval>,
+    approval_waiters:
+        Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalDecision>>>>,
+    autonomous_schedules: Vec<AutonomousSchedule>,
+    autonomous_time_input: String,
+    autonomous_prompt_input: String,
 }
 
 impl ChatApp {
@@ -1110,6 +1149,7 @@ impl ChatApp {
                         })
                     }
                 }
+                crate::parser::ActionKind::GenerateDocument => None,
                 crate::parser::ActionKind::RunCmd => {
                     let command = item.parameters.command?.trim().to_string();
                     if command.is_empty() {
@@ -1326,6 +1366,8 @@ impl ChatApp {
                     content: None,
                     mode: None,
                     title: None,
+                    format: None,
+                    markdown_content: None,
                     command: Some(command),
                     query: None,
                     url: None,
@@ -1349,6 +1391,16 @@ impl ChatApp {
                             terminal_id: tid,
                             stdout: String::new(),
                             stderr: "Command awaiting approval".to_string(),
+                            exit_code: -1,
+                        })
+                        .await;
+                }
+                Ok(ExecutionStatus::AuthorizationDenied { reason, .. }) => {
+                    let _ = tx
+                        .send(AppEvent::TerminalFinished {
+                            terminal_id: tid,
+                            stdout: String::new(),
+                            stderr: reason,
                             exit_code: -1,
                         })
                         .await;
@@ -1692,6 +1744,11 @@ impl ChatApp {
             workspace_refresh_rx,
             workspace_watcher_task: None,
             policy_block_dialog: None,
+            pending_execution_approval: None,
+            approval_waiters: Arc::new(Mutex::new(HashMap::new())),
+            autonomous_schedules: vec![],
+            autonomous_time_input: "08:00".to_string(),
+            autonomous_prompt_input: String::new(),
         };
 
         if let Some(idx) = app
@@ -1706,6 +1763,8 @@ impl ChatApp {
         app.load_models_from_provider();
         app.start_workspace_watcher_task();
         app.request_workspace_refresh();
+        app.hydrate_autonomous_schedules_from_settings();
+        app.start_autonomous_scheduler_task();
         app
     }
 
@@ -1744,6 +1803,22 @@ impl ChatApp {
             kind,
             ttl_secs: 4.0,
         });
+    }
+
+    fn resolve_pending_execution_approval(
+        &mut self,
+        approval_id: &str,
+        decision: ApprovalDecision,
+    ) {
+        let sender = self
+            .approval_waiters
+            .lock()
+            .ok()
+            .and_then(|mut waiters| waiters.remove(approval_id));
+        if let Some(sender) = sender {
+            let _ = sender.send(decision);
+        }
+        self.pending_execution_approval = None;
     }
 
     fn current_model(&self) -> Option<&ModelInfo> {
@@ -1896,6 +1971,7 @@ impl ChatApp {
         let req_id = request_id.clone();
         let model_id = model_id.clone();
         let shared_rag_client = self.rag_client.clone();
+        let approval_waiters = self.approval_waiters.clone();
 
         self.tokio_rt.spawn(async move {
             let mut rag_context = "LOCAL REPOSITORY CONTEXT:\n- No relevant snippets found.".to_string();
@@ -1984,6 +2060,8 @@ impl ChatApp {
             let mut swarm_memory = String::new();
             let mut final_parts: Vec<String> = Vec::new();
             let executor = ActionExecutor::new(working_dir);
+
+            let mut auto_approve_enabled = false;
 
             for step in queue {
                 let Some(role) = AgentRole::from_plan_name(&step.agent) else {
@@ -2136,13 +2214,68 @@ impl ChatApp {
                     continue;
                 }
 
-                match executor
-                    .execute_actions(filtered_actions, execution_policy)
-                    .await
-                {
-                    Ok(statuses) => {
-                        swarm_memory.push_str(&format!("\n[{} execution]\n", role.as_str()));
-                        for status in statuses {
+                swarm_memory.push_str(&format!("\n[{} execution]\n", role.as_str()));
+                for action in filtered_actions {
+                    let request_id_for_approval = req_id.clone();
+                    let approval_event_tx = event_tx.clone();
+                    let approval_waiters = approval_waiters.clone();
+                    match executor
+                        .execute_action_with_permission(
+                            action,
+                            execution_policy,
+                            auto_approve_enabled,
+                            move |approval_request| {
+                                let approval_event_tx = approval_event_tx.clone();
+                                let request_id_for_approval = request_id_for_approval.clone();
+                                let approval_waiters = approval_waiters.clone();
+                                async move {
+                                    let approval_id = Uuid::new_v4().to_string();
+                                    let (tx, rx) = tokio::sync::oneshot::channel();
+                                    let lock_ok = if let Ok(mut waiters) = approval_waiters.lock() {
+                                        waiters.insert(approval_id.clone(), tx);
+                                        true
+                                    } else {
+                                        false
+                                    };
+                                    if !lock_ok {
+                                        let _ = approval_event_tx
+                                            .send(AppEvent::SwarmWorkflowStep {
+                                                request_id: request_id_for_approval.clone(),
+                                                title: "Authorization callback failed".to_string(),
+                                                details: "Approval lock acquisition failed; defaulting to deny."
+                                                    .to_string(),
+                                            })
+                                            .await;
+                                        return ApprovalDecision::Deny;
+                                    }
+                                    let _ = approval_event_tx
+                                        .send(AppEvent::ExecutionApprovalRequested {
+                                            request_id: request_id_for_approval.clone(),
+                                            approval_id,
+                                            request: approval_request,
+                                        })
+                                        .await;
+                                    match rx.await {
+                                        Ok(decision) => decision,
+                                        Err(_) => {
+                                            let _ = approval_event_tx
+                                                .send(AppEvent::SwarmWorkflowStep {
+                                                    request_id: request_id_for_approval,
+                                                    title: "Authorization callback failed".to_string(),
+                                                    details: "Approval channel closed; defaulting to deny."
+                                                        .to_string(),
+                                                })
+                                                .await;
+                                            ApprovalDecision::Deny
+                                        }
+                                    }
+                                }
+                            },
+                        )
+                        .await
+                    {
+                        Ok((status, next_auto_approve_state)) => {
+                            auto_approve_enabled = next_auto_approve_state;
                             match status {
                                 ExecutionStatus::Executed(report) => {
                                     let _ = event_tx
@@ -2160,85 +2293,44 @@ impl ChatApp {
                                         report.action, report.success, report.exit_code, report.stdout, report.stderr
                                     ));
                                 }
+                                ExecutionStatus::AuthorizationDenied { action, reason } => {
+                                    let _ = event_tx
+                                        .send(AppEvent::SwarmWorkflowStep {
+                                            request_id: req_id.clone(),
+                                            title: format!("{}: authorization denied", role.as_str()),
+                                            details: format!("{reason}\naction={:?}", action.action),
+                                        })
+                                        .await;
+                                    swarm_memory.push_str(&format!(
+                                        "action authorization denied: {:?}\nreason: {}\n",
+                                        action.action, reason
+                                    ));
+                                }
                                 ExecutionStatus::AwaitingApproval(req) => {
-                                    let detail = match req.action.action {
-                                        ActionKind::RunCmd => req
-                                            .action
-                                            .parameters
-                                            .command
-                                            .as_deref()
-                                            .unwrap_or(""),
-                                        ActionKind::EditFile => req
-                                            .action
-                                            .parameters
-                                            .path
-                                            .as_deref()
-                                            .unwrap_or(""),
-                                        ActionKind::CreateFile => req
-                                            .action
-                                            .parameters
-                                            .path
-                                            .as_deref()
-                                            .unwrap_or(""),
-                                        ActionKind::CreateFolder => req
-                                            .action
-                                            .parameters
-                                            .path
-                                            .as_deref()
-                                            .unwrap_or(""),
-                                        ActionKind::CreatePdf => req
-                                            .action
-                                            .parameters
-                                            .path
-                                            .as_deref()
-                                            .unwrap_or(""),
-                                        ActionKind::SearchWeb => req
-                                            .action
-                                            .parameters
-                                            .query
-                                            .as_deref()
-                                            .unwrap_or(""),
-                                        ActionKind::ReadUrl => req
-                                            .action
-                                            .parameters
-                                            .url
-                                            .as_deref()
-                                            .unwrap_or(""),
-                                    };
                                     let _ = event_tx
                                         .send(AppEvent::SwarmWorkflowStep {
                                             request_id: req_id.clone(),
                                             title: format!("{}: awaiting approval", role.as_str()),
-                                            details: format!("{}\n{}", req.reason, detail),
-                                        })
-                                        .await;
-                                    swarm_memory.push_str(&format!(
-                                        "action awaiting approval: {:?}\nreason: {}\n",
-                                        req.action.action, req.reason
-                                    ));
-                                    let _ = event_tx
-                                        .send(AppEvent::PolicyBlocked {
-                                            request_id: req_id.clone(),
-                                            reason: req.reason,
+                                            details: req.reason,
                                         })
                                         .await;
                                 }
                             }
                         }
-                    }
-                    Err(e) => {
-                        let _ = event_tx
-                            .send(AppEvent::SwarmWorkflowStep {
-                                request_id: req_id.clone(),
-                                title: format!("{}: execution error", role.as_str()),
-                                details: e.to_string(),
-                            })
-                            .await;
-                        swarm_memory.push_str(&format!(
-                            "\n[{} execution error]\n{}\n",
-                            role.as_str(),
-                            e
-                        ));
+                        Err(e) => {
+                            let _ = event_tx
+                                .send(AppEvent::SwarmWorkflowStep {
+                                    request_id: req_id.clone(),
+                                    title: format!("{}: execution error", role.as_str()),
+                                    details: e.to_string(),
+                                })
+                                .await;
+                            swarm_memory.push_str(&format!(
+                                "\n[{} execution error]\n{}\n",
+                                role.as_str(),
+                                e
+                            ));
+                        }
                     }
                 }
             }
@@ -2322,6 +2414,173 @@ impl ChatApp {
                 .await;
             let _ = event_tx.send(AppEvent::ResponseComplete(req_id)).await;
         });
+    }
+
+    fn start_autonomous_scheduler_task(&self) {
+        let tx = self.event_tx.clone();
+        self.tokio_rt.spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                AUTONOMOUS_SCHEDULER_TICK_INTERVAL_SECS,
+            ));
+            loop {
+                interval.tick().await;
+                let _ = tx.send(AppEvent::AutonomousScheduleTick).await;
+            }
+        });
+    }
+
+    fn hydrate_autonomous_schedules_from_settings(&mut self) {
+        self.autonomous_schedules = self
+            .settings
+            .autonomous_schedules
+            .iter()
+            .map(|job| AutonomousSchedule {
+                id: if job.id.trim().is_empty() {
+                    Uuid::new_v4().to_string()
+                } else {
+                    job.id.clone()
+                },
+                time_24h: job.time_24h.clone(),
+                prompt: job.prompt.clone(),
+                enabled: job.enabled,
+                last_run_date_utc: None,
+            })
+            .collect();
+    }
+
+    fn persist_autonomous_schedules_to_settings(&mut self) {
+        self.settings.autonomous_schedules = self
+            .autonomous_schedules
+            .iter()
+            .map(|job| crate::config::ScheduledJobConfig {
+                id: job.id.clone(),
+                time_24h: job.time_24h.clone(),
+                prompt: job.prompt.clone(),
+                enabled: job.enabled,
+            })
+            .collect();
+        if let Err(e) = save_settings(&self.settings) {
+            self.notify(
+                format!("Failed to save autonomous schedules: {e}"),
+                NotificationKind::Error,
+            );
+        }
+    }
+
+    fn parse_time_hhmm(value: &str) -> Option<(u32, u32)> {
+        let trimmed = value.trim();
+        let (h, m) = trimmed.split_once(':')?;
+        let hour: u32 = h.parse().ok()?;
+        let minute: u32 = m.parse().ok()?;
+        if hour < 24 && minute < 60 {
+            Some((hour, minute))
+        } else {
+            None
+        }
+    }
+
+    fn try_extract_schedule_from_user_message(&self, text: &str) -> Option<(String, String)> {
+        let lower = text.to_ascii_lowercase();
+        if !AUTONOMOUS_TRIGGER_KEYWORDS.iter().any(|k| lower.contains(k)) {
+            return None;
+        }
+        let bytes = text.as_bytes();
+        for i in 0..bytes.len().saturating_sub(4) {
+            if bytes[i].is_ascii_digit()
+                && bytes[i + 1].is_ascii_digit()
+                && bytes[i + 2] == b':'
+                && bytes[i + 3].is_ascii_digit()
+                && bytes[i + 4].is_ascii_digit()
+            {
+                let t = &text[i..i + 5];
+                if Self::parse_time_hhmm(t).is_some() {
+                    let prompt = text.trim().to_string();
+                    return Some((t.to_string(), prompt));
+                }
+            }
+        }
+        None
+    }
+
+    fn add_autonomous_schedule(&mut self, time_24h: String, prompt: String) {
+        if Self::parse_time_hhmm(&time_24h).is_none() {
+            self.notify(
+                "Invalid schedule time. Use HH:MM (24h).",
+                NotificationKind::Error,
+            );
+            return;
+        }
+        if prompt.trim().is_empty() {
+            self.notify("Schedule prompt cannot be empty.", NotificationKind::Error);
+            return;
+        }
+        self.autonomous_schedules.push(AutonomousSchedule {
+            id: Uuid::new_v4().to_string(),
+            time_24h,
+            prompt,
+            enabled: true,
+            last_run_date_utc: None,
+        });
+        self.persist_autonomous_schedules_to_settings();
+        self.notify("Autonomous schedule added.", NotificationKind::Info);
+    }
+
+    fn run_autonomous_scheduler_tick(&mut self) {
+        if self.autonomous_schedules.is_empty() {
+            return;
+        }
+        let now = Utc::now();
+        let today = now.format("%Y-%m-%d").to_string();
+        let mut to_run: Vec<String> = Vec::new();
+        for job in &mut self.autonomous_schedules {
+            if !job.enabled {
+                continue;
+            }
+            let Some((hour, minute)) = Self::parse_time_hhmm(&job.time_24h) else {
+                continue;
+            };
+            if now.hour() == hour
+                && now.minute() == minute
+                && job.last_run_date_utc.as_deref() != Some(&today)
+            {
+                job.last_run_date_utc = Some(today.clone());
+                to_run.push(job.prompt.clone());
+            }
+        }
+        if to_run.is_empty() {
+            return;
+        }
+        if self.current_session_idx.is_none() {
+            self.new_session();
+        }
+        let Some(session_idx) = self.current_session_idx else {
+            return;
+        };
+        for prompt in to_run {
+            let user_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                role: Role::User,
+                content: format!("{AUTONOMOUS_WORKFLOW_PREFIX}\n{prompt}"),
+                attachments: vec![],
+                timestamp: Utc::now(),
+                is_streaming: false,
+            };
+            if let Some(session) = self.sessions.get_mut(session_idx) {
+                if session.messages.is_empty() {
+                    session.name = AUTONOMOUS_SESSION_NAME.to_string();
+                }
+                let session_id = session.id.clone();
+                session.messages.push(user_msg.clone());
+                self.save_message(&session_id, &user_msg);
+            }
+            self.append_system_message(
+                Some(session_idx),
+                "🕒 Autonomous Cron-Swarm triggered scheduled workflow.".to_string(),
+            );
+        }
+        self.persist_autonomous_schedules_to_settings();
+        self.persist_session_snapshot_async(session_idx);
+        self.dispatch_agent_requests(session_idx);
     }
 
     fn delete_session_by_index(&mut self, idx: usize) {
@@ -2670,6 +2929,10 @@ impl ChatApp {
         self.input_text.clear();
         self.persist_session_snapshot_async(session_idx);
 
+        if let Some((time_24h, prompt)) = self.try_extract_schedule_from_user_message(&text) {
+            self.add_autonomous_schedule(time_24h, prompt);
+        }
+
         self.dispatch_agent_requests(session_idx);
     }
 
@@ -2797,10 +3060,17 @@ impl ChatApp {
                         self.begin_workflow_step(&request_id, title, details);
                     }
                 }
-                AppEvent::PolicyBlocked { request_id, reason } => {
+                AppEvent::ExecutionApprovalRequested {
+                    request_id,
+                    approval_id,
+                    request,
+                } => {
                     if self.active_requests.contains_key(&request_id) {
-                        self.policy_block_dialog = Some(reason.clone());
-                        self.notify(reason, NotificationKind::Error);
+                        self.pending_execution_approval = Some(PendingExecutionApproval {
+                            request_id,
+                            approval_id,
+                            request,
+                        });
                     }
                 }
                 AppEvent::ModelsLoaded(model_ids) => {
@@ -2972,6 +3242,9 @@ impl ChatApp {
                     self.editor_buffers.insert(path.clone(), content);
                     self.editor_dirty.insert(path.clone(), false);
                     self.active_open_file = Some(path);
+                }
+                AppEvent::AutonomousScheduleTick => {
+                    self.run_autonomous_scheduler_tick();
                 }
             }
         }
@@ -3494,6 +3767,131 @@ impl eframe::App for ChatApp {
                 } else {
                     self.notify("Setup complete", NotificationKind::Info);
                 }
+            }
+        }
+
+        if let Some(pending) = self.pending_execution_approval.clone() {
+            let mut approve_once = false;
+            let mut grant_temporary = false;
+            let mut deny = false;
+            egui::Window::new("⚠ Action Approval Required")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.visuals_mut().override_text_color = Some(LIGHT_TEXT);
+                    ui.label(RichText::new("Manual approval required").strong());
+                    ui.label(format!("Request: {}", pending.request_id));
+                    ui.separator();
+                    match &pending.request.action.action {
+                        ActionKind::RunCmd => {
+                            ui.label("Execute command:");
+                            ui.monospace(
+                                pending
+                                    .request
+                                    .action
+                                    .parameters
+                                    .command
+                                    .as_deref()
+                                    .unwrap_or(""),
+                            );
+                        }
+                        ActionKind::EditFile => {
+                            let path = pending
+                                .request
+                                .action
+                                .parameters
+                                .path
+                                .as_deref()
+                                .unwrap_or("");
+                            let mode = pending
+                                .request
+                                .action
+                                .parameters
+                                .mode
+                                .as_deref()
+                                .unwrap_or("overwrite");
+                            let content = pending
+                                .request
+                                .action
+                                .parameters
+                                .content
+                                .as_deref()
+                                .unwrap_or("");
+                            ui.label(format!("Edit file ({mode}): {path}"));
+                            ui.separator();
+                            ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                                ui.monospace(content);
+                            });
+                        }
+                        ActionKind::GenerateDocument => {
+                            let format = pending
+                                .request
+                                .action
+                                .parameters
+                                .format
+                                .as_deref()
+                                .unwrap_or("unknown");
+                            let path = pending
+                                .request
+                                .action
+                                .parameters
+                                .path
+                                .as_deref()
+                                .unwrap_or("");
+                            let markdown = pending
+                                .request
+                                .action
+                                .parameters
+                                .markdown_content
+                                .as_deref()
+                                .unwrap_or("");
+                            ui.label(format!("Generate document ({format}): {path}"));
+                            ui.separator();
+                            ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                                ui.monospace(markdown);
+                            });
+                        }
+                        _ => {
+                            ui.label(format!("Action: {:?}", pending.request.action.action));
+                        }
+                    }
+                    ui.separator();
+                    ui.label(pending.request.reason.clone());
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(RichText::new("Approve Once").color(LIGHT_TEXT))
+                            .clicked()
+                        {
+                            approve_once = true;
+                        }
+                        if ui
+                            .button(RichText::new("Grant Temporary Access").color(LIGHT_TEXT))
+                            .clicked()
+                        {
+                            grant_temporary = true;
+                        }
+                        if ui
+                            .button(RichText::new("Deny").color(LIGHT_TEXT))
+                            .clicked()
+                        {
+                            deny = true;
+                        }
+                    });
+                });
+            if approve_once {
+                self.resolve_pending_execution_approval(
+                    &pending.approval_id,
+                    ApprovalDecision::ApproveOnce,
+                );
+            } else if grant_temporary {
+                self.resolve_pending_execution_approval(
+                    &pending.approval_id,
+                    ApprovalDecision::GrantTemporaryAccess,
+                );
+            } else if deny {
+                self.resolve_pending_execution_approval(&pending.approval_id, ApprovalDecision::Deny);
             }
         }
 
@@ -4218,6 +4616,62 @@ impl eframe::App for ChatApp {
                         }
                         if ui.button("⚙ Advanced Settings").clicked() {
                             self.show_settings = true;
+                        }
+                    });
+                    ui.separator();
+                    ui.collapsing("Autonomous Cron-Swarm", |ui| {
+                        ui.label(
+                            RichText::new("Schedule autonomous workflows (daily HH:MM UTC)")
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Time:");
+                            ui.add(TextEdit::singleline(&mut self.autonomous_time_input).desired_width(70.0));
+                        });
+                        ui.add(
+                            TextEdit::multiline(&mut self.autonomous_prompt_input)
+                                .desired_rows(3)
+                                .desired_width(ui.available_width())
+                                .hint_text("e.g. Every morning: research AI news, analyze latest repo changes, generate PDF briefing."),
+                        );
+                        if ui.button("➕ Add Schedule").clicked() {
+                            let t = self.autonomous_time_input.trim().to_string();
+                            let p = self.autonomous_prompt_input.trim().to_string();
+                            self.add_autonomous_schedule(t, p);
+                            self.autonomous_prompt_input.clear();
+                        }
+                        ui.separator();
+                        let mut remove_id: Option<String> = None;
+                        for job in &mut self.autonomous_schedules {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut job.enabled, "");
+                                    ui.label(
+                                        RichText::new(format!("{} — {}", job.time_24h, job.prompt))
+                                            .small()
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                    if ui.small_button("🗑").clicked() {
+                                        remove_id = Some(job.id.clone());
+                                    }
+                                });
+                                if let Some(last) = &job.last_run_date_utc {
+                                    ui.label(
+                                        RichText::new(format!("Last run (UTC date): {last}"))
+                                            .small()
+                                            .color(TEXT_MUTED),
+                                    );
+                                }
+                            });
+                        }
+                        if let Some(id) = remove_id {
+                            self.autonomous_schedules.retain(|j| j.id != id);
+                            self.persist_autonomous_schedules_to_settings();
+                        }
+                        if ui.button("💾 Save Schedule Changes").clicked() {
+                            self.persist_autonomous_schedules_to_settings();
+                            self.notify("Schedules saved.", NotificationKind::Info);
                         }
                     });
                 });

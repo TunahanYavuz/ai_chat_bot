@@ -1,4 +1,6 @@
 use std::path::{Path, PathBuf};
+use std::future::Future;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use tokio::io::AsyncWriteExt;
@@ -8,6 +10,7 @@ use crate::parser::{ActionKind, AgentAction};
 use crate::web_engine::{format_search_results, WebEngine};
 
 const EMPTY_COMMAND_SUCCESS_MSG: &str = "[System: Command executed successfully with no output]";
+const SUPPORTED_DOCUMENT_FORMATS: [&str; 2] = ["pdf", "docx"];
 
 /// Execution status emitted by the action pipeline.
 #[derive(Debug, Clone)]
@@ -16,6 +19,11 @@ pub enum ExecutionStatus {
     Executed(ExecutionReport),
     /// Execution was intentionally paused because user confirmation is required.
     AwaitingApproval(ApprovalRequest),
+    /// Execution was denied by user authorization decision.
+    AuthorizationDenied {
+        action: AgentAction,
+        reason: String,
+    },
 }
 
 /// Approval payload that the UI can render for approve/reject interactions.
@@ -23,6 +31,13 @@ pub enum ExecutionStatus {
 pub struct ApprovalRequest {
     pub action: AgentAction,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    ApproveOnce,
+    GrantTemporaryAccess,
+    Deny,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,15 +98,20 @@ pub struct ExecutionReport {
 /// - Normalizes empty successful command output.
 pub struct ActionExecutor {
     workspace_root: PathBuf,
-    web_engine: WebEngine,
+    web_engine: Option<WebEngine>,
+    web_engine_init_error: Option<String>,
 }
 
 impl ActionExecutor {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
-        let web_engine = WebEngine::new().expect("web engine init must succeed");
+        let (web_engine, web_engine_init_error) = match WebEngine::new() {
+            Ok(engine) => (Some(engine), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
         Self {
             workspace_root: workspace_root.into(),
             web_engine,
+            web_engine_init_error,
         }
     }
 
@@ -113,9 +133,57 @@ impl ActionExecutor {
         Ok(ExecutionStatus::Executed(report))
     }
 
+    /// Executes one action with async permission callback support.
+    ///
+    /// Returns the action status and the potentially-updated auto-approve state.
+    pub async fn execute_action_with_permission<F, Fut>(
+        &self,
+        action: AgentAction,
+        policy: ExecutionPolicy,
+        current_auto_approve_state: bool,
+        mut request_permission: F,
+    ) -> Result<(ExecutionStatus, bool)>
+    where
+        F: FnMut(ApprovalRequest) -> Fut,
+        Fut: Future<Output = ApprovalDecision>,
+    {
+        if policy.requires_manual_approval(&action) {
+            if current_auto_approve_state {
+                let report = self.execute_approved_action(action).await?;
+                return Ok((ExecutionStatus::Executed(report), current_auto_approve_state));
+            }
+
+            let request = ApprovalRequest {
+                action: action.clone(),
+                reason: policy.approval_reason(&action),
+            };
+            match request_permission(request).await {
+                ApprovalDecision::ApproveOnce => {
+                    let report = self.execute_approved_action(action).await?;
+                    Ok((ExecutionStatus::Executed(report), current_auto_approve_state))
+                }
+                ApprovalDecision::GrantTemporaryAccess => {
+                    let report = self.execute_approved_action(action).await?;
+                    Ok((ExecutionStatus::Executed(report), true))
+                }
+                ApprovalDecision::Deny => Ok((
+                    ExecutionStatus::AuthorizationDenied {
+                        action: action.clone(),
+                        reason: format!("Authorization Denied for {:?}", action.action),
+                    },
+                    current_auto_approve_state,
+                )),
+            }
+        } else {
+            let report = self.execute_approved_action(action).await?;
+            Ok((ExecutionStatus::Executed(report), current_auto_approve_state))
+        }
+    }
+
     /// Executes a full action list in sequence.
     ///
     /// If policy requires approval, the function returns early with first pending approval.
+    #[allow(dead_code)]
     pub async fn execute_actions(
         &self,
         actions: Vec<AgentAction>,
@@ -244,9 +312,42 @@ impl ActionExecutor {
                     exit_code: 0,
                 })
             }
+            ActionKind::GenerateDocument => {
+                let format = required_non_empty(action.parameters.format.as_deref(), "format")?
+                    .to_ascii_lowercase();
+                if !SUPPORTED_DOCUMENT_FORMATS.contains(&format.as_str()) {
+                    return Err(anyhow!(
+                        "unsupported document format '{}'; expected pdf or docx",
+                        format
+                    ));
+                }
+                let path = required_non_empty(action.parameters.path.as_deref(), "path")?;
+                let markdown_content = required_non_empty(
+                    action.parameters.markdown_content.as_deref(),
+                    "markdown_content",
+                )?;
+                let mut full_path = self.resolve_path(&path);
+                if full_path.extension().and_then(|e| e.to_str()).is_none() {
+                    full_path.set_extension(&format);
+                }
+                ensure_parent_dir(&full_path).await?;
+                self.generate_document_with_pandoc(&full_path, &format, &markdown_content)
+                    .await
+            }
             ActionKind::SearchWeb => {
                 let query = required_non_empty(action.parameters.query.as_deref(), "query")?;
-                let results = self.web_engine.search_web(&query).await?;
+                let web_engine = self
+                    .web_engine
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "web engine initialization failed: {}",
+                            self.web_engine_init_error
+                                .as_deref()
+                                .unwrap_or("unknown initialization error")
+                        )
+                    })?;
+                let results = web_engine.search_web(&query).await?;
                 Ok(ExecutionReport {
                     action: "search_web".to_string(),
                     success: true,
@@ -257,7 +358,18 @@ impl ActionExecutor {
             }
             ActionKind::ReadUrl => {
                 let url = required_non_empty(action.parameters.url.as_deref(), "url")?;
-                let content = self.web_engine.read_url(&url).await?;
+                let web_engine = self
+                    .web_engine
+                    .as_ref()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "web engine initialization failed: {}",
+                            self.web_engine_init_error
+                                .as_deref()
+                                .unwrap_or("unknown initialization error")
+                        )
+                    })?;
+                let content = web_engine.read_url(&url).await?;
                 Ok(ExecutionReport {
                     action: "read_url".to_string(),
                     success: true,
@@ -313,6 +425,84 @@ impl ActionExecutor {
             path.to_path_buf()
         } else {
             self.workspace_root.join(path)
+        }
+    }
+
+    async fn generate_document_with_pandoc(
+        &self,
+        output_path: &Path,
+        format: &str,
+        markdown_content: &str,
+    ) -> Result<ExecutionReport> {
+        let temp_name = format!(
+            ".ai_os_doc_{}_{}.md",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        );
+        let temp_md_path = self.workspace_root.join(temp_name);
+        tokio::fs::write(&temp_md_path, markdown_content)
+            .await
+            .with_context(|| format!("failed writing temporary markdown {}", temp_md_path.display()))?;
+
+        let mut cmd = Command::new("pandoc");
+        cmd.arg(&temp_md_path)
+            .arg("-o")
+            .arg(output_path)
+            .arg("--from")
+            .arg("markdown")
+            .arg("--to")
+            .arg(format)
+            .current_dir(&self.workspace_root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let output = cmd.output().await;
+        let _ = tokio::fs::remove_file(&temp_md_path).await;
+
+        match output {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+                let exit_code = output.status.code().unwrap_or(-1);
+                if output.status.success() {
+                    Ok(ExecutionReport {
+                        action: "generate_document".to_string(),
+                        success: true,
+                        stdout: format!(
+                            "[System: Document generated] {} ({})",
+                            output_path.display(),
+                            format
+                        ),
+                        stderr,
+                        exit_code,
+                    })
+                } else {
+                    Ok(ExecutionReport {
+                        action: "generate_document".to_string(),
+                        success: false,
+                        stdout,
+                        stderr: format!("pandoc failed (exit={exit_code}): {stderr}"),
+                        exit_code,
+                    })
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ExecutionReport {
+                action: "generate_document".to_string(),
+                success: false,
+                stdout: String::new(),
+                stderr: "pandoc is not installed. Install pandoc and retry document generation."
+                    .to_string(),
+                exit_code: 127,
+            }),
+            Err(e) => Err(anyhow!(e)).with_context(|| {
+                format!(
+                    "failed to execute pandoc for document generation at {}",
+                    output_path.display()
+                )
+            }),
         }
     }
 }
