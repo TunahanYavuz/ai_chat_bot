@@ -5,6 +5,8 @@ mod db;
 mod files;
 mod setup;
 mod shell;
+mod telemetry;
+mod parser;
 
 use std::sync::Arc;
 

@@ -1,19 +1,17 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::sync::OnceLock;
-
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use egui::text::LayoutJob;
 use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, TextFormat, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
-use regex::Regex;
 use uuid::Uuid;
 
 use crate::api::{builtin_models, provider_models, ChatMessage, ModelInfo, RemoteModelInfo, ThinkingMode};
 use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT_MODEL_ID};
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
 use crate::setup::SetupWizard;
+use crate::telemetry::collect_telemetry;
 
 const BG_PRIMARY: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
 const BG_SURFACE: Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);
@@ -270,6 +268,66 @@ impl ChatApp {
         } else {
             stdout.to_string()
         }
+    }
+
+    fn pending_actions_from_agent_actions(actions: Vec<crate::parser::AgentAction>) -> Vec<PendingAction> {
+        actions
+            .into_iter()
+            .filter_map(|item| match item.action {
+                crate::parser::ActionKind::CreateFolder => {
+                    let path = item.parameters.path?.trim().to_string();
+                    if path.is_empty() {
+                        None
+                    } else {
+                        Some(PendingAction::CreateFolder { path })
+                    }
+                }
+                crate::parser::ActionKind::CreateFile => {
+                    let path = item.parameters.path?.trim().to_string();
+                    if path.is_empty() {
+                        None
+                    } else {
+                        Some(PendingAction::WriteFile {
+                            path,
+                            content: item.parameters.content.unwrap_or_default(),
+                        })
+                    }
+                }
+                crate::parser::ActionKind::EditFile => {
+                    let path = item.parameters.path?.trim().to_string();
+                    let mode = item.parameters.mode?.trim().to_string();
+                    if path.is_empty() || (mode != "overwrite" && mode != "append") {
+                        None
+                    } else {
+                        Some(PendingAction::EditFile {
+                            path,
+                            mode,
+                            content: item.parameters.content.unwrap_or_default(),
+                        })
+                    }
+                }
+                crate::parser::ActionKind::CreatePdf => {
+                    let path = item.parameters.path?.trim().to_string();
+                    if path.is_empty() {
+                        None
+                    } else {
+                        Some(PendingAction::CreatePdf {
+                            path,
+                            title: item.parameters.title.unwrap_or_default(),
+                            content: item.parameters.content.unwrap_or_default(),
+                        })
+                    }
+                }
+                crate::parser::ActionKind::RunCmd => {
+                    let command = item.parameters.command?.trim().to_string();
+                    if command.is_empty() {
+                        None
+                    } else {
+                        Some(PendingAction::ExecuteCommand { command })
+                    }
+                }
+            })
+            .collect()
     }
 
     fn selected_model_id(&self) -> String {
@@ -885,7 +943,8 @@ Do not fabricate directory listings, command outputs, or success messages.",
                     "disabled"
                 }
             );
-            let full_system_prompt = format!("{CORE_OS_SYSTEM_PROMPT}\n\n{system_prompt}");
+            let telemetry_context = collect_telemetry().to_llm_system_context();
+            let full_system_prompt = format!("{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{system_prompt}");
             api_messages.push(ChatMessage::with_cache_control("system", &full_system_prompt));
 
             if let Some(session) = self.sessions.get(session_idx) {
@@ -1388,11 +1447,37 @@ Do not fabricate directory listings, command outputs, or success messages.",
                             let session_id = session.id.clone();
                             if let Some(msg) = session.messages.iter_mut().find(|m| m.id == active.message_id) {
                                 msg.is_streaming = false;
-                                let parsed_actions = Self::parse_json_actions_actions_only(&msg.content);
-                                msg.content = Self::strip_json_execution_block(&msg.content);
+                                let parsed = crate::parser::parse_response(&msg.content);
+                                let mut rendered = String::new();
+                                if let Some(message) = parsed.message.as_deref() {
+                                    rendered.push_str(message);
+                                } else if !parsed.fallback_text.trim().is_empty() {
+                                    rendered.push_str(parsed.fallback_text.trim());
+                                }
+
+                                if !parsed.plan_items.is_empty() {
+                                    if !rendered.is_empty() {
+                                        rendered.push_str("\n\n");
+                                    }
+                                    rendered.push_str("PLAN:\n");
+                                    for item in &parsed.plan_items {
+                                        rendered.push_str("- [ ] ");
+                                        rendered.push_str(item);
+                                        rendered.push('\n');
+                                    }
+                                    rendered = rendered.trim_end().to_string();
+                                }
+
+                                if let Some(err) = parsed.json_parse_error.as_deref() {
+                                    self.notify(format!("Execution block parse error: {err}"), NotificationKind::Error);
+                                }
+
+                                msg.content = rendered;
+
                                 if self.pending_action.is_none() {
-                                    if let Some(actions) = parsed_actions {
-                                        let mut iter = actions.into_iter();
+                                    let parsed_actions = Self::pending_actions_from_agent_actions(parsed.actions);
+                                    if !parsed_actions.is_empty() {
+                                        let mut iter = parsed_actions.into_iter();
                                         if let Some(action) = iter.next() {
                                             self.pending_action = Some(action);
                                             self.pending_action_session_idx = Some(active.session_idx);
