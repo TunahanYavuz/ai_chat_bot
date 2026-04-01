@@ -52,6 +52,7 @@ const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
 const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const WORKFLOW_STEP_DETAIL_MAX_CHARS: usize = 1200;
+const QDRANT_URL: &str = "http://127.0.0.1:6334";
 const SWARM_SYNTH_ROLE_PROMPT: &str = r#"You are Synthesizer in a multi-agent swarm.
 Output format:
 MESSAGE: ...
@@ -510,8 +511,8 @@ impl ChatApp {
         request_refresh: &mut bool,
     ) {
         let is_dir = node.is_dir;
-        let icon_ascii = if is_dir { "[D]" } else { "[F]" };
-        let label = format!("{icon_ascii} {}", node.name);
+        let node_marker = if is_dir { "[D]" } else { "[F]" };
+        let label = format!("{node_marker} {}", node.name);
 
         if is_dir {
             let expanded_now = self
@@ -1646,7 +1647,7 @@ impl ChatApp {
             active_requests: HashMap::new(),
             db_path,
             storage,
-            rag_client: crate::rag_engine::RagEngine::<OpenAIEmbeddingProvider>::init_shared_qdrant_client("http://127.0.0.1:6334").ok(),
+            rag_client: crate::rag_engine::RagEngine::<OpenAIEmbeddingProvider>::init_shared_qdrant_client(QDRANT_URL).ok(),
             pending_action: None,
             pending_actions_queue: VecDeque::new(),
             pending_action_session_idx: None,
