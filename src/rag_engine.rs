@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use ignore::WalkBuilder;
+use std::sync::Arc;
 use qdrant_client::qdrant::{
     vectors_config::Config, CreateCollection, Distance, PointStruct, SearchPoints, UpsertPoints,
     Value, VectorParams, VectorsConfig,
@@ -80,7 +81,7 @@ pub struct RagEngine<E>
 where
     E: EmbeddingProvider,
 {
-    client: Qdrant,
+    client: Arc<Qdrant>,
     config: RagConfig,
     embedder: E,
 }
@@ -89,12 +90,9 @@ impl<E> RagEngine<E>
 where
     E: EmbeddingProvider,
 {
-    /// Creates the engine and asynchronously initializes Qdrant collection state.
-    pub async fn new(config: RagConfig, embedder: E) -> Result<Self> {
-        let client = Qdrant::from_url(&config.qdrant_url)
-            .build()
-            .context("failed to build qdrant client")?;
-
+    /// Creates the engine with a pre-initialized shared Qdrant client and
+    /// asynchronously initializes collection state.
+    pub async fn new(config: RagConfig, embedder: E, client: Arc<Qdrant>) -> Result<Self> {
         let engine = Self {
             client,
             config,
@@ -103,6 +101,16 @@ where
 
         engine.ensure_collection().await?;
         Ok(engine)
+    }
+
+    /// Creates a shared Qdrant client with compatibility checks disabled to
+    /// avoid noisy version-check logs on startup.
+    pub fn init_shared_qdrant_client(qdrant_url: &str) -> Result<Arc<Qdrant>> {
+        let client = Qdrant::from_url(qdrant_url)
+            .skip_compatibility_check()
+            .build()
+            .context("failed to build qdrant client")?;
+        Ok(Arc::new(client))
     }
 
     /// Scans repository files while honoring .gitignore rules via `ignore` crate.

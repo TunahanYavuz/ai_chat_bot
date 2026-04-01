@@ -25,6 +25,7 @@ use crate::storage::{ChatSession, Storage, StoredMessage, StoredRole};
 use crate::swarm::{get_system_prompt, parse_router_plan, AgentRole, RoutedTask};
 use crate::telemetry::collect_telemetry_cached;
 use crate::watcher::run_workspace_watcher;
+use qdrant_client::Qdrant;
 
 const BG_PRIMARY: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
 const BG_SURFACE: Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);
@@ -51,6 +52,16 @@ const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
 const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const WORKFLOW_STEP_DETAIL_MAX_CHARS: usize = 1200;
+const QDRANT_URL: &str = "http://127.0.0.1:6334";
+const SWARM_SYNTH_ROLE_PROMPT: &str = r#"You are Synthesizer in a multi-agent swarm.
+Output format:
+MESSAGE: ...
+PLAN: ```json ... ```
+Rules:
+- Produce a final user-facing summary in MESSAGE using only gathered execution data.
+- Include key findings, errors, and blocked steps when relevant.
+- If no reliable result is available, clearly state what is missing.
+- Keep PLAN as an empty JSON object."#;
 /// Prepended as the first system prompt for API requests so responses include
 /// a user-facing message plus a machine-readable ```json ... ``` execution block.
 const CORE_OS_SYSTEM_PROMPT: &str = r#"You are 'CoreOS', an advanced local File System and Command Line Interface (CLI) Agent. Your purpose is to assist the user by generating precise, executable commands while maintaining a helpful, conversational tone.
@@ -362,6 +373,7 @@ pub struct ChatApp {
     model_waiting_command_output: bool,
     model_access_outline_ok: Option<bool>,
     custom_model_id: String,
+    force_reasoning_controls: bool,
     selected_thinking_mode: ThinkingMode,
     binary_reasoning_enabled: bool,
     execution_policy: ExecutionPolicy,
@@ -376,6 +388,7 @@ pub struct ChatApp {
 
     db_path: String,
     storage: Option<Storage>,
+    rag_client: Option<Arc<Qdrant>>,
     pending_action: Option<PendingAction>,
     pending_actions_queue: VecDeque<PendingAction>,
     pending_action_session_idx: Option<usize>,
@@ -498,8 +511,8 @@ impl ChatApp {
         request_refresh: &mut bool,
     ) {
         let is_dir = node.is_dir;
-        let icon_emoji = if is_dir { "📁" } else { "📄" };
-        let label = format!("{icon_emoji} {}", node.name);
+        let node_marker = if is_dir { "[D]" } else { "[F]" };
+        let label = format!("{node_marker} {}", node.name);
 
         if is_dir {
             let expanded_now = self
@@ -580,7 +593,20 @@ impl ChatApp {
     }
 
     fn active_reasoning_config(&self) -> ModelReasoningConfig {
-        reasoning_config_for_model(&self.selected_model_id())
+        if self.force_reasoning_controls {
+            ModelReasoningConfig {
+                capability: ReasoningCapability::Tiered,
+                tiered_modes: &[
+                    ThinkingMode::Low,
+                    ThinkingMode::Medium,
+                    ThinkingMode::High,
+                ],
+                binary_label: "Enable Reasoning / Thinking",
+                tiered_label: "Thinking level:",
+            }
+        } else {
+            reasoning_config_for_model(&self.selected_model_id())
+        }
     }
 
     fn ensure_thinking_mode_valid_for_model(&mut self) {
@@ -1110,7 +1136,11 @@ impl ChatApp {
     }
 
     fn current_reasoning_capability(&self) -> ReasoningCapability {
-        get_model_capability(&self.selected_model_id())
+        if self.force_reasoning_controls {
+            ReasoningCapability::Tiered
+        } else {
+            get_model_capability(&self.selected_model_id())
+        }
     }
 
     fn refresh_model_access_outline(&mut self) {
@@ -1604,6 +1634,7 @@ impl ChatApp {
             model_waiting_command_output: false,
             model_access_outline_ok: None,
             custom_model_id,
+            force_reasoning_controls: false,
             // Tiered-capable models expose Low/Medium/High only, so use Medium as neutral default.
             selected_thinking_mode: ThinkingMode::Medium,
             binary_reasoning_enabled: true,
@@ -1616,6 +1647,7 @@ impl ChatApp {
             active_requests: HashMap::new(),
             db_path,
             storage,
+            rag_client: crate::rag_engine::RagEngine::<OpenAIEmbeddingProvider>::init_shared_qdrant_client(QDRANT_URL).ok(),
             pending_action: None,
             pending_actions_queue: VecDeque::new(),
             pending_action_session_idx: None,
@@ -1863,6 +1895,7 @@ impl ChatApp {
         let event_tx = self.event_tx.clone();
         let req_id = request_id.clone();
         let model_id = model_id.clone();
+        let shared_rag_client = self.rag_client.clone();
 
         self.tokio_rt.spawn(async move {
             let mut rag_context = "LOCAL REPOSITORY CONTEXT:\n- No relevant snippets found.".to_string();
@@ -1883,9 +1916,11 @@ impl ChatApp {
                     model: "text-embedding-3-small".to_string(),
                 };
                 let rag_cfg = RagConfig::with_workspace(working_dir.clone(), 1536);
-                if let Ok(engine) = RagEngine::new(rag_cfg, provider).await {
-                    if let Ok(snippets) = engine.semantic_search(&query).await {
-                        rag_context = RagEngine::<OpenAIEmbeddingProvider>::format_repository_context(&snippets);
+                if let Some(rag_client) = shared_rag_client {
+                    if let Ok(engine) = RagEngine::new(rag_cfg, provider, rag_client).await {
+                        if let Ok(snippets) = engine.semantic_search(&query).await {
+                            rag_context = RagEngine::<OpenAIEmbeddingProvider>::format_repository_context(&snippets);
+                        }
                     }
                 }
             }
@@ -2204,6 +2239,61 @@ impl ChatApp {
                             role.as_str(),
                             e
                         ));
+                    }
+                }
+            }
+
+            let unread_memory = swarm_memory.trim();
+            if !unread_memory.is_empty() {
+                let _ = event_tx
+                    .send(AppEvent::SwarmStatus {
+                        request_id: req_id.clone(),
+                        status: "🧩 Synthesizer is composing final response...".to_string(),
+                    })
+                    .await;
+                let _ = event_tx
+                    .send(AppEvent::SwarmWorkflowStep {
+                        request_id: req_id.clone(),
+                        title: "Synthesizer: final response".to_string(),
+                        details: "Generating final user-facing summary from swarm memory.".to_string(),
+                    })
+                    .await;
+
+                let synth_system_prompt = format!(
+                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{rag_context}\n\n{SWARM_SYNTH_ROLE_PROMPT}\n\nUser request:\n{query}\n\nSwarm memory:\n{swarm_memory}",
+                    swarm_memory = swarm_memory
+                );
+                let mut synth_messages = api_messages.clone();
+                synth_messages.insert(
+                    0,
+                    ChatMessage::with_cache_control("system", &synth_system_prompt),
+                );
+                match client
+                    .chat_completion(
+                        &model_id,
+                        synth_messages,
+                        reasoning_capability,
+                        tiered_reasoning_level.as_ref(),
+                        binary_reasoning_enabled,
+                        |_stream_chunk| {},
+                    )
+                    .await
+                {
+                    Ok(synth_raw) => {
+                        let synth_parsed = crate::parser::parse_response(&synth_raw);
+                        let synth_message = synth_parsed
+                            .message
+                            .as_deref()
+                            .filter(|m| !m.trim().is_empty())
+                            .unwrap_or(synth_parsed.fallback_text.as_str())
+                            .trim()
+                            .to_string();
+                        if !synth_message.is_empty() {
+                            final_parts.push(format!("Synthesizer: {synth_message}"));
+                        }
+                    }
+                    Err(e) => {
+                        swarm_memory.push_str(&format!("\n[Synthesizer error]\n{}\n", e));
                     }
                 }
             }
@@ -3356,11 +3446,13 @@ impl ChatApp {
                             }
                         }
 
-                        ui.horizontal(|ui| {
-                            if ui.button("📋 Copy").clicked() {
-                                self.copy_to_clipboard(&msg.content);
-                            }
-                            ui.with_layout(
+                        ui.columns(2, |columns| {
+                            columns[0].horizontal(|ui| {
+                                if ui.button("📋 Copy").clicked() {
+                                    self.copy_to_clipboard(&msg.content);
+                                }
+                            });
+                            columns[1].with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
@@ -4023,6 +4115,15 @@ impl eframe::App for ChatApp {
                                 self.activate_model_selection();
                             }
                         });
+                        if ui
+                            .checkbox(
+                                &mut self.force_reasoning_controls,
+                                "Force Enable Reasoning Controls",
+                            )
+                            .changed()
+                        {
+                            self.ensure_thinking_mode_valid_for_model();
+                        }
                     });
 
                     ui.horizontal(|ui| {
