@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::future::Future;
 
 use anyhow::{anyhow, Context, Result};
 use tokio::io::AsyncWriteExt;
@@ -16,6 +17,11 @@ pub enum ExecutionStatus {
     Executed(ExecutionReport),
     /// Execution was intentionally paused because user confirmation is required.
     AwaitingApproval(ApprovalRequest),
+    /// Execution was denied by user authorization decision.
+    AuthorizationDenied {
+        action: AgentAction,
+        reason: String,
+    },
 }
 
 /// Approval payload that the UI can render for approve/reject interactions.
@@ -23,6 +29,13 @@ pub enum ExecutionStatus {
 pub struct ApprovalRequest {
     pub action: AgentAction,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    ApproveOnce,
+    GrantTemporaryAccess,
+    Deny,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +124,53 @@ impl ActionExecutor {
 
         let report = self.execute_approved_action(action).await?;
         Ok(ExecutionStatus::Executed(report))
+    }
+
+    /// Executes one action with async permission callback support.
+    ///
+    /// Returns the action status and the potentially-updated auto-approve state.
+    pub async fn execute_action_with_permission<F, Fut>(
+        &self,
+        action: AgentAction,
+        policy: ExecutionPolicy,
+        current_auto_approve_state: bool,
+        mut request_permission: F,
+    ) -> Result<(ExecutionStatus, bool)>
+    where
+        F: FnMut(ApprovalRequest) -> Fut,
+        Fut: Future<Output = ApprovalDecision>,
+    {
+        if policy.requires_manual_approval(&action) {
+            if current_auto_approve_state {
+                let report = self.execute_approved_action(action).await?;
+                return Ok((ExecutionStatus::Executed(report), current_auto_approve_state));
+            }
+
+            let request = ApprovalRequest {
+                action: action.clone(),
+                reason: policy.approval_reason(&action),
+            };
+            match request_permission(request).await {
+                ApprovalDecision::ApproveOnce => {
+                    let report = self.execute_approved_action(action).await?;
+                    Ok((ExecutionStatus::Executed(report), false))
+                }
+                ApprovalDecision::GrantTemporaryAccess => {
+                    let report = self.execute_approved_action(action).await?;
+                    Ok((ExecutionStatus::Executed(report), true))
+                }
+                ApprovalDecision::Deny => Ok((
+                    ExecutionStatus::AuthorizationDenied {
+                        action,
+                        reason: "Authorization Denied".to_string(),
+                    },
+                    false,
+                )),
+            }
+        } else {
+            let report = self.execute_approved_action(action).await?;
+            Ok((ExecutionStatus::Executed(report), current_auto_approve_state))
+        }
     }
 
     /// Executes a full action list in sequence.
