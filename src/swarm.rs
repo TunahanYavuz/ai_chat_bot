@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-const UNIVERSAL_NLU_DIRECTIVE: &str = r#"GLOBAL NLU PROTOCOL: The user may command you in ANY language (Turkish, Spanish, etc.). You must understand their intent and reply in their language in the 'MESSAGE:' block. HOWEVER, your internal reasoning and the JSON `EXECUTION_BLOCK` MUST remain strictly in English. Never translate OS commands (e.g., use `mkdir`, not `klasör_aç`) or JSON keys."#;
+const UNIVERSAL_NLU_PROTOCOL: &str = r#"GLOBAL NLU PROTOCOL: The user may command you in ANY language (Turkish, Spanish, etc.). You must understand their intent and reply in their language in the 'MESSAGE:' block. HOWEVER, your internal reasoning and the JSON `EXECUTION_BLOCK` MUST remain strictly in English. Never translate OS commands (e.g., use `mkdir`, not `klasör_aç`) or JSON keys."#;
 
 const VISUAL_QA_PROTOCOL: &str = r#"VISUAL QA PROTOCOL:
 If the user provides image/screenshot context, perform visual QA triage before proposing actions:
@@ -111,7 +111,7 @@ PLAN:
             .to_string(),
     };
     format!(
-        "{base}\n\n{UNIVERSAL_NLU_DIRECTIVE}\n\n{VISUAL_QA_PROTOCOL}\n\n{WEB_SYNTHESIS_PROTOCOL}"
+        "{base}\n\n{UNIVERSAL_NLU_PROTOCOL}\n\n{VISUAL_QA_PROTOCOL}\n\n{WEB_SYNTHESIS_PROTOCOL}"
     )
 }
 

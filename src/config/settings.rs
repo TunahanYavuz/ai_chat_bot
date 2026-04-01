@@ -90,6 +90,14 @@ pub struct ProviderConfig {
     pub base_url: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ScheduledJobConfig {
+    pub id: String,
+    pub time_24h: String,
+    pub prompt: String,
+    pub enabled: bool,
+}
+
 // ─── Application Settings ─────────────────────────────────────────────────────
 
 fn default_openai_url() -> String {
@@ -123,6 +131,8 @@ pub struct Settings {
     pub setup_complete: bool,
     #[serde(default = "default_dark_mode")]
     pub dark_mode: bool,
+    #[serde(default)]
+    pub autonomous_schedules: Vec<ScheduledJobConfig>,
 }
 
 fn default_dark_mode() -> bool {
@@ -245,6 +255,7 @@ impl Default for Settings {
             default_model: DEFAULT_MODEL_ID.to_string(),
             setup_complete: false,
             dark_mode: true,
+            autonomous_schedules: vec![],
         }
     }
 }

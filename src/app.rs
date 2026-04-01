@@ -7,6 +7,7 @@ use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
+use chrono::Timelike;
 
 use crate::api::{
     builtin_models, provider_models, ChatMessage, ModelInfo, RemoteModelInfo,
@@ -55,6 +56,17 @@ const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const WORKFLOW_STEP_DETAIL_MAX_CHARS: usize = 1200;
 const QDRANT_URL: &str = "http://127.0.0.1:6334";
+const AUTONOMOUS_SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
+const AUTONOMOUS_WORKFLOW_PREFIX: &str = "[AUTONOMOUS CRON-SWARM]";
+const AUTONOMOUS_SESSION_NAME: &str = "Autonomous Briefing";
+const AUTONOMOUS_TRIGGER_KEYWORDS: [&str; 6] = [
+    "every day",
+    "every morning",
+    "schedule",
+    "every weekday",
+    "her gün",
+    "zamanla",
+];
 const SWARM_SYNTH_ROLE_PROMPT: &str = r#"You are Synthesizer in a multi-agent swarm.
 Output format:
 MESSAGE: ...
@@ -164,6 +176,7 @@ pub enum AppEvent {
         content: String,
         error: Option<String>,
     },
+    AutonomousScheduleTick,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +334,15 @@ struct PendingExecutionApproval {
     request: ApprovalRequest,
 }
 
+#[derive(Debug, Clone)]
+struct AutonomousSchedule {
+    id: String,
+    time_24h: String,
+    prompt: String,
+    enabled: bool,
+    last_run_date_utc: Option<String>,
+}
+
 #[derive(Clone)]
 struct OpenAIEmbeddingProvider {
     api_key: String,
@@ -434,6 +456,9 @@ pub struct ChatApp {
     pending_execution_approval: Option<PendingExecutionApproval>,
     approval_waiters:
         Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ApprovalDecision>>>>,
+    autonomous_schedules: Vec<AutonomousSchedule>,
+    autonomous_time_input: String,
+    autonomous_prompt_input: String,
 }
 
 impl ChatApp {
@@ -1721,6 +1746,9 @@ impl ChatApp {
             policy_block_dialog: None,
             pending_execution_approval: None,
             approval_waiters: Arc::new(Mutex::new(HashMap::new())),
+            autonomous_schedules: vec![],
+            autonomous_time_input: "08:00".to_string(),
+            autonomous_prompt_input: String::new(),
         };
 
         if let Some(idx) = app
@@ -1735,6 +1763,8 @@ impl ChatApp {
         app.load_models_from_provider();
         app.start_workspace_watcher_task();
         app.request_workspace_refresh();
+        app.hydrate_autonomous_schedules_from_settings();
+        app.start_autonomous_scheduler_task();
         app
     }
 
@@ -2386,6 +2416,173 @@ impl ChatApp {
         });
     }
 
+    fn start_autonomous_scheduler_task(&self) {
+        let tx = self.event_tx.clone();
+        self.tokio_rt.spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                AUTONOMOUS_SCHEDULER_TICK_INTERVAL_SECS,
+            ));
+            loop {
+                interval.tick().await;
+                let _ = tx.send(AppEvent::AutonomousScheduleTick).await;
+            }
+        });
+    }
+
+    fn hydrate_autonomous_schedules_from_settings(&mut self) {
+        self.autonomous_schedules = self
+            .settings
+            .autonomous_schedules
+            .iter()
+            .map(|job| AutonomousSchedule {
+                id: if job.id.trim().is_empty() {
+                    Uuid::new_v4().to_string()
+                } else {
+                    job.id.clone()
+                },
+                time_24h: job.time_24h.clone(),
+                prompt: job.prompt.clone(),
+                enabled: job.enabled,
+                last_run_date_utc: None,
+            })
+            .collect();
+    }
+
+    fn persist_autonomous_schedules_to_settings(&mut self) {
+        self.settings.autonomous_schedules = self
+            .autonomous_schedules
+            .iter()
+            .map(|job| crate::config::ScheduledJobConfig {
+                id: job.id.clone(),
+                time_24h: job.time_24h.clone(),
+                prompt: job.prompt.clone(),
+                enabled: job.enabled,
+            })
+            .collect();
+        if let Err(e) = save_settings(&self.settings) {
+            self.notify(
+                format!("Failed to save autonomous schedules: {e}"),
+                NotificationKind::Error,
+            );
+        }
+    }
+
+    fn parse_time_hhmm(value: &str) -> Option<(u32, u32)> {
+        let trimmed = value.trim();
+        let (h, m) = trimmed.split_once(':')?;
+        let hour: u32 = h.parse().ok()?;
+        let minute: u32 = m.parse().ok()?;
+        if hour < 24 && minute < 60 {
+            Some((hour, minute))
+        } else {
+            None
+        }
+    }
+
+    fn try_extract_schedule_from_user_message(&self, text: &str) -> Option<(String, String)> {
+        let lower = text.to_ascii_lowercase();
+        if !AUTONOMOUS_TRIGGER_KEYWORDS.iter().any(|k| lower.contains(k)) {
+            return None;
+        }
+        let bytes = text.as_bytes();
+        for i in 0..bytes.len().saturating_sub(4) {
+            if bytes[i].is_ascii_digit()
+                && bytes[i + 1].is_ascii_digit()
+                && bytes[i + 2] == b':'
+                && bytes[i + 3].is_ascii_digit()
+                && bytes[i + 4].is_ascii_digit()
+            {
+                let t = &text[i..i + 5];
+                if Self::parse_time_hhmm(t).is_some() {
+                    let prompt = text.trim().to_string();
+                    return Some((t.to_string(), prompt));
+                }
+            }
+        }
+        None
+    }
+
+    fn add_autonomous_schedule(&mut self, time_24h: String, prompt: String) {
+        if Self::parse_time_hhmm(&time_24h).is_none() {
+            self.notify(
+                "Invalid schedule time. Use HH:MM (24h).",
+                NotificationKind::Error,
+            );
+            return;
+        }
+        if prompt.trim().is_empty() {
+            self.notify("Schedule prompt cannot be empty.", NotificationKind::Error);
+            return;
+        }
+        self.autonomous_schedules.push(AutonomousSchedule {
+            id: Uuid::new_v4().to_string(),
+            time_24h,
+            prompt,
+            enabled: true,
+            last_run_date_utc: None,
+        });
+        self.persist_autonomous_schedules_to_settings();
+        self.notify("Autonomous schedule added.", NotificationKind::Info);
+    }
+
+    fn run_autonomous_scheduler_tick(&mut self) {
+        if self.autonomous_schedules.is_empty() {
+            return;
+        }
+        let now = Utc::now();
+        let today = now.format("%Y-%m-%d").to_string();
+        let mut to_run: Vec<String> = Vec::new();
+        for job in &mut self.autonomous_schedules {
+            if !job.enabled {
+                continue;
+            }
+            let Some((hour, minute)) = Self::parse_time_hhmm(&job.time_24h) else {
+                continue;
+            };
+            if now.hour() == hour
+                && now.minute() == minute
+                && job.last_run_date_utc.as_deref() != Some(&today)
+            {
+                job.last_run_date_utc = Some(today.clone());
+                to_run.push(job.prompt.clone());
+            }
+        }
+        if to_run.is_empty() {
+            return;
+        }
+        if self.current_session_idx.is_none() {
+            self.new_session();
+        }
+        let Some(session_idx) = self.current_session_idx else {
+            return;
+        };
+        for prompt in to_run {
+            let user_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                role: Role::User,
+                content: format!("{AUTONOMOUS_WORKFLOW_PREFIX}\n{prompt}"),
+                attachments: vec![],
+                timestamp: Utc::now(),
+                is_streaming: false,
+            };
+            if let Some(session) = self.sessions.get_mut(session_idx) {
+                if session.messages.is_empty() {
+                    session.name = AUTONOMOUS_SESSION_NAME.to_string();
+                }
+                let session_id = session.id.clone();
+                session.messages.push(user_msg.clone());
+                self.save_message(&session_id, &user_msg);
+            }
+            self.append_system_message(
+                Some(session_idx),
+                "🕒 Autonomous Cron-Swarm triggered scheduled workflow.".to_string(),
+            );
+        }
+        self.persist_autonomous_schedules_to_settings();
+        self.persist_session_snapshot_async(session_idx);
+        self.dispatch_agent_requests(session_idx);
+    }
+
     fn delete_session_by_index(&mut self, idx: usize) {
         let Some(session) = self.sessions.get(idx) else {
             return;
@@ -2732,6 +2929,10 @@ impl ChatApp {
         self.input_text.clear();
         self.persist_session_snapshot_async(session_idx);
 
+        if let Some((time_24h, prompt)) = self.try_extract_schedule_from_user_message(&text) {
+            self.add_autonomous_schedule(time_24h, prompt);
+        }
+
         self.dispatch_agent_requests(session_idx);
     }
 
@@ -3041,6 +3242,9 @@ impl ChatApp {
                     self.editor_buffers.insert(path.clone(), content);
                     self.editor_dirty.insert(path.clone(), false);
                     self.active_open_file = Some(path);
+                }
+                AppEvent::AutonomousScheduleTick => {
+                    self.run_autonomous_scheduler_tick();
                 }
             }
         }
@@ -4412,6 +4616,62 @@ impl eframe::App for ChatApp {
                         }
                         if ui.button("⚙ Advanced Settings").clicked() {
                             self.show_settings = true;
+                        }
+                    });
+                    ui.separator();
+                    ui.collapsing("Autonomous Cron-Swarm", |ui| {
+                        ui.label(
+                            RichText::new("Schedule autonomous workflows (daily HH:MM UTC)")
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Time:");
+                            ui.add(TextEdit::singleline(&mut self.autonomous_time_input).desired_width(70.0));
+                        });
+                        ui.add(
+                            TextEdit::multiline(&mut self.autonomous_prompt_input)
+                                .desired_rows(3)
+                                .desired_width(ui.available_width())
+                                .hint_text("e.g. Every morning: research AI news, analyze latest repo changes, generate PDF briefing."),
+                        );
+                        if ui.button("➕ Add Schedule").clicked() {
+                            let t = self.autonomous_time_input.trim().to_string();
+                            let p = self.autonomous_prompt_input.trim().to_string();
+                            self.add_autonomous_schedule(t, p);
+                            self.autonomous_prompt_input.clear();
+                        }
+                        ui.separator();
+                        let mut remove_id: Option<String> = None;
+                        for job in &mut self.autonomous_schedules {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.checkbox(&mut job.enabled, "");
+                                    ui.label(
+                                        RichText::new(format!("{} — {}", job.time_24h, job.prompt))
+                                            .small()
+                                            .color(TEXT_PRIMARY),
+                                    );
+                                    if ui.small_button("🗑").clicked() {
+                                        remove_id = Some(job.id.clone());
+                                    }
+                                });
+                                if let Some(last) = &job.last_run_date_utc {
+                                    ui.label(
+                                        RichText::new(format!("Last run (UTC date): {last}"))
+                                            .small()
+                                            .color(TEXT_MUTED),
+                                    );
+                                }
+                            });
+                        }
+                        if let Some(id) = remove_id {
+                            self.autonomous_schedules.retain(|j| j.id != id);
+                            self.persist_autonomous_schedules_to_settings();
+                        }
+                        if ui.button("💾 Save Schedule Changes").clicked() {
+                            self.persist_autonomous_schedules_to_settings();
+                            self.notify("Schedules saved.", NotificationKind::Info);
                         }
                     });
                 });

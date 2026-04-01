@@ -10,6 +10,7 @@ use crate::parser::{ActionKind, AgentAction};
 use crate::web_engine::{format_search_results, WebEngine};
 
 const EMPTY_COMMAND_SUCCESS_MSG: &str = "[System: Command executed successfully with no output]";
+const SUPPORTED_DOCUMENT_FORMATS: [&str; 2] = ["pdf", "docx"];
 
 /// Execution status emitted by the action pipeline.
 #[derive(Debug, Clone)]
@@ -98,14 +99,19 @@ pub struct ExecutionReport {
 pub struct ActionExecutor {
     workspace_root: PathBuf,
     web_engine: Option<WebEngine>,
+    web_engine_init_error: Option<String>,
 }
 
 impl ActionExecutor {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
-        let web_engine = WebEngine::new().ok();
+        let (web_engine, web_engine_init_error) = match WebEngine::new() {
+            Ok(engine) => (Some(engine), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
         Self {
             workspace_root: workspace_root.into(),
             web_engine,
+            web_engine_init_error,
         }
     }
 
@@ -309,7 +315,7 @@ impl ActionExecutor {
             ActionKind::GenerateDocument => {
                 let format = required_non_empty(action.parameters.format.as_deref(), "format")?
                     .to_ascii_lowercase();
-                if format != "pdf" && format != "docx" {
+                if !SUPPORTED_DOCUMENT_FORMATS.contains(&format.as_str()) {
                     return Err(anyhow!(
                         "unsupported document format '{}'; expected pdf or docx",
                         format
@@ -333,7 +339,14 @@ impl ActionExecutor {
                 let web_engine = self
                     .web_engine
                     .as_ref()
-                    .ok_or_else(|| anyhow!("web engine initialization failed"))?;
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "web engine initialization failed: {}",
+                            self.web_engine_init_error
+                                .as_deref()
+                                .unwrap_or("unknown initialization error")
+                        )
+                    })?;
                 let results = web_engine.search_web(&query).await?;
                 Ok(ExecutionReport {
                     action: "search_web".to_string(),
@@ -348,7 +361,14 @@ impl ActionExecutor {
                 let web_engine = self
                     .web_engine
                     .as_ref()
-                    .ok_or_else(|| anyhow!("web engine initialization failed"))?;
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "web engine initialization failed: {}",
+                            self.web_engine_init_error
+                                .as_deref()
+                                .unwrap_or("unknown initialization error")
+                        )
+                    })?;
                 let content = web_engine.read_url(&url).await?;
                 Ok(ExecutionReport {
                     action: "read_url".to_string(),
@@ -415,7 +435,7 @@ impl ActionExecutor {
         markdown_content: &str,
     ) -> Result<ExecutionReport> {
         let temp_name = format!(
-            ".ai_chat_bot_doc_{}_{}.md",
+            ".ai_os_doc_{}_{}.md",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
