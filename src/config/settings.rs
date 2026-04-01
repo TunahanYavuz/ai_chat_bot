@@ -8,19 +8,14 @@ const OLD_HUGGINGFACE_BASE_URL: &str = "https://api-inference.huggingface.co/v1"
 
 // ─── API Provider ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash, Default)]
 pub enum ApiProvider {
+    #[default]
     OpenAI,
     Nvidia,
     OpenRouter,
     HuggingFace,
     Custom,
-}
-
-impl Default for ApiProvider {
-    fn default() -> Self {
-        ApiProvider::OpenAI
-    }
 }
 
 impl ApiProvider {

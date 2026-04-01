@@ -1297,10 +1297,8 @@ impl ChatApp {
         let tx = self.event_tx.clone();
         self.tokio_rt.spawn(async move {
             let client = crate::api::OpenAIClient::new(&api_key, &base_url);
-            let model_ids = match client.list_models().await {
-                Ok(ids) => ids,
-                Err(_) => vec![],
-            };
+            let model_ids: Vec<crate::api::openai::RemoteModelInfo> =
+                client.list_models().await.unwrap_or_default();
             let _ = tx.send(AppEvent::ModelsLoaded(model_ids)).await;
         });
     }
@@ -3431,6 +3429,11 @@ impl eframe::App for ChatApp {
                     ui.collapsing("Settings", |ui| {
                         for agent in &mut self.agents {
                             ui.checkbox(&mut agent.enabled, &agent.name);
+                            ui.label(
+                                RichText::new(&agent.system_prompt)
+                                    .small()
+                                    .color(TEXT_MUTED),
+                            );
                         }
                         ui.separator();
                         ui.checkbox(

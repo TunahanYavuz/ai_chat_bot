@@ -36,6 +36,7 @@ pub struct ChatSession {
 /// Resolved host-specific storage paths for this app.
 #[derive(Debug, Clone)]
 pub struct StoragePaths {
+    #[allow(dead_code)] // Kept for future settings/config file persistence expansion.
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
     pub latest_session_path: PathBuf,
@@ -76,6 +77,7 @@ impl Storage {
         Ok(Self { paths })
     }
 
+    #[allow(dead_code)] // Kept for future diagnostics and path introspection in UI.
     pub fn paths(&self) -> &StoragePaths {
         &self.paths
     }
