@@ -25,6 +25,7 @@ use crate::storage::{ChatSession, Storage, StoredMessage, StoredRole};
 use crate::swarm::{get_system_prompt, parse_router_plan, AgentRole, RoutedTask};
 use crate::telemetry::collect_telemetry_cached;
 use crate::watcher::run_workspace_watcher;
+use qdrant_client::Qdrant;
 
 const BG_PRIMARY: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
 const BG_SURFACE: Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);
@@ -386,6 +387,7 @@ pub struct ChatApp {
 
     db_path: String,
     storage: Option<Storage>,
+    rag_client: Option<Arc<Qdrant>>,
     pending_action: Option<PendingAction>,
     pending_actions_queue: VecDeque<PendingAction>,
     pending_action_session_idx: Option<usize>,
@@ -1644,6 +1646,7 @@ impl ChatApp {
             active_requests: HashMap::new(),
             db_path,
             storage,
+            rag_client: crate::rag_engine::RagEngine::<OpenAIEmbeddingProvider>::init_shared_qdrant_client("http://127.0.0.1:6334").ok(),
             pending_action: None,
             pending_actions_queue: VecDeque::new(),
             pending_action_session_idx: None,
@@ -1891,6 +1894,7 @@ impl ChatApp {
         let event_tx = self.event_tx.clone();
         let req_id = request_id.clone();
         let model_id = model_id.clone();
+        let shared_rag_client = self.rag_client.clone();
 
         self.tokio_rt.spawn(async move {
             let mut rag_context = "LOCAL REPOSITORY CONTEXT:\n- No relevant snippets found.".to_string();
@@ -1911,9 +1915,11 @@ impl ChatApp {
                     model: "text-embedding-3-small".to_string(),
                 };
                 let rag_cfg = RagConfig::with_workspace(working_dir.clone(), 1536);
-                if let Ok(engine) = RagEngine::new(rag_cfg, provider).await {
-                    if let Ok(snippets) = engine.semantic_search(&query).await {
-                        rag_context = RagEngine::<OpenAIEmbeddingProvider>::format_repository_context(&snippets);
+                if let Some(rag_client) = shared_rag_client {
+                    if let Ok(engine) = RagEngine::new(rag_cfg, provider, rag_client).await {
+                        if let Ok(snippets) = engine.semantic_search(&query).await {
+                            rag_context = RagEngine::<OpenAIEmbeddingProvider>::format_repository_context(&snippets);
+                        }
                     }
                 }
             }
