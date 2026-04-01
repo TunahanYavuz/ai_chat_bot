@@ -21,7 +21,7 @@ use crate::models::{
     get_model_capability, reasoning_config_for_model, ModelReasoningConfig, ReasoningCapability,
     ThinkingMode,
 };
-use crate::parser::{ActionKind, AgentAction, CommandParams};
+use crate::parser::ActionKind;
 use crate::rag_engine::{EmbeddingProvider, RagConfig, RagEngine};
 use crate::setup::SetupWizard;
 use crate::storage::{ChatSession, Storage, StoredMessage, StoredRole};
@@ -55,6 +55,8 @@ const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
 const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const WORKFLOW_STEP_DETAIL_MAX_CHARS: usize = 1200;
+const TIMEOUT_EXIT_CODE: i32 = 124;
+const TERMINAL_RUNNING_MARKER: &str = "[running...]\n";
 const QDRANT_URL: &str = "http://127.0.0.1:6334";
 const AUTONOMOUS_SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
 const AUTONOMOUS_WORKFLOW_PREFIX: &str = "[AUTONOMOUS CRON-SWARM]";
@@ -130,6 +132,12 @@ pub enum AppEvent {
         stdout: String,
         stderr: String,
         exit_code: i32,
+        streamed: bool,
+    },
+    TerminalChunk {
+        terminal_id: String,
+        line: String,
+        is_stdout: bool,
     },
     InitialSessionsLoaded {
         sessions: Vec<Session>,
@@ -335,6 +343,12 @@ struct PendingExecutionApproval {
 }
 
 #[derive(Debug, Clone)]
+struct ClipboardAttachment {
+    filename: String,
+    text: String,
+}
+
+#[derive(Debug, Clone)]
 struct AutonomousSchedule {
     id: String,
     time_24h: String,
@@ -462,6 +476,122 @@ pub struct ChatApp {
 }
 
 impl ChatApp {
+    fn ingest_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
+        if dropped_files.is_empty() {
+            return;
+        }
+
+        let mut added = 0usize;
+        for file in dropped_files {
+            if let Some(path) = file.path {
+                match crate::files::read_file(&path) {
+                    Ok(fc) => {
+                        self.pending_attachments.push(Attachment {
+                            filename: fc.filename,
+                            text: fc.text,
+                            image_base64: fc.image_base64,
+                            mime_type: fc.mime_type,
+                            raw_bytes: fc.raw_bytes,
+                        });
+                        added += 1;
+                    }
+                    Err(e) => {
+                        self.notify(
+                            format!("Failed to ingest dropped file: {e}"),
+                            NotificationKind::Error,
+                        );
+                    }
+                }
+            } else if let Some(bytes) = file.bytes {
+                let raw = bytes.to_vec();
+                let filename = file
+                    .name
+                    .trim()
+                    .split(std::path::MAIN_SEPARATOR)
+                    .next_back()
+                    .unwrap_or("pasted.bin")
+                    .to_string();
+                let mime_type = if file.mime.trim().is_empty() {
+                    "application/octet-stream".to_string()
+                } else {
+                    file.mime.clone()
+                };
+                let text = std::str::from_utf8(&raw).ok().map(|s| s.to_string());
+                let image_base64 = if mime_type.starts_with("image/") {
+                    Some(general_purpose::STANDARD.encode(&raw))
+                } else {
+                    None
+                };
+                self.pending_attachments.push(Attachment {
+                    filename,
+                    text,
+                    image_base64,
+                    mime_type,
+                    raw_bytes: raw,
+                });
+                added += 1;
+            }
+        }
+        if added > 0 {
+            self.notify(
+                format!("Added {added} dropped attachment(s)"),
+                NotificationKind::Info,
+            );
+        }
+    }
+
+    fn clipboard_attachment(&self) -> Option<ClipboardAttachment> {
+        let mut clipboard = arboard::Clipboard::new().ok()?;
+        let text = clipboard.get_text().ok()?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let lines: Vec<&str> = trimmed.lines().collect();
+        let code_keyword_hits = ["fn ", "def ", "class ", "function ", "import ", "let ", "const "]
+            .iter()
+            .filter(|kw| trimmed.contains(**kw))
+            .count();
+        let punctuated_lines = lines
+            .iter()
+            .filter(|line| {
+                let l = line.trim();
+                l.ends_with(';') || l.ends_with('{') || l.ends_with('}')
+            })
+            .count();
+        let looks_like_code = trimmed.contains("```")
+            || code_keyword_hits >= 1
+            || (lines.len() >= 3 && punctuated_lines >= 2);
+        let filename = if trimmed.lines().count() > 1 || looks_like_code {
+            "clipboard_code.txt".to_string()
+        } else {
+            "clipboard_text.txt".to_string()
+        };
+        Some(ClipboardAttachment {
+            filename,
+            text: trimmed.to_string(),
+        })
+    }
+
+    fn attach_from_clipboard(&mut self) {
+        let Some(att) = self.clipboard_attachment() else {
+            self.notify(
+                "Clipboard does not contain text attachment data",
+                NotificationKind::Error,
+            );
+            return;
+        };
+        self.pending_attachments.push(Attachment {
+            filename: att.filename,
+            text: Some(att.text.clone()),
+            image_base64: None,
+            mime_type: "text/plain".to_string(),
+            raw_bytes: att.text.into_bytes(),
+        });
+        self.notify("Clipboard attachment added", NotificationKind::Info);
+    }
+
     fn request_workspace_refresh(&self) {
         let _ = self.workspace_refresh_tx.try_send(());
     }
@@ -712,7 +842,7 @@ impl ChatApp {
 
     fn render_workflow_visualizer(&mut self, ui: &mut egui::Ui) {
         egui::Frame::new()
-            .fill(BG_SURFACE)
+            .fill(Color32::from_rgba_unmultiplied(0x22, 0x24, 0x2A, 0xB8))
             .corner_radius(8.0)
             .stroke(egui::Stroke::new(1.0, BG_SURFACE_ALT))
             .inner_margin(egui::Margin::same(10))
@@ -1354,54 +1484,32 @@ impl ChatApp {
         self.terminals[idx]
             .output
             .push_str(&format!("$ {}\n", command));
+        self.terminals[idx].output.push_str(TERMINAL_RUNNING_MARKER);
         let wd = self.settings.working_directory.clone();
         let tx = self.event_tx.clone();
         let tid = terminal_id.to_string();
         self.tokio_rt.spawn(async move {
             let executor = ActionExecutor::new(wd);
-            let action = AgentAction {
-                action: ActionKind::RunCmd,
-                parameters: CommandParams {
-                    path: None,
-                    content: None,
-                    mode: None,
-                    title: None,
-                    format: None,
-                    markdown_content: None,
-                    command: Some(command),
-                    query: None,
-                    url: None,
-                },
-            };
-            let outcome = executor.execute_action(action, ExecutionPolicy::FullAccess).await;
+            let tx_chunks = tx.clone();
+            let tid_chunks = tid.clone();
+            let outcome = executor
+                .execute_command_streaming(&command, move |is_stdout, line| {
+                    let _ = tx_chunks.blocking_send(AppEvent::TerminalChunk {
+                        terminal_id: tid_chunks.clone(),
+                        line,
+                        is_stdout,
+                    });
+                })
+                .await;
             match outcome {
-                Ok(ExecutionStatus::Executed(report)) => {
+                Ok(report) => {
                     let _ = tx
                         .send(AppEvent::TerminalFinished {
                             terminal_id: tid,
                             stdout: report.stdout,
                             stderr: report.stderr,
                             exit_code: report.exit_code,
-                        })
-                        .await;
-                }
-                Ok(ExecutionStatus::AwaitingApproval(_)) => {
-                    let _ = tx
-                        .send(AppEvent::TerminalFinished {
-                            terminal_id: tid,
-                            stdout: String::new(),
-                            stderr: "Command awaiting approval".to_string(),
-                            exit_code: -1,
-                        })
-                        .await;
-                }
-                Ok(ExecutionStatus::AuthorizationDenied { reason, .. }) => {
-                    let _ = tx
-                        .send(AppEvent::TerminalFinished {
-                            terminal_id: tid,
-                            stdout: String::new(),
-                            stderr: reason,
-                            exit_code: -1,
+                            streamed: true,
                         })
                         .await;
                 }
@@ -1412,6 +1520,7 @@ impl ChatApp {
                             stdout: String::new(),
                             stderr: e.to_string(),
                             exit_code: -1,
+                            streamed: false,
                         })
                         .await;
                 }
@@ -1778,18 +1887,26 @@ impl ChatApp {
             style.visuals.window_fill = BG_SURFACE;
             style.visuals.extreme_bg_color = BG_PRIMARY;
             style.visuals.code_bg_color = BG_SURFACE_ALT;
+            style.visuals.window_stroke = egui::Stroke::new(1.0, BG_SURFACE_ALT);
+            style.visuals.widgets.noninteractive.weak_bg_fill = BG_SURFACE;
             style.visuals.widgets.noninteractive.bg_fill = BG_SURFACE;
             style.visuals.widgets.noninteractive.fg_stroke.color = TEXT_PRIMARY;
+            style.visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, BG_SURFACE_ALT);
             style.visuals.widgets.inactive.bg_fill = BG_SURFACE_ALT;
             style.visuals.widgets.inactive.fg_stroke.color = TEXT_PRIMARY;
+            style.visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, BG_SURFACE_ALT);
             style.visuals.widgets.hovered.bg_fill = BG_SURFACE_ALT;
             style.visuals.widgets.hovered.fg_stroke.color = TEXT_PRIMARY;
+            style.visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT_SOFT);
             style.visuals.widgets.active.bg_fill = ACCENT_SOFT;
             style.visuals.widgets.active.fg_stroke.color = TEXT_PRIMARY;
+            style.visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
             style.visuals.widgets.open.bg_fill = BG_SURFACE;
             style.visuals.widgets.open.fg_stroke.color = TEXT_PRIMARY;
             style.visuals.selection.bg_fill = ACCENT_SOFT;
             style.visuals.selection.stroke.color = TEXT_PRIMARY;
+            style.spacing.item_spacing = Vec2::new(8.0, 8.0);
+            style.spacing.button_padding = Vec2::new(10.0, 6.0);
             ctx.set_style(style);
         } else {
             ctx.set_visuals(egui::Visuals::light());
@@ -1938,9 +2055,11 @@ impl ChatApp {
                 if msg.attachments.iter().any(|a| a.image_base64.is_some()) {
                     for att in &msg.attachments {
                         if let Some(b64) = &att.image_base64 {
+                            let mut content = msg.content.clone();
+                            Self::push_attachment_with_metadata(&mut content, att);
                             api_messages.push(ChatMessage::with_image(
                                 role,
-                                &msg.content,
+                                &content,
                                 b64,
                                 &att.mime_type,
                             ));
@@ -1949,9 +2068,7 @@ impl ChatApp {
                 } else {
                     let mut content = msg.content.clone();
                     for att in &msg.attachments {
-                        if let Some(txt) = &att.text {
-                            content.push_str(&format!("\n\n[File: {}]\n{}", att.filename, txt));
-                        }
+                        Self::push_attachment_with_metadata(&mut content, att);
                     }
                     api_messages.push(ChatMessage::text(role, &content));
                 }
@@ -2283,15 +2400,20 @@ impl ChatApp {
                                             request_id: req_id.clone(),
                                             title: format!("{}: {}", role.as_str(), report.action),
                                             details: format!(
-                                                "success={}\nexit_code={}\nstdout:\n{}\nstderr:\n{}",
-                                                report.success, report.exit_code, report.stdout, report.stderr
+                                                "success={}\nexit_code={}\ntimed_out={}\nstdout:\n{}\nstderr:\n{}",
+                                                report.success, report.exit_code, report.timed_out, report.stdout, report.stderr
                                             ),
                                         })
                                         .await;
                                     swarm_memory.push_str(&format!(
-                                        "action={} success={} exit_code={}\nstdout:\n{}\nstderr:\n{}\n",
-                                        report.action, report.success, report.exit_code, report.stdout, report.stderr
+                                        "action={} success={} exit_code={} timed_out={}\nstdout:\n{}\nstderr:\n{}\n",
+                                        report.action, report.success, report.exit_code, report.timed_out, report.stdout, report.stderr
                                     ));
+                                    if report.timed_out {
+                                        swarm_memory.push_str(
+                                            "[synthesizer_timeout_hint]\nA command timed out. Analyze partial output, identify root cause, and propose an autonomous retry/fix strategy.\n",
+                                        );
+                                    }
                                 }
                                 ExecutionStatus::AuthorizationDenied { action, reason } => {
                                     let _ = event_tx
@@ -3066,6 +3188,7 @@ impl ChatApp {
                     request,
                 } => {
                     if self.active_requests.contains_key(&request_id) {
+                        self.swarm_status = "⏸ Waiting for manual approval".to_string();
                         self.pending_execution_approval = Some(PendingExecutionApproval {
                             request_id,
                             approval_id,
@@ -3109,6 +3232,7 @@ impl ChatApp {
                     stdout,
                     stderr,
                     exit_code,
+                    streamed,
                 } => {
                     let mut continue_session: Option<usize> = None;
                     let mut system_result: Option<(usize, String)> = None;
@@ -3116,13 +3240,17 @@ impl ChatApp {
                     if let Some(term) = self.terminals.iter_mut().find(|t| t.id == terminal_id) {
                         term.running = false;
                         term.exit_code = Some(exit_code);
-                        if !stdout.trim().is_empty() {
+                        if term.output.ends_with(TERMINAL_RUNNING_MARKER) {
+                            let len = term.output.len() - TERMINAL_RUNNING_MARKER.len();
+                            term.output.truncate(len);
+                        }
+                        if !streamed && !stdout.trim().is_empty() {
                             term.output.push_str(&stdout);
                             if !stdout.ends_with('\n') {
                                 term.output.push('\n');
                             }
                         }
-                        if !stderr.trim().is_empty() {
+                        if !streamed && !stderr.trim().is_empty() {
                             term.output.push_str("\n[stderr]\n");
                             term.output.push_str(&stderr);
                             if !stderr.ends_with('\n') {
@@ -3145,6 +3273,13 @@ impl ChatApp {
                                     result.push_str(&stderr);
                                     result.push_str("\n```");
                                 }
+                                if exit_code == TIMEOUT_EXIT_CODE
+                                    || stderr.to_ascii_lowercase().contains("[timeout]")
+                                {
+                                    result.push_str(
+                                        "\n\n[Synthesizer hint]\nThe command timed out. Analyze partial output, identify the blocker, and propose the next safe autonomous step.",
+                                    );
+                                }
                                 system_result = Some((session_idx, result));
                                 if term.auto_continue_agent {
                                     continue_session = Some(session_idx);
@@ -3158,6 +3293,22 @@ impl ChatApp {
                     }
                     if let Some(session_idx) = continue_session {
                         self.dispatch_agent_requests(session_idx);
+                    }
+                }
+                AppEvent::TerminalChunk {
+                    terminal_id,
+                    line,
+                    is_stdout,
+                } => {
+                    if let Some(term) = self.terminals.iter_mut().find(|t| t.id == terminal_id) {
+                        if is_stdout {
+                            term.output.push_str(&line);
+                            term.output.push('\n');
+                        } else {
+                            term.output.push_str("[stderr] ");
+                            term.output.push_str(&line);
+                            term.output.push('\n');
+                        }
                     }
                 }
                 AppEvent::InitialSessionsLoaded { sessions, error } => {
@@ -3270,6 +3421,22 @@ impl ChatApp {
                 }
                 Err(e) => self.notify(format!("Failed to read file: {e}"), NotificationKind::Error),
             }
+        }
+    }
+
+    fn push_attachment_with_metadata(content: &mut String, att: &Attachment) {
+        content.push_str(&format!(
+            "\n\n[AttachmentMeta]\nname={}\nmime={}\nbytes={}\n",
+            att.filename,
+            att.mime_type,
+            att.raw_bytes.len()
+        ));
+        if let Some(txt) = &att.text {
+            content.push_str(txt);
+        } else if att.image_base64.is_some() {
+            content.push_str("[binary image attached]");
+        } else {
+            content.push_str("[binary attachment]");
         }
     }
 
@@ -3667,17 +3834,33 @@ impl ChatApp {
                 egui::Frame::new()
                     .fill(bg_color)
                     .corner_radius(8.0)
-                    .inner_margin(egui::Margin::same(10))
+                    .inner_margin(egui::Margin {
+                        left: 12,
+                        right: 12,
+                        top: 10,
+                        bottom: 10,
+                    })
                     .show(ui, |ui| {
-                        ui.set_max_width(max_bubble - 20.0);
+                        ui.set_max_width(max_bubble - 24.0);
 
                         let role_label = if is_user { "You" } else { "Assistant" };
-                        ui.label(
-                            RichText::new(role_label)
-                                .small()
-                                .color(if is_user { BURGUNDY } else { SKY_BLUE })
-                                .strong(),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(role_label)
+                                    .small()
+                                    .color(if is_user { BURGUNDY } else { SKY_BLUE })
+                                    .strong(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Copy").clicked() {
+                                        self.copy_to_clipboard(&msg.content);
+                                    }
+                                },
+                            );
+                        });
+                        ui.add_space(4.0);
 
                         if msg.is_streaming && msg.content.is_empty() {
                             ui.spinner();
@@ -3719,21 +3902,13 @@ impl ChatApp {
                             }
                         }
 
-                        ui.columns(2, |columns| {
-                            columns[0].horizontal(|ui| {
-                                if ui.button("📋 Copy").clicked() {
-                                    self.copy_to_clipboard(&msg.content);
-                                }
-                            });
-                            columns[1].with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new(msg.timestamp.format("%H:%M").to_string())
-                                            .small()
-                                            .color(Color32::from_rgb(160, 160, 160)),
-                                    );
-                                },
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.add_space(2.0);
+                            ui.label(
+                                RichText::new(msg.timestamp.format("%H:%M").to_string())
+                                    .small()
+                                    .color(TEXT_MUTED),
                             );
                         });
                     });
@@ -3746,6 +3921,7 @@ impl eframe::App for ChatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_events();
         self.process_workspace_refresh_signals();
+        self.ingest_dropped_files(ctx);
         self.tick_notifications(ctx.input(|i| i.stable_dt));
         if !self.active_requests.is_empty() {
             ctx.request_repaint();
@@ -3885,13 +4061,16 @@ impl eframe::App for ChatApp {
                     &pending.approval_id,
                     ApprovalDecision::ApproveOnce,
                 );
+                self.swarm_status = "▶ Approval granted once".to_string();
             } else if grant_temporary {
                 self.resolve_pending_execution_approval(
                     &pending.approval_id,
                     ApprovalDecision::GrantTemporaryAccess,
                 );
+                self.swarm_status = "▶ Temporary access granted".to_string();
             } else if deny {
                 self.resolve_pending_execution_approval(&pending.approval_id, ApprovalDecision::Deny);
+                self.swarm_status = "⛔ Authorization denied".to_string();
             }
         }
 
@@ -4758,10 +4937,6 @@ impl eframe::App for ChatApp {
                         });
                     });
 
-                ui.add_space(6.0);
-                self.render_workflow_visualizer(ui);
-                ui.add_space(8.0);
-
                 let input_height = 100.0;
                 let msg_height = ui.available_height() - input_height;
 
@@ -4864,9 +5039,37 @@ impl eframe::App for ChatApp {
                                 {
                                     self.attach_file();
                                 }
+                                if ui
+                                    .add_sized(
+                                        [110.0, 26.0],
+                                        egui::Button::new(
+                                            RichText::new("Paste Clip").color(LIGHT_TEXT),
+                                        )
+                                        .fill(BG_SURFACE_ALT),
+                                    )
+                                    .clicked()
+                                {
+                                    self.attach_from_clipboard();
+                                }
                             });
                         });
                     });
+            });
+
+        egui::Window::new("Swarm Workflow")
+            .title_bar(true)
+            .resizable(true)
+            .default_size(Vec2::new(360.0, 220.0))
+            .default_pos(egui::pos2(290.0, 96.0))
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgba_unmultiplied(0x16, 0x18, 0x1E, 0xCC))
+                    .corner_radius(10.0)
+                    .stroke(egui::Stroke::new(1.0, BG_SURFACE_ALT))
+                    .inner_margin(egui::Margin::same(10)),
+            )
+            .show(ctx, |ui| {
+                self.render_workflow_visualizer(ui);
             });
 
         self.render_snapshots_window(ctx);

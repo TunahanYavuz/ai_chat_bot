@@ -3,14 +3,21 @@ use std::future::Future;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::Child;
+use tokio::sync::mpsc;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::time::{timeout, Duration};
 
 use crate::parser::{ActionKind, AgentAction};
 use crate::web_engine::{format_search_results, WebEngine};
 
 const EMPTY_COMMAND_SUCCESS_MSG: &str = "[System: Command executed successfully with no output]";
 const SUPPORTED_DOCUMENT_FORMATS: [&str; 2] = ["pdf", "docx"];
+const TERMINAL_ACTION_TIMEOUT_SECS: u64 = 90;
+const FILE_ACTION_TIMEOUT_SECS: u64 = 15;
+const TIMEOUT_EXIT_CODE: i32 = 124;
 
 /// Execution status emitted by the action pipeline.
 #[derive(Debug, Clone)]
@@ -88,6 +95,7 @@ pub struct ExecutionReport {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: i32,
+    pub timed_out: bool,
 }
 
 /// Enterprise-grade async action executor.
@@ -212,9 +220,13 @@ impl ActionExecutor {
             ActionKind::CreateFolder => {
                 let path = required_non_empty(action.parameters.path.as_deref(), "path")?;
                 let full_path = self.resolve_path(&path);
-                tokio::fs::create_dir_all(&full_path)
-                    .await
-                    .with_context(|| format!("failed to create folder {}", full_path.display()))?;
+                timeout(
+                    Duration::from_secs(FILE_ACTION_TIMEOUT_SECS),
+                    tokio::fs::create_dir_all(&full_path),
+                )
+                .await
+                .map_err(|_| anyhow!("create_folder timed out after {}s", FILE_ACTION_TIMEOUT_SECS))?
+                .with_context(|| format!("failed to create folder {}", full_path.display()))?;
 
                 Ok(ExecutionReport {
                     action: "create_folder".to_string(),
@@ -222,6 +234,7 @@ impl ActionExecutor {
                     stdout: format!("[System: Folder created] {}", full_path.display()),
                     stderr: String::new(),
                     exit_code: 0,
+                    timed_out: false,
                 })
             }
             ActionKind::CreateFile => {
@@ -230,9 +243,13 @@ impl ActionExecutor {
                 let full_path = self.resolve_path(&path);
 
                 ensure_parent_dir(&full_path).await?;
-                tokio::fs::write(&full_path, content)
-                    .await
-                    .with_context(|| format!("failed to write file {}", full_path.display()))?;
+                timeout(
+                    Duration::from_secs(FILE_ACTION_TIMEOUT_SECS),
+                    tokio::fs::write(&full_path, content),
+                )
+                .await
+                .map_err(|_| anyhow!("create_file timed out after {}s", FILE_ACTION_TIMEOUT_SECS))?
+                .with_context(|| format!("failed to write file {}", full_path.display()))?;
 
                 Ok(ExecutionReport {
                     action: "create_file".to_string(),
@@ -240,6 +257,7 @@ impl ActionExecutor {
                     stdout: format!("[System: File created] {}", full_path.display()),
                     stderr: String::new(),
                     exit_code: 0,
+                    timed_out: false,
                 })
             }
             ActionKind::EditFile => {
@@ -252,21 +270,29 @@ impl ActionExecutor {
 
                 match mode.as_str() {
                     "overwrite" => {
-                        tokio::fs::write(&full_path, content)
-                            .await
-                            .with_context(|| {
-                                format!("failed to overwrite file {}", full_path.display())
-                            })?;
+                        timeout(
+                            Duration::from_secs(FILE_ACTION_TIMEOUT_SECS),
+                            tokio::fs::write(&full_path, content),
+                        )
+                        .await
+                        .map_err(|_| anyhow!("edit_file timed out after {}s", FILE_ACTION_TIMEOUT_SECS))?
+                        .with_context(|| {
+                            format!("failed to overwrite file {}", full_path.display())
+                        })?;
                     }
                     "append" => {
-                        let mut file = tokio::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&full_path)
-                            .await
-                            .with_context(|| {
-                                format!("failed to open file for append {}", full_path.display())
-                            })?;
+                        let mut file = timeout(
+                            Duration::from_secs(FILE_ACTION_TIMEOUT_SECS),
+                            tokio::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&full_path),
+                        )
+                        .await
+                        .map_err(|_| anyhow!("edit_file timed out after {}s", FILE_ACTION_TIMEOUT_SECS))?
+                        .with_context(|| {
+                            format!("failed to open file for append {}", full_path.display())
+                        })?;
                         file.write_all(content.as_bytes()).await.with_context(|| {
                             format!("failed to append file {}", full_path.display())
                         })?;
@@ -285,6 +311,7 @@ impl ActionExecutor {
                     stdout: format!("[System: File edited] {}", full_path.display()),
                     stderr: String::new(),
                     exit_code: 0,
+                    timed_out: false,
                 })
             }
             ActionKind::CreatePdf => {
@@ -310,6 +337,7 @@ impl ActionExecutor {
                     stdout: format!("[System: PDF created] {}", full_path.display()),
                     stderr: String::new(),
                     exit_code: 0,
+                    timed_out: false,
                 })
             }
             ActionKind::GenerateDocument => {
@@ -354,6 +382,7 @@ impl ActionExecutor {
                     stdout: format_search_results(&results),
                     stderr: String::new(),
                     exit_code: 0,
+                    timed_out: false,
                 })
             }
             ActionKind::ReadUrl => {
@@ -376,6 +405,7 @@ impl ActionExecutor {
                     stdout: format!("[Web] Read URL: {url}\n\n{content}"),
                     stderr: String::new(),
                     exit_code: 0,
+                    timed_out: false,
                 })
             }
         }
@@ -397,10 +427,35 @@ impl ActionExecutor {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let output = command
-            .output()
+        let timeout_enabled = !should_skip_timeout_for_ui_app(cmd);
+        let output = if timeout_enabled {
+            match timeout(
+                Duration::from_secs(TERMINAL_ACTION_TIMEOUT_SECS),
+                command.output(),
+            )
             .await
-            .with_context(|| format!("failed to execute command: {cmd}"))?;
+            {
+                Ok(result) => result.with_context(|| format!("failed to execute command: {cmd}"))?,
+                Err(_) => {
+                    return Ok(ExecutionReport {
+                        action: "run_cmd".to_string(),
+                        success: false,
+                        stdout: String::new(),
+                        stderr: format!(
+                            "[timeout] command exceeded {}s: {}",
+                            TERMINAL_ACTION_TIMEOUT_SECS, cmd
+                        ),
+                        exit_code: TIMEOUT_EXIT_CODE,
+                        timed_out: true,
+                    });
+                }
+            }
+        } else {
+            command
+                .output()
+                .await
+                .with_context(|| format!("failed to execute command: {cmd}"))?
+        };
 
         let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -416,6 +471,142 @@ impl ActionExecutor {
             stdout,
             stderr,
             exit_code,
+            timed_out: false,
+        })
+    }
+
+    pub async fn execute_command_streaming<F>(
+        &self,
+        cmd: &str,
+        mut on_chunk: F,
+    ) -> Result<ExecutionReport>
+    where
+        F: FnMut(bool, String) + Send + 'static,
+    {
+        let mut command = if cfg!(target_os = "windows") {
+            let mut c = Command::new("cmd");
+            c.args(["/C", cmd]);
+            c
+        } else {
+            let mut c = Command::new("sh");
+            c.args(["-c", cmd]);
+            c
+        };
+
+        command
+            .current_dir(&self.workspace_root)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to start command: {cmd}"))?;
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<(bool, String)>();
+        let stdout_tx = chunk_tx.clone();
+        let stderr_tx = chunk_tx.clone();
+
+        let stdout_task = tokio::spawn(async move {
+            let mut output = String::new();
+            if let Some(stdout) = stdout_pipe {
+                let mut reader = BufReader::new(stdout).lines();
+                loop {
+                    match reader.next_line().await {
+                        Ok(Some(line)) => {
+                            if let Err(e) = stdout_tx.send((true, line.clone())) {
+                                eprintln!("failed to send stdout chunk to terminal UI channel: {e}");
+                            }
+                            output.push_str(&line);
+                            output.push('\n');
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            let msg = format!("[stdout read error] {e}");
+                            if let Err(e) = stdout_tx.send((false, msg.clone())) {
+                                eprintln!("failed to send stdout read error to terminal UI channel: {e}");
+                            }
+                            output.push_str(&msg);
+                            output.push('\n');
+                            break;
+                        }
+                    }
+                }
+            }
+            output
+        });
+
+        let stderr_task = tokio::spawn(async move {
+            let mut output = String::new();
+            if let Some(stderr) = stderr_pipe {
+                let mut reader = BufReader::new(stderr).lines();
+                loop {
+                    match reader.next_line().await {
+                        Ok(Some(line)) => {
+                            if let Err(e) = stderr_tx.send((false, line.clone())) {
+                                eprintln!("failed to send stderr chunk to terminal UI channel: {e}");
+                            }
+                            output.push_str(&line);
+                            output.push('\n');
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            let msg = format!("[stderr read error] {e}");
+                            if let Err(e) = stderr_tx.send((false, msg.clone())) {
+                                eprintln!("failed to send stderr read error to terminal UI channel: {e}");
+                            }
+                            output.push_str(&msg);
+                            output.push('\n');
+                            break;
+                        }
+                    }
+                }
+            }
+            output
+        });
+        drop(chunk_tx);
+
+        let timeout_enabled = !should_skip_timeout_for_ui_app(cmd);
+        let status_task = tokio::spawn(async move {
+            wait_for_child_with_optional_timeout(&mut child, timeout_enabled).await
+        });
+
+        while let Some((is_stdout, line)) = chunk_rx.recv().await {
+            on_chunk(is_stdout, line);
+        }
+
+        let status = status_task.await??;
+
+        let mut stdout = stdout_task.await.unwrap_or_default();
+        let stderr = stderr_task.await.unwrap_or_default();
+        let timed_out = status.1;
+        let exit_code = if timed_out {
+            TIMEOUT_EXIT_CODE
+        } else {
+            status.0.code().unwrap_or(-1)
+        };
+
+        if exit_code == 0 && stdout.trim().is_empty() {
+            stdout = EMPTY_COMMAND_SUCCESS_MSG.to_string();
+        }
+        let stderr = if timed_out {
+            format!(
+                "{}\n[timeout] command exceeded {}s: {}",
+                stderr, TERMINAL_ACTION_TIMEOUT_SECS, cmd
+            )
+            .trim()
+            .to_string()
+        } else {
+            stderr
+        };
+
+        Ok(ExecutionReport {
+            action: "run_cmd".to_string(),
+            success: exit_code == 0,
+            stdout,
+            stderr,
+            exit_code,
+            timed_out,
         })
     }
 
@@ -478,6 +669,7 @@ impl ActionExecutor {
                         ),
                         stderr,
                         exit_code,
+                        timed_out: false,
                     })
                 } else {
                     Ok(ExecutionReport {
@@ -486,6 +678,7 @@ impl ActionExecutor {
                         stdout,
                         stderr: format!("pandoc failed (exit={exit_code}): {stderr}"),
                         exit_code,
+                        timed_out: false,
                     })
                 }
             }
@@ -496,6 +689,7 @@ impl ActionExecutor {
                 stderr: "pandoc is not installed. Install pandoc and retry document generation."
                     .to_string(),
                 exit_code: 127,
+                timed_out: false,
             }),
             Err(e) => Err(anyhow!(e)).with_context(|| {
                 format!(
@@ -504,6 +698,54 @@ impl ActionExecutor {
                 )
             }),
         }
+    }
+}
+
+fn should_skip_timeout_for_ui_app(cmd: &str) -> bool {
+    let normalized = cmd.to_ascii_lowercase();
+    let ui_indicators = [
+        " ui.py",
+        "python ui.py",
+        "python3 ui.py",
+        "streamlit run",
+        "gradio",
+        "uvicorn",
+        "flask run",
+        "npm run dev",
+    ];
+    ui_indicators.iter().any(|pat| normalized.contains(pat))
+}
+
+async fn wait_for_child_with_optional_timeout(
+    child: &mut Child,
+    timeout_enabled: bool,
+) -> Result<(std::process::ExitStatus, bool)> {
+    if timeout_enabled {
+        match timeout(
+            Duration::from_secs(TERMINAL_ACTION_TIMEOUT_SECS),
+            child.wait(),
+        )
+        .await
+        {
+            Ok(wait_result) => Ok((
+                wait_result.context("failed waiting for command process")?,
+                false,
+            )),
+            Err(_) => {
+                let _ = child.kill().await;
+                let status = child
+                    .wait()
+                    .await
+                    .context("failed waiting for timed out process after kill")?;
+                Ok((status, true))
+            }
+        }
+    } else {
+        let status = child
+            .wait()
+            .await
+            .context("failed waiting for command process")?;
+        Ok((status, false))
     }
 }
 
