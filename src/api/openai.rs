@@ -188,14 +188,7 @@ impl ChatMessage {
     }
 
     pub fn with_cache_control(role: &str, content: &str) -> Self {
-        Self {
-            role: role.to_string(),
-            content: serde_json::json!([{
-                "type": "text",
-                "text": content,
-                "cache_control": {"type": "ephemeral"}
-            }]),
-        }
+        Self::text(role, content)
     }
 
     pub fn with_image(role: &str, text: &str, image_base64: &str, mime_type: &str) -> Self {
@@ -286,11 +279,15 @@ impl OpenAIClient {
         use futures_util::StreamExt;
 
         let is_thinking_model = model.contains("o1") || model.contains("o3");
+        let supports_reasoning_effort = self
+            .base_url
+            .trim_end_matches('/')
+            .starts_with("https://api.openai.com/v1");
 
         let request = ChatRequest {
             model: model.to_string(),
             messages,
-            reasoning_effort: if is_thinking_model {
+            reasoning_effort: if is_thinking_model && supports_reasoning_effort {
                 thinking_mode.and_then(|m| m.as_reasoning_effort()).map(str::to_string)
             } else {
                 None
