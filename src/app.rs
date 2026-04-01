@@ -11,6 +11,7 @@ use crate::api::{builtin_models, provider_models, ChatMessage, ModelInfo, Remote
 use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT_MODEL_ID};
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
 use crate::setup::SetupWizard;
+use crate::storage::{ChatSession, Storage, StoredMessage, StoredRole};
 use crate::telemetry::collect_telemetry_cached;
 
 const BG_PRIMARY: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
@@ -236,6 +237,7 @@ pub struct ChatApp {
     active_requests: HashMap<String, ActiveRequest>,
 
     db: Arc<Mutex<Option<Database>>>,
+    storage: Option<Storage>,
     pending_action: Option<PendingAction>,
     pending_actions_queue: VecDeque<PendingAction>,
     pending_action_session_idx: Option<usize>,
@@ -260,6 +262,54 @@ pub struct ChatApp {
 }
 
 impl ChatApp {
+    fn stored_role_from_role(role: &Role) -> StoredRole {
+        match role {
+            Role::System => StoredRole::System,
+            Role::User => StoredRole::User,
+            Role::Assistant => StoredRole::Assistant,
+        }
+    }
+
+    fn role_from_stored_role(role: &StoredRole) -> Role {
+        match role {
+            StoredRole::System => Role::System,
+            StoredRole::User => Role::User,
+            StoredRole::Assistant => Role::Assistant,
+        }
+    }
+
+    fn session_to_stored(session: &Session) -> ChatSession {
+        ChatSession {
+            id: session.id.clone(),
+            name: session.name.clone(),
+            updated_at: Utc::now(),
+            messages: session
+                .messages
+                .iter()
+                .map(|m| StoredMessage {
+                    role: Self::stored_role_from_role(&m.role),
+                    content: m.content.clone(),
+                    timestamp: m.timestamp,
+                })
+                .collect(),
+        }
+    }
+
+    fn persist_session_snapshot_async(&self, session_idx: usize) {
+        let Some(storage) = self.storage.clone() else {
+            return;
+        };
+        let Some(session) = self.sessions.get(session_idx) else {
+            return;
+        };
+        let payload = Self::session_to_stored(session);
+        self.tokio_rt.spawn(async move {
+            if let Err(e) = storage.save_session(&payload).await {
+                eprintln!("Failed to persist latest session: {e}");
+            }
+        });
+    }
+
     fn sanitized_command_stdout(stdout: &str, exit_code: i32) -> String {
         if stdout.trim().is_empty() {
             if exit_code == 0 {
@@ -596,12 +646,22 @@ impl ChatApp {
         if let Some((session_id, msg)) = to_save {
             self.save_message(&session_id, &msg);
         }
+        if let Some(i) = idx {
+            self.persist_session_snapshot_async(i);
+        }
     }
 
     pub fn new(cc: &eframe::CreationContext, rt: Arc<tokio::runtime::Runtime>) -> Self {
         let (event_tx, event_rx) = std::sync::mpsc::channel();
         let settings = load_settings();
         Self::apply_theme(&cc.egui_ctx, settings.dark_mode);
+        let storage = match Storage::new() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                eprintln!("Storage init error: {e}");
+                None
+            }
+        };
 
         let db = match Database::new(&settings.db_path) {
             Ok(d) => Some(d),
@@ -657,6 +717,7 @@ impl ChatApp {
             tokio_rt: rt,
             active_requests: HashMap::new(),
             db,
+            storage,
             pending_action: None,
             pending_actions_queue: VecDeque::new(),
             pending_action_session_idx: None,
@@ -699,6 +760,40 @@ impl ChatApp {
             .position(|m| m.id == app.settings.default_model)
         {
             app.selected_model_idx = idx;
+        }
+
+        if !app.sessions.is_empty() {
+            app.current_session_idx = Some(0);
+            app.load_session_messages(0);
+        } else if let Some(storage) = app.storage.clone() {
+            match app.tokio_rt.block_on(storage.load_latest_session()) {
+                Ok(Some(stored)) => {
+                    let restored_messages: Vec<Message> = stored
+                        .messages
+                        .into_iter()
+                        .map(|m| Message {
+                            id: Uuid::new_v4().to_string(),
+                            role: Self::role_from_stored_role(&m.role),
+                            content: m.content,
+                            attachments: vec![],
+                            timestamp: m.timestamp,
+                            is_streaming: false,
+                        })
+                        .collect();
+                    app.sessions.push(Session {
+                        id: stored.id,
+                        name: stored.name,
+                        messages: restored_messages,
+                    });
+                    app.current_session_idx = Some(0);
+                    app.activity_log
+                        .push("Loaded latest chat session from local storage".to_string());
+                }
+                Ok(None) => {}
+                Err(e) => app
+                    .activity_log
+                    .push(format!("Failed to load stored session: {e}")),
+            }
         }
 
         app.load_models_from_provider();
@@ -1327,6 +1422,7 @@ Do not fabricate directory listings, command outputs, or success messages.",
             session.messages.push(user_msg);
         }
         self.input_text.clear();
+        self.persist_session_snapshot_async(session_idx);
 
         self.dispatch_agent_requests(session_idx);
     }
@@ -1402,6 +1498,7 @@ Do not fabricate directory listings, command outputs, or success messages.",
                         if let Some((session_id, msg)) = to_save {
                             self.save_message(&session_id, &msg);
                         }
+                        self.persist_session_snapshot_async(active.session_idx);
                         self.activity_log.push(format!("{} finished response", active.agent_name));
                     }
                 }

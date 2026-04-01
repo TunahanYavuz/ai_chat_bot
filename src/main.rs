@@ -9,6 +9,7 @@ mod telemetry;
 mod parser;
 mod rag_engine;
 mod executor;
+mod storage;
 
 use std::sync::Arc;
 
