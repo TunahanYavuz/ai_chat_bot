@@ -362,6 +362,7 @@ pub struct ChatApp {
     model_waiting_command_output: bool,
     model_access_outline_ok: Option<bool>,
     custom_model_id: String,
+    force_reasoning_controls: bool,
     selected_thinking_mode: ThinkingMode,
     binary_reasoning_enabled: bool,
     execution_policy: ExecutionPolicy,
@@ -498,8 +499,8 @@ impl ChatApp {
         request_refresh: &mut bool,
     ) {
         let is_dir = node.is_dir;
-        let icon_emoji = if is_dir { "📁" } else { "📄" };
-        let label = format!("{icon_emoji} {}", node.name);
+        let icon_ascii = if is_dir { "[D]" } else { "[F]" };
+        let label = format!("{icon_ascii} {}", node.name);
 
         if is_dir {
             let expanded_now = self
@@ -580,7 +581,20 @@ impl ChatApp {
     }
 
     fn active_reasoning_config(&self) -> ModelReasoningConfig {
-        reasoning_config_for_model(&self.selected_model_id())
+        if self.force_reasoning_controls {
+            ModelReasoningConfig {
+                capability: ReasoningCapability::Tiered,
+                tiered_modes: &[
+                    ThinkingMode::Low,
+                    ThinkingMode::Medium,
+                    ThinkingMode::High,
+                ],
+                binary_label: "Enable Reasoning / Thinking",
+                tiered_label: "Thinking level:",
+            }
+        } else {
+            reasoning_config_for_model(&self.selected_model_id())
+        }
     }
 
     fn ensure_thinking_mode_valid_for_model(&mut self) {
@@ -1110,7 +1124,11 @@ impl ChatApp {
     }
 
     fn current_reasoning_capability(&self) -> ReasoningCapability {
-        get_model_capability(&self.selected_model_id())
+        if self.force_reasoning_controls {
+            ReasoningCapability::Tiered
+        } else {
+            get_model_capability(&self.selected_model_id())
+        }
     }
 
     fn refresh_model_access_outline(&mut self) {
@@ -1604,6 +1622,7 @@ impl ChatApp {
             model_waiting_command_output: false,
             model_access_outline_ok: None,
             custom_model_id,
+            force_reasoning_controls: false,
             // Tiered-capable models expose Low/Medium/High only, so use Medium as neutral default.
             selected_thinking_mode: ThinkingMode::Medium,
             binary_reasoning_enabled: true,
@@ -2204,6 +2223,70 @@ impl ChatApp {
                             role.as_str(),
                             e
                         ));
+                    }
+                }
+            }
+
+            let unread_memory = swarm_memory.trim();
+            if !unread_memory.is_empty() {
+                let _ = event_tx
+                    .send(AppEvent::SwarmStatus {
+                        request_id: req_id.clone(),
+                        status: "🧩 Synthesizer is composing final response...".to_string(),
+                    })
+                    .await;
+                let _ = event_tx
+                    .send(AppEvent::SwarmWorkflowStep {
+                        request_id: req_id.clone(),
+                        title: "Synthesizer: final response".to_string(),
+                        details: "Generating final user-facing summary from swarm memory.".to_string(),
+                    })
+                    .await;
+
+                let synth_role_prompt = "You are Synthesizer in a multi-agent swarm.
+Output format:
+MESSAGE: ...
+PLAN: ```json ... ```
+Rules:
+- Produce a final user-facing summary in MESSAGE using only gathered execution data.
+- Include key findings, errors, and blocked steps when relevant.
+- If no reliable result is available, clearly state what is missing.
+- Keep PLAN as an empty JSON object.";
+                let synth_system_prompt = format!(
+                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{rag_context}\n\n{synth_role_prompt}\n\nUser request:\n{query}\n\nSwarm memory:\n{}",
+                    swarm_memory
+                );
+                let mut synth_messages = api_messages.clone();
+                synth_messages.insert(
+                    0,
+                    ChatMessage::with_cache_control("system", &synth_system_prompt),
+                );
+                match client
+                    .chat_completion(
+                        &model_id,
+                        synth_messages,
+                        reasoning_capability,
+                        tiered_reasoning_level.as_ref(),
+                        binary_reasoning_enabled,
+                        |_| {},
+                    )
+                    .await
+                {
+                    Ok(synth_raw) => {
+                        let synth_parsed = crate::parser::parse_response(&synth_raw);
+                        let synth_message = synth_parsed
+                            .message
+                            .as_deref()
+                            .filter(|m| !m.trim().is_empty())
+                            .unwrap_or(synth_parsed.fallback_text.as_str())
+                            .trim()
+                            .to_string();
+                        if !synth_message.is_empty() {
+                            final_parts.push(format!("Synthesizer: {synth_message}"));
+                        }
+                    }
+                    Err(e) => {
+                        swarm_memory.push_str(&format!("\n[Synthesizer error]\n{}\n", e));
                     }
                 }
             }
@@ -3356,11 +3439,13 @@ impl ChatApp {
                             }
                         }
 
-                        ui.horizontal(|ui| {
-                            if ui.button("📋 Copy").clicked() {
-                                self.copy_to_clipboard(&msg.content);
-                            }
-                            ui.with_layout(
+                        ui.columns(2, |columns| {
+                            columns[0].horizontal(|ui| {
+                                if ui.button("📋 Copy").clicked() {
+                                    self.copy_to_clipboard(&msg.content);
+                                }
+                            });
+                            columns[1].with_layout(
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
@@ -4023,6 +4108,15 @@ impl eframe::App for ChatApp {
                                 self.activate_model_selection();
                             }
                         });
+                        if ui
+                            .checkbox(
+                                &mut self.force_reasoning_controls,
+                                "Force Enable Reasoning Controls",
+                            )
+                            .changed()
+                        {
+                            self.ensure_thinking_mode_valid_for_model();
+                        }
                     });
 
                     ui.horizontal(|ui| {

@@ -124,6 +124,24 @@ pub fn reasoning_config_for_model(model_name: &str) -> ModelReasoningConfig {
         return REASONING_BINARY;
     }
 
+    if m.contains("deepseek")
+        || m.contains("qwq")
+        || m.contains("reasoner")
+        || m.contains("thinking")
+    {
+        return REASONING_BINARY;
+    }
+
+    if m.contains("/o1")
+        || m.contains("/o3")
+        || m.contains("-o1")
+        || m.contains("-o3")
+        || m.contains("_o1")
+        || m.contains("_o3")
+    {
+        return REASONING_TIERED;
+    }
+
     REASONING_NONE
 }
 
