@@ -3841,75 +3841,77 @@ impl ChatApp {
                         bottom: 10,
                     })
                     .show(ui, |ui| {
-                        ui.set_max_width(max_bubble - 24.0);
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                            ui.set_max_width(max_bubble - 24.0);
 
-                        let role_label = if is_user { "You" } else { "Assistant" };
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                RichText::new(role_label)
-                                    .small()
-                                    .color(if is_user { BURGUNDY } else { SKY_BLUE })
-                                    .strong(),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.small_button("Copy").clicked() {
-                                        self.copy_to_clipboard(&msg.content);
-                                    }
-                                },
-                            );
-                        });
-                        ui.add_space(4.0);
-
-                        if msg.is_streaming && msg.content.is_empty() {
-                            ui.spinner();
-                        } else {
-                            let mut style = (*ui.ctx().style()).clone();
-                            style.visuals.override_text_color = Some(text_color);
-                            ui.scope(|ui| {
-                                ui.set_style(style);
-                                CommonMarkViewer::new().show(
-                                    ui,
-                                    &mut self.markdown_cache,
-                                    &msg.content,
+                            let role_label = if is_user { "You" } else { "Assistant" };
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    RichText::new(role_label)
+                                        .small()
+                                        .color(if is_user { BURGUNDY } else { SKY_BLUE })
+                                        .strong(),
+                                );
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui.small_button("Copy").clicked() {
+                                            self.copy_to_clipboard(&msg.content);
+                                        }
+                                    },
                                 );
                             });
-                        }
+                            ui.add_space(4.0);
 
-                        for att in &msg.attachments {
-                            ui.separator();
-                            if att.image_base64.is_some() {
-                                if ui
-                                    .button(
-                                        RichText::new(format!(
-                                            "🖼 {} (click to download)",
-                                            att.filename
-                                        ))
-                                        .color(SKY_BLUE)
-                                        .small(),
-                                    )
-                                    .clicked()
-                                {
-                                    self.download_image(att);
-                                }
+                            if msg.is_streaming && msg.content.is_empty() {
+                                ui.spinner();
                             } else {
-                                ui.label(
-                                    RichText::new(format!("📄 {}", att.filename))
-                                        .color(SKY_BLUE)
-                                        .small(),
-                                );
+                                let mut style = (*ui.ctx().style()).clone();
+                                style.visuals.override_text_color = Some(text_color);
+                                ui.scope(|ui| {
+                                    ui.set_style(style);
+                                    CommonMarkViewer::new().show(
+                                        ui,
+                                        &mut self.markdown_cache,
+                                        &msg.content,
+                                    );
+                                });
                             }
-                        }
 
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.add_space(2.0);
-                            ui.label(
-                                RichText::new(msg.timestamp.format("%H:%M").to_string())
-                                    .small()
-                                    .color(TEXT_MUTED),
-                            );
+                            for att in &msg.attachments {
+                                ui.separator();
+                                if att.image_base64.is_some() {
+                                    if ui
+                                        .button(
+                                            RichText::new(format!(
+                                                "🖼 {} (click to download)",
+                                                att.filename
+                                            ))
+                                            .color(SKY_BLUE)
+                                            .small(),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.download_image(att);
+                                    }
+                                } else {
+                                    ui.label(
+                                        RichText::new(format!("📄 {}", att.filename))
+                                            .color(SKY_BLUE)
+                                            .small(),
+                                    );
+                                }
+                            }
+
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(2.0);
+                                ui.label(
+                                    RichText::new(msg.timestamp.format("%H:%M").to_string())
+                                        .small()
+                                        .color(TEXT_MUTED),
+                                );
+                            });
                         });
                     });
             },
@@ -4538,6 +4540,7 @@ impl eframe::App for ChatApp {
                 .resizable(true)
                 .default_width(260.0)
                 .min_width(180.0)
+                .max_width(420.0)
                 .frame(
                     egui::Frame::new()
                         .fill(BG_SURFACE)
@@ -4573,9 +4576,16 @@ impl eframe::App for ChatApp {
                                     .get(idx)
                                     .map(|s| s.name.clone())
                                     .unwrap_or_else(|| "Conversation".to_string());
+                                let display_name: String = if name.chars().count() > 32 {
+                                    let shortened: String = name.chars().take(29).collect();
+                                    format!("{shortened}...")
+                                } else {
+                                    name.clone()
+                                };
                                 ui.horizontal(|ui| {
                                     let btn = egui::Button::new(
-                                        RichText::new(format!("💬 {name}")).color(LIGHT_TEXT),
+                                        RichText::new(format!("💬 {display_name}"))
+                                            .color(LIGHT_TEXT),
                                     )
                                     .fill(if is_current { GOLD_DARK } else { SKY_BLUE_DARK })
                                     .min_size(Vec2::new(
@@ -4883,6 +4893,8 @@ impl eframe::App for ChatApp {
             egui::SidePanel::right("activity")
                 .resizable(true)
                 .default_width(220.0)
+                .min_width(180.0)
+                .max_width(420.0)
                 .frame(
                     egui::Frame::new()
                         .fill(BURGUNDY_DARK)
