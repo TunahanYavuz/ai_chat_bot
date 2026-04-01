@@ -13,6 +13,7 @@ use qdrant_client::Qdrant;
 use tokio::task::JoinSet;
 
 /// Configuration for the repository-aware retrieval engine.
+#[allow(dead_code)] // Kept for future indexing/chunking configuration.
 #[derive(Debug, Clone)]
 pub struct RagConfig {
     pub qdrant_url: String,
@@ -49,6 +50,7 @@ pub trait EmbeddingProvider: Send + Sync {
 }
 
 /// One workspace file loaded for indexing.
+#[allow(dead_code)] // Kept for future workspace indexing pipeline.
 #[derive(Debug, Clone)]
 pub struct WorkspaceDocument {
     pub path: PathBuf,
@@ -56,6 +58,7 @@ pub struct WorkspaceDocument {
 }
 
 /// A normalized chunk that is embedded + persisted to Qdrant.
+#[allow(dead_code)] // Kept for future chunk persistence and tracing.
 #[derive(Debug, Clone)]
 pub struct ChunkRecord {
     pub id: u64,
@@ -64,6 +67,7 @@ pub struct ChunkRecord {
 }
 
 /// Search result surfaced to prompt-building layers.
+#[allow(dead_code)] // Kept for future typed retrieval outputs.
 #[derive(Debug, Clone)]
 pub struct RetrievedSnippet {
     pub file_path: String,
@@ -105,6 +109,7 @@ where
     ///
     /// Allowed extensions: .rs, .py, .md, .txt
     /// Explicitly skips: target/, .git/
+    #[allow(dead_code)] // Kept for future full indexing flow from UI triggers.
     pub async fn scan_workspace(&self) -> Result<Vec<WorkspaceDocument>> {
         let root = self.config.workspace_root.clone();
         let file_paths = tokio::task::spawn_blocking(move || -> Result<Vec<PathBuf>> {
@@ -167,7 +172,11 @@ where
     }
 
     /// Splits documents into overlap-preserving chunks and computes embeddings for each chunk.
-    pub async fn chunk_and_embed(&self, docs: &[WorkspaceDocument]) -> Result<Vec<(ChunkRecord, Vec<f32>)>> {
+    #[allow(dead_code)] // Kept for future full indexing flow from UI triggers.
+    pub async fn chunk_and_embed(
+        &self,
+        docs: &[WorkspaceDocument],
+    ) -> Result<Vec<(ChunkRecord, Vec<f32>)>> {
         let chunks = self.chunk_documents(docs);
         let mut result = Vec::with_capacity(chunks.len());
 
@@ -184,6 +193,7 @@ where
     }
 
     /// End-to-end indexing pipeline: scan -> chunk -> embed -> upsert.
+    #[allow(dead_code)] // Kept for future full indexing flow from UI triggers.
     pub async fn index_workspace(&self) -> Result<usize> {
         let docs = self.scan_workspace().await?;
         let embedded_chunks = self.chunk_and_embed(&docs).await?;
@@ -329,6 +339,7 @@ where
         Ok(())
     }
 
+    #[allow(dead_code)] // Kept for future full indexing flow from UI triggers.
     fn chunk_documents(&self, docs: &[WorkspaceDocument]) -> Vec<ChunkRecord> {
         let mut chunks = Vec::new();
         let size = self.config.chunk_size_chars.max(64);
@@ -369,12 +380,16 @@ where
     }
 }
 
+#[allow(dead_code)] // Kept for future indexing scan usage.
 fn is_allowed_extension(path: &Path) -> bool {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return false;
     };
 
-    matches!(ext.to_ascii_lowercase().as_str(), "rs" | "py" | "md" | "txt")
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "rs" | "py" | "md" | "txt"
+    )
 }
 
 fn payload_value_to_string(value: &Value) -> Option<String> {
@@ -384,6 +399,7 @@ fn payload_value_to_string(value: &Value) -> Option<String> {
     }
 }
 
+#[allow(dead_code)] // Kept for future deterministic indexing IDs.
 fn deterministic_chunk_id(file_path: &str, start_offset: usize, snippet: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     file_path.hash(&mut hasher);

@@ -36,6 +36,7 @@ pub struct ChatSession {
 /// Resolved host-specific storage paths for this app.
 #[derive(Debug, Clone)]
 pub struct StoragePaths {
+    #[allow(dead_code)] // Kept for future settings/config file persistence expansion.
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
     pub latest_session_path: PathBuf,
@@ -76,6 +77,7 @@ impl Storage {
         Ok(Self { paths })
     }
 
+    #[allow(dead_code)] // Kept for future diagnostics and path introspection in UI.
     pub fn paths(&self) -> &StoragePaths {
         &self.paths
     }
@@ -92,12 +94,14 @@ impl Storage {
         fs::write(&tmp_path, &serialized)
             .await
             .with_context(|| format!("failed to write temp session file {}", tmp_path.display()))?;
-        fs::rename(&tmp_path, &self.paths.latest_session_path).await.with_context(|| {
-            format!(
-                "failed to replace latest session file {}",
-                self.paths.latest_session_path.display()
-            )
-        })?;
+        fs::rename(&tmp_path, &self.paths.latest_session_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to replace latest session file {}",
+                    self.paths.latest_session_path.display()
+                )
+            })?;
         Ok(())
     }
 
@@ -115,8 +119,8 @@ impl Storage {
                     self.paths.latest_session_path.display()
                 )
             })?;
-        let parsed =
-            serde_json::from_slice::<ChatSession>(&bytes).context("failed to parse session JSON")?;
+        let parsed = serde_json::from_slice::<ChatSession>(&bytes)
+            .context("failed to parse session JSON")?;
         Ok(Some(parsed))
     }
 }

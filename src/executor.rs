@@ -5,6 +5,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
 use crate::parser::{ActionKind, AgentAction};
+use crate::web_engine::{format_search_results, WebEngine};
 
 const EMPTY_COMMAND_SUCCESS_MSG: &str = "[System: Command executed successfully with no output]";
 
@@ -22,6 +23,46 @@ pub enum ExecutionStatus {
 pub struct ApprovalRequest {
     pub action: AgentAction,
     pub reason: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionPolicy {
+    Manual,
+    ReadEdit,
+    Execute,
+    FullAccess,
+}
+
+impl ExecutionPolicy {
+    pub fn requires_manual_approval(self, action: &AgentAction) -> bool {
+        if self != ExecutionPolicy::FullAccess && action_requires_delete_safety(action) {
+            return true;
+        }
+        match self {
+            ExecutionPolicy::Manual => true,
+            ExecutionPolicy::ReadEdit => matches!(action.action, ActionKind::RunCmd),
+            ExecutionPolicy::Execute => false,
+            ExecutionPolicy::FullAccess => false,
+        }
+    }
+
+    pub fn approval_reason(self, action: &AgentAction) -> String {
+        if self != ExecutionPolicy::FullAccess && action_requires_delete_safety(action) {
+            return "Delete safety warning: destructive delete command/file deletion requires explicit confirmation".to_string();
+        }
+        match self {
+            ExecutionPolicy::Manual => {
+                "ExecutionPolicy::Manual requires explicit confirmation for all actions".to_string()
+            }
+            ExecutionPolicy::ReadEdit => {
+                "ExecutionPolicy::ReadEdit requires confirmation for command execution".to_string()
+            }
+            ExecutionPolicy::Execute => {
+                "ExecutionPolicy::Execute auto-approves commands and file edits".to_string()
+            }
+            ExecutionPolicy::FullAccess => "ExecutionPolicy::FullAccess auto-approves all actions".to_string(),
+        }
+    }
 }
 
 /// Normalized execution result returned to upper layers / LLM relay.
@@ -42,25 +83,29 @@ pub struct ExecutionReport {
 /// - Normalizes empty successful command output.
 pub struct ActionExecutor {
     workspace_root: PathBuf,
+    web_engine: WebEngine,
 }
 
 impl ActionExecutor {
     pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        let web_engine = WebEngine::new().expect("web engine init must succeed");
         Self {
             workspace_root: workspace_root.into(),
+            web_engine,
         }
     }
 
-    /// Executes one action or yields an approval request depending on `auto_approve`.
+    /// Executes one action or yields an approval request depending on execution policy.
     pub async fn execute_action(
         &self,
         action: AgentAction,
-        auto_approve: bool,
+        policy: ExecutionPolicy,
     ) -> Result<ExecutionStatus> {
-        if !auto_approve {
+        if policy.requires_manual_approval(&action) {
+            let reason = policy.approval_reason(&action);
             return Ok(ExecutionStatus::AwaitingApproval(ApprovalRequest {
                 action,
-                reason: "Auto-Approve is disabled; explicit user confirmation required".to_string(),
+                reason,
             }));
         }
 
@@ -70,16 +115,16 @@ impl ActionExecutor {
 
     /// Executes a full action list in sequence.
     ///
-    /// If auto-approve is disabled, the function returns early with first pending approval.
+    /// If policy requires approval, the function returns early with first pending approval.
     pub async fn execute_actions(
         &self,
         actions: Vec<AgentAction>,
-        auto_approve: bool,
+        policy: ExecutionPolicy,
     ) -> Result<Vec<ExecutionStatus>> {
         let mut statuses = Vec::with_capacity(actions.len());
 
         for action in actions {
-            let status = self.execute_action(action, auto_approve).await?;
+            let status = self.execute_action(action, policy).await?;
             let needs_approval = matches!(status, ExecutionStatus::AwaitingApproval(_));
             statuses.push(status);
             if needs_approval {
@@ -141,7 +186,9 @@ impl ActionExecutor {
                     "overwrite" => {
                         tokio::fs::write(&full_path, content)
                             .await
-                            .with_context(|| format!("failed to overwrite file {}", full_path.display()))?;
+                            .with_context(|| {
+                                format!("failed to overwrite file {}", full_path.display())
+                            })?;
                     }
                     "append" => {
                         let mut file = tokio::fs::OpenOptions::new()
@@ -149,10 +196,12 @@ impl ActionExecutor {
                             .append(true)
                             .open(&full_path)
                             .await
-                            .with_context(|| format!("failed to open file for append {}", full_path.display()))?;
-                        file.write_all(content.as_bytes())
-                            .await
-                            .with_context(|| format!("failed to append file {}", full_path.display()))?;
+                            .with_context(|| {
+                                format!("failed to open file for append {}", full_path.display())
+                            })?;
+                        file.write_all(content.as_bytes()).await.with_context(|| {
+                            format!("failed to append file {}", full_path.display())
+                        })?;
                     }
                     _ => {
                         return Err(anyhow!(
@@ -172,7 +221,10 @@ impl ActionExecutor {
             }
             ActionKind::CreatePdf => {
                 let path = required_non_empty(action.parameters.path.as_deref(), "path")?;
-                let title = action.parameters.title.unwrap_or_else(|| "Untitled".to_string());
+                let title = action
+                    .parameters
+                    .title
+                    .unwrap_or_else(|| "Untitled".to_string());
                 let content = action.parameters.content.unwrap_or_default();
                 let full_path = self.resolve_path(&path);
 
@@ -188,6 +240,28 @@ impl ActionExecutor {
                     action: "create_pdf".to_string(),
                     success: true,
                     stdout: format!("[System: PDF created] {}", full_path.display()),
+                    stderr: String::new(),
+                    exit_code: 0,
+                })
+            }
+            ActionKind::SearchWeb => {
+                let query = required_non_empty(action.parameters.query.as_deref(), "query")?;
+                let results = self.web_engine.search_web(&query).await?;
+                Ok(ExecutionReport {
+                    action: "search_web".to_string(),
+                    success: true,
+                    stdout: format_search_results(&results),
+                    stderr: String::new(),
+                    exit_code: 0,
+                })
+            }
+            ActionKind::ReadUrl => {
+                let url = required_non_empty(action.parameters.url.as_deref(), "url")?;
+                let content = self.web_engine.read_url(&url).await?;
+                Ok(ExecutionReport {
+                    action: "read_url".to_string(),
+                    success: true,
+                    stdout: format!("[Web] Read URL: {url}\n\n{content}"),
                     stderr: String::new(),
                     exit_code: 0,
                 })
@@ -318,4 +392,24 @@ fn escape_pdf_text(input: &str) -> String {
         .replace('(', "\\(")
         .replace(')', "\\)")
         .replace('\n', " ")
+}
+
+fn action_requires_delete_safety(action: &AgentAction) -> bool {
+    if let ActionKind::RunCmd = action.action {
+        let cmd = action
+            .parameters
+            .command
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mut tokens = cmd.split_whitespace();
+        let first = tokens.next().unwrap_or_default();
+        if first == "rm" || first == "del" || first == "rmdir" {
+            return true;
+        }
+        return std::iter::once(first)
+            .chain(tokens)
+            .any(|tok| tok == "delete_file");
+    }
+    false
 }

@@ -1,11 +1,9 @@
-use serde::{Deserialize, Serialize};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThinkingMode {
-    Disabled,
-    Auto,
     Low,
     Medium,
     High,
@@ -14,13 +12,45 @@ pub enum ThinkingMode {
 impl ThinkingMode {
     pub fn as_reasoning_effort(&self) -> Option<&'static str> {
         match self {
-            ThinkingMode::Disabled | ThinkingMode::Auto => None,
             ThinkingMode::Low => Some("low"),
             ThinkingMode::Medium => Some("medium"),
             ThinkingMode::High => Some("high"),
         }
     }
+}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningCapability {
+    None,
+    Binary,
+    Tiered,
+}
+
+pub fn get_model_capability(model_name: &str) -> ReasoningCapability {
+    let m = model_name.trim().to_lowercase();
+    if m.is_empty() {
+        return ReasoningCapability::None;
+    }
+
+    if m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.contains("/o1")
+        || m.contains("/o3")
+        || m.contains("-o1")
+        || m.contains("-o3")
+    {
+        return ReasoningCapability::Tiered;
+    }
+
+    if m.contains("deepseek-reasoner")
+        || m.contains("deepseek-r1")
+        || m.contains("qwen-reasoner")
+        || m.contains("qwq")
+    {
+        return ReasoningCapability::Binary;
+    }
+
+    ReasoningCapability::None
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +129,8 @@ struct ChatRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    include_reasoning: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
@@ -139,6 +171,53 @@ pub struct OpenAIClient {
     client: Client,
     api_key: String,
     base_url: String,
+}
+
+fn chat_message_text_content(msg: &ChatMessage) -> String {
+    if let Some(text) = msg.content.as_str() {
+        return text.to_string();
+    }
+
+    if let Some(items) = msg.content.as_array() {
+        let mut out = String::new();
+        for item in items {
+            if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(t);
+            }
+        }
+        return out;
+    }
+
+    String::new()
+}
+
+fn normalize_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let mut system_parts: Vec<String> = Vec::new();
+    let mut normalized_non_system: Vec<ChatMessage> = Vec::new();
+
+    for msg in messages {
+        if msg.role == "system" {
+            let text = chat_message_text_content(&msg);
+            if !text.trim().is_empty() {
+                system_parts.push(text);
+            }
+        } else {
+            normalized_non_system.push(msg);
+        }
+    }
+
+    if system_parts.is_empty() {
+        return normalized_non_system;
+    }
+
+    let merged_system = system_parts.join("\n\n");
+    let mut normalized = Vec::with_capacity(normalized_non_system.len() + 1);
+    normalized.push(ChatMessage::text("system", &merged_system));
+    normalized.extend(normalized_non_system);
+    normalized
 }
 
 impl OpenAIClient {
@@ -182,25 +261,38 @@ impl OpenAIClient {
         &self,
         model: &str,
         messages: Vec<ChatMessage>,
-        thinking_mode: Option<&ThinkingMode>,
+        reasoning_capability: ReasoningCapability,
+        tiered_reasoning_level: Option<&ThinkingMode>,
+        binary_reasoning_enabled: bool,
         on_chunk: impl Fn(String) + Send + 'static,
     ) -> Result<String> {
         use futures_util::StreamExt;
 
-        let is_thinking_model = model.contains("o1") || model.contains("o3");
-        let supports_reasoning_effort = self
-            .base_url
-            .trim_end_matches('/')
-            .starts_with("https://api.openai.com/v1");
+        let normalized_messages = normalize_messages(messages);
+        let supports_reasoning_effort = matches!(reasoning_capability, ReasoningCapability::Tiered)
+            && self
+                .base_url
+                .trim_end_matches('/')
+                .starts_with("https://api.openai.com/v1");
+        let include_reasoning =
+            if matches!(reasoning_capability, ReasoningCapability::Binary) && binary_reasoning_enabled
+            {
+                Some(true)
+            } else {
+                None
+            };
 
         let request = ChatRequest {
             model: model.to_string(),
-            messages,
-            reasoning_effort: if is_thinking_model && supports_reasoning_effort {
-                thinking_mode.and_then(|m| m.as_reasoning_effort()).map(str::to_string)
+            messages: normalized_messages,
+            reasoning_effort: if supports_reasoning_effort {
+                tiered_reasoning_level
+                    .and_then(|m| m.as_reasoning_effort())
+                    .map(str::to_string)
             } else {
                 None
             },
+            include_reasoning,
             stream: Some(true),
             max_tokens: None,
         };

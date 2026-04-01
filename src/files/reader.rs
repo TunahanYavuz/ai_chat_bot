@@ -1,6 +1,6 @@
 use anyhow::Result;
-use std::path::Path;
 use base64::{engine::general_purpose, Engine as _};
+use std::path::Path;
 
 pub struct FileContent {
     pub filename: String,
@@ -30,9 +30,7 @@ pub fn read_file(path: &Path) -> Result<FileContent> {
         "webp" => "image/webp",
         "pdf" => "application/pdf",
         "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "txt" | "md" | "rs" | "py" | "js" | "ts" | "json" | "toml" | "yaml" | "yml" => {
-            "text/plain"
-        }
+        "txt" | "md" | "rs" | "py" | "js" | "ts" | "json" | "toml" | "yaml" | "yml" => "text/plain",
         _ => "application/octet-stream",
     }
     .to_string();
@@ -79,7 +77,10 @@ fn extract_pdf_text(data: &[u8]) -> String {
                 if let Some(end) = line.rfind(')') {
                     if end > start {
                         let text = &line[start + 1..end];
-                        let cleaned: String = text.chars().filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace()).collect();
+                        let cleaned: String = text
+                            .chars()
+                            .filter(|c| c.is_ascii_graphic() || c.is_ascii_whitespace())
+                            .collect();
                         if !cleaned.trim().is_empty() {
                             result.push_str(&cleaned);
                             result.push(' ');

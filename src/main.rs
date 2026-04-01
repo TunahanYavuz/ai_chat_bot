@@ -2,13 +2,15 @@ mod api;
 mod app;
 mod config;
 mod db;
+mod executor;
 mod files;
-mod setup;
-mod telemetry;
 mod parser;
 mod rag_engine;
-mod executor;
+mod setup;
 mod storage;
+mod swarm;
+mod telemetry;
+mod web_engine;
 
 use std::sync::Arc;
 
