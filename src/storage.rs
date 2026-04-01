@@ -71,6 +71,14 @@ pub struct Storage {
     paths: StoragePaths,
 }
 
+#[derive(Debug, Clone)]
+pub struct FileNode {
+    pub name: String,
+    pub path: String,
+    pub is_dir: bool,
+    pub children: Vec<FileNode>,
+}
+
 impl Storage {
     pub fn new() -> Result<Self> {
         let paths = StoragePaths::resolve()?;
@@ -123,4 +131,72 @@ impl Storage {
             .context("failed to parse session JSON")?;
         Ok(Some(parsed))
     }
+}
+
+const IGNORED_DIRS: &[&str] = &[".git", "target", "node_modules"];
+
+fn should_ignore_dir(name: &str) -> bool {
+    IGNORED_DIRS.iter().any(|d| d.eq_ignore_ascii_case(name))
+}
+
+fn file_name_or_path(path: &std::path::Path) -> String {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| path.to_string_lossy().to_string())
+}
+
+pub async fn rebuild_file_cache(workspace_root: String) -> Result<FileNode> {
+    tokio::task::spawn_blocking(move || build_file_tree_sync(std::path::Path::new(&workspace_root)))
+        .await
+        .context("workspace file cache task failed")?
+}
+
+fn build_file_tree_sync(path: &std::path::Path) -> Result<FileNode> {
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed to read metadata for {}", path.display()))?;
+    let is_dir = metadata.is_dir();
+
+    let mut node = FileNode {
+        name: file_name_or_path(path),
+        path: path.to_string_lossy().to_string(),
+        is_dir,
+        children: Vec::new(),
+    };
+
+    if !is_dir {
+        return Ok(node);
+    }
+
+    let mut entries: Vec<std::path::PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(path)
+        .with_context(|| format!("failed to read directory {}", path.display()))?
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        entries.push(entry.path());
+    }
+
+    entries.sort_by(|a, b| {
+        let a_dir = a.is_dir();
+        let b_dir = b.is_dir();
+        match b_dir.cmp(&a_dir) {
+            std::cmp::Ordering::Equal => file_name_or_path(a).cmp(&file_name_or_path(b)),
+            other => other,
+        }
+    });
+
+    for entry_path in entries {
+        let name = file_name_or_path(&entry_path);
+        if entry_path.is_dir() && should_ignore_dir(&name) {
+            continue;
+        }
+        if let Ok(child) = build_file_tree_sync(&entry_path) {
+            node.children.push(child);
+        }
+    }
+
+    Ok(node)
 }

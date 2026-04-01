@@ -12,6 +12,7 @@ mod swarm;
 mod telemetry;
 mod web_engine;
 mod models;
+mod watcher;
 
 use std::sync::Arc;
 

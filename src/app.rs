@@ -24,6 +24,7 @@ use crate::setup::SetupWizard;
 use crate::storage::{ChatSession, Storage, StoredMessage, StoredRole};
 use crate::swarm::{get_system_prompt, parse_router_plan, AgentRole, RoutedTask};
 use crate::telemetry::collect_telemetry_cached;
+use crate::watcher::run_workspace_watcher;
 
 const BG_PRIMARY: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
 const BG_SURFACE: Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);
@@ -137,6 +138,15 @@ pub enum AppEvent {
     PolicyBlocked {
         request_id: String,
         reason: String,
+    },
+    WorkspaceTreeLoaded {
+        root: crate::storage::FileNode,
+        error: Option<String>,
+    },
+    WorkspaceFileLoaded {
+        path: String,
+        content: String,
+        error: Option<String>,
     },
 }
 
@@ -283,6 +293,11 @@ struct WorkflowStep {
     status: WorkflowStepStatus,
 }
 
+#[derive(Debug, Clone)]
+struct WorkspaceNodeUiState {
+    expanded: bool,
+}
+
 #[derive(Clone)]
 struct OpenAIEmbeddingProvider {
     api_key: String,
@@ -385,10 +400,167 @@ pub struct ChatApp {
     swarm_workflow: Vec<WorkflowStep>,
     workflow_expanded: HashMap<String, bool>,
     workflow_request_id: Option<String>,
+    workspace_tree: Option<crate::storage::FileNode>,
+    workspace_node_state: HashMap<String, WorkspaceNodeUiState>,
+    workspace_refresh_tx: tokio::sync::mpsc::Sender<()>,
+    workspace_refresh_rx: tokio::sync::mpsc::Receiver<()>,
+    workspace_watcher_task: Option<tokio::task::JoinHandle<()>>,
     policy_block_dialog: Option<String>,
 }
 
 impl ChatApp {
+    fn request_workspace_refresh(&self) {
+        let _ = self.workspace_refresh_tx.try_send(());
+    }
+
+    fn spawn_workspace_cache_rebuild(&self) {
+        let workspace_root = self.settings.working_directory.clone();
+        let tx = self.event_tx.clone();
+        self.tokio_rt.spawn(async move {
+            match crate::storage::rebuild_file_cache(workspace_root).await {
+                Ok(root) => {
+                    let _ = tx
+                        .send(AppEvent::WorkspaceTreeLoaded { root, error: None })
+                        .await;
+                }
+                Err(e) => {
+                    let fallback = crate::storage::FileNode {
+                        name: "workspace".to_string(),
+                        path: String::new(),
+                        is_dir: true,
+                        children: vec![],
+                    };
+                    let _ = tx
+                        .send(AppEvent::WorkspaceTreeLoaded {
+                            root: fallback,
+                            error: Some(e.to_string()),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn spawn_workspace_file_open(&self, path: String) {
+        let tx = self.event_tx.clone();
+        self.tokio_rt.spawn(async move {
+            match tokio::fs::read_to_string(&path).await {
+                Ok(content) => {
+                    let _ = tx
+                        .send(AppEvent::WorkspaceFileLoaded {
+                            path,
+                            content,
+                            error: None,
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(AppEvent::WorkspaceFileLoaded {
+                            path,
+                            content: String::new(),
+                            error: Some(e.to_string()),
+                        })
+                        .await;
+                }
+            }
+        });
+    }
+
+    fn process_workspace_refresh_signals(&mut self) {
+        let mut should_refresh = false;
+        while self.workspace_refresh_rx.try_recv().is_ok() {
+            should_refresh = true;
+        }
+        if should_refresh {
+            self.spawn_workspace_cache_rebuild();
+        }
+    }
+
+    fn start_workspace_watcher_task(&mut self) {
+        if let Some(handle) = self.workspace_watcher_task.take() {
+            handle.abort();
+        }
+        let workspace_root = self.settings.working_directory.clone();
+        let tx = self.workspace_refresh_tx.clone();
+        self.workspace_watcher_task = Some(self.tokio_rt.spawn(async move {
+            if let Err(err) = run_workspace_watcher(workspace_root, tx).await {
+                eprintln!("workspace watcher failed: {err}");
+            }
+        }));
+    }
+
+    fn render_workspace_tree_node(
+        &mut self,
+        ui: &mut egui::Ui,
+        node: &crate::storage::FileNode,
+        request_refresh: &mut bool,
+    ) {
+        let is_dir = node.is_dir;
+        let icon = if is_dir { "📁" } else { "📄" };
+        let label = format!("{icon} {}", node.name);
+
+        if is_dir {
+            let expanded_now = self
+                .workspace_node_state
+                .get(&node.path)
+                .map(|s| s.expanded)
+                .unwrap_or(false);
+            let chevron = if expanded_now { "▾" } else { "▸" };
+            let mut toggle = false;
+            ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::new(chevron).frame(false))
+                    .clicked()
+                {
+                    toggle = true;
+                }
+                let resp = ui.selectable_label(false, RichText::new(label).color(TEXT_PRIMARY));
+                resp.context_menu(|ui| {
+                    if ui.button("Refresh").clicked() {
+                        *request_refresh = true;
+                        ui.close_menu();
+                    }
+                });
+            });
+            if toggle {
+                let entry = self
+                    .workspace_node_state
+                    .entry(node.path.clone())
+                    .or_insert(WorkspaceNodeUiState { expanded: false });
+                entry.expanded = !entry.expanded;
+            }
+            let expanded_after = self
+                .workspace_node_state
+                .get(&node.path)
+                .map(|s| s.expanded)
+                .unwrap_or(false);
+            if expanded_after {
+                ui.indent(format!("indent_{}", node.path), |ui| {
+                    for child in &node.children {
+                        self.render_workspace_tree_node(ui, child, request_refresh);
+                    }
+                });
+            }
+            return;
+        }
+
+        let selected = self.active_open_file.as_deref() == Some(node.path.as_str());
+        let resp = ui.selectable_label(
+            selected,
+            RichText::new(label).color(if selected { GOLD } else { TEXT_PRIMARY }),
+        );
+        if resp.double_clicked() {
+            self.spawn_workspace_file_open(node.path.clone());
+        }
+        resp.context_menu(|ui| {
+            if ui.button("Refresh").clicked() {
+                *request_refresh = true;
+                ui.close_menu();
+            }
+        });
+    }
+
     fn sanitize_workflow_details(raw: &str) -> String {
         let trimmed = raw.trim();
         if trimmed.is_empty() {
@@ -1411,6 +1583,8 @@ impl ChatApp {
 
         let models = provider_models(settings.selected_provider.key());
         let custom_model_id = settings.default_model.clone();
+        let (workspace_refresh_tx, workspace_refresh_rx) =
+            tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let mut app = Self {
             setup_wizard: if settings.setup_complete {
                 None
@@ -1477,6 +1651,11 @@ impl ChatApp {
             swarm_workflow: vec![],
             workflow_expanded: HashMap::new(),
             workflow_request_id: None,
+            workspace_tree: None,
+            workspace_node_state: HashMap::new(),
+            workspace_refresh_tx,
+            workspace_refresh_rx,
+            workspace_watcher_task: None,
             policy_block_dialog: None,
         };
 
@@ -1490,6 +1669,8 @@ impl ChatApp {
 
         app.spawn_initial_data_load();
         app.load_models_from_provider();
+        app.start_workspace_watcher_task();
+        app.request_workspace_refresh();
         app
     }
 
@@ -2339,6 +2520,18 @@ impl ChatApp {
         }
     }
 
+    fn active_editor_language_label(&self) -> String {
+        let Some(path) = self.active_open_file.as_ref() else {
+            return "Language: txt".to_string();
+        };
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("txt")
+            .to_lowercase();
+        format!("Language: {}", ext)
+    }
+
     fn send_message(&mut self) {
         let text = self.input_text.trim().to_string();
         if text.is_empty() && self.pending_attachments.is_empty() {
@@ -2663,6 +2856,30 @@ impl ChatApp {
                 AppEvent::DbError(err) => {
                     self.notify(err, NotificationKind::Error);
                 }
+                AppEvent::WorkspaceTreeLoaded { root, error } => {
+                    self.workspace_tree = Some(root);
+                    if let Some(err) = error {
+                        self.notify(
+                            format!("Workspace refresh failed: {err}"),
+                            NotificationKind::Error,
+                        );
+                    }
+                }
+                AppEvent::WorkspaceFileLoaded { path, content, error } => {
+                    if let Some(err) = error {
+                        self.notify(
+                            format!("Open failed for {}: {}", path, err),
+                            NotificationKind::Error,
+                        );
+                        continue;
+                    }
+                    if !self.opened_files.iter().any(|p| p == &path) {
+                        self.opened_files.push(path.clone());
+                    }
+                    self.editor_buffers.insert(path.clone(), content);
+                    self.editor_dirty.insert(path.clone(), false);
+                    self.active_open_file = Some(path);
+                }
             }
         }
     }
@@ -2801,7 +3018,7 @@ impl ChatApp {
                     ui.label(RichText::new("Editor").color(TEXT_PRIMARY).strong());
                     if ui.small_button("📂 Open File").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
-                            self.open_file_in_workspace(path.to_string_lossy().to_string());
+                            self.spawn_workspace_file_open(path.to_string_lossy().to_string());
                         }
                     }
                 });
@@ -2812,7 +3029,7 @@ impl ChatApp {
                         for path in changed {
                             ui.horizontal(|ui| {
                                 if ui.small_button("Open").clicked() {
-                                    self.open_file_in_workspace(path.clone());
+                                    self.spawn_workspace_file_open(path.clone());
                                 }
                                 ui.label(RichText::new(path.clone()).small().color(LIGHT_TEXT));
                             });
@@ -2825,6 +3042,29 @@ impl ChatApp {
                             );
                         }
                     });
+                });
+                ui.separator();
+                let panel_resp = ui.collapsing("Workspace Explorer", |ui| {
+                    let max_h = (ui.available_height() * 0.30).max(120.0);
+                    ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
+                        let mut request_refresh = false;
+                        if let Some(root) = self.workspace_tree.clone() {
+                            for child in &root.children {
+                                self.render_workspace_tree_node(ui, child, &mut request_refresh);
+                            }
+                        } else {
+                            ui.label(RichText::new("Loading workspace…").small().color(TEXT_MUTED));
+                        }
+                        if request_refresh {
+                            self.request_workspace_refresh();
+                        }
+                    });
+                });
+                panel_resp.header_response.context_menu(|ui| {
+                    if ui.button("Refresh").clicked() {
+                        self.request_workspace_refresh();
+                        ui.close_menu();
+                    }
                 });
                 ui.separator();
 
@@ -2876,6 +3116,7 @@ impl ChatApp {
                 ui.separator();
 
                 if let Some(path) = self.active_open_file.clone() {
+                    let language_label = self.active_editor_language_label();
                     ui.horizontal(|ui| {
                         ui.label(RichText::new(path.clone()).small().color(TEXT_MUTED));
                         if ui.button("💾 Save").clicked() {
@@ -2883,13 +3124,8 @@ impl ChatApp {
                         }
                     });
                     if let Some(buffer) = self.editor_buffers.get_mut(&path) {
-                        let ext = std::path::Path::new(&path)
-                            .extension()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("txt")
-                            .to_lowercase();
                         ui.label(
-                            RichText::new(format!("Language: {}", ext))
+                            RichText::new(language_label)
                                 .small()
                                 .color(TEXT_MUTED),
                         );
@@ -3140,6 +3376,7 @@ impl ChatApp {
 impl eframe::App for ChatApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_events();
+        self.process_workspace_refresh_signals();
         self.tick_notifications(ctx.input(|i| i.stable_dt));
         if !self.active_requests.is_empty() {
             ctx.request_repaint();
