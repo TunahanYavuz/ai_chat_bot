@@ -30,10 +30,8 @@ pub async fn run_workspace_watcher(
 
     let signal_bridge = tokio::task::spawn_blocking(move || {
         while let Ok(evt) = fs_evt_rx.recv() {
-            if evt.is_ok() {
-                if raw_signal_tx.blocking_send(()).is_err() {
-                    break;
-                }
+            if evt.is_ok() && raw_signal_tx.blocking_send(()).is_err() {
+                break;
             }
         }
     });

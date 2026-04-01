@@ -50,6 +50,7 @@ const DELETE_CHAT_BUTTON_WIDTH: f32 = 36.0;
 const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
 const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
+const WORKFLOW_STEP_DETAIL_MAX_CHARS: usize = 1200;
 /// Prepended as the first system prompt for API requests so responses include
 /// a user-facing message plus a machine-readable ```json ... ``` execution block.
 const CORE_OS_SYSTEM_PROMPT: &str = r#"You are 'CoreOS', an advanced local File System and Command Line Interface (CLI) Agent. Your purpose is to assist the user by generating precise, executable commands while maintaining a helpful, conversational tone.
@@ -497,8 +498,8 @@ impl ChatApp {
         request_refresh: &mut bool,
     ) {
         let is_dir = node.is_dir;
-        let icon = if is_dir { "📁" } else { "📄" };
-        let label = format!("{icon} {}", node.name);
+        let icon_emoji = if is_dir { "📁" } else { "📄" };
+        let label = format!("{icon_emoji} {}", node.name);
 
         if is_dir {
             let expanded_now = self
@@ -568,11 +569,13 @@ impl ChatApp {
         }
         // Cap detail text to ~1200 chars so expanded blocks stay within a typical
         // laptop-height viewport and avoid pushing active steps out of view.
-        const MAX_CHARS: usize = 1200;
-        if trimmed.chars().count() <= MAX_CHARS {
+        if trimmed.len() <= WORKFLOW_STEP_DETAIL_MAX_CHARS {
             return trimmed.to_string();
         }
-        let clipped: String = trimmed.chars().take(MAX_CHARS).collect();
+        let clipped: String = trimmed
+            .chars()
+            .take(WORKFLOW_STEP_DETAIL_MAX_CHARS)
+            .collect();
         format!("{clipped}\n…")
     }
 
@@ -3048,8 +3051,9 @@ impl ChatApp {
                     let max_h = (ui.available_height() * 0.30).max(120.0);
                     ScrollArea::vertical().max_height(max_h).show(ui, |ui| {
                         let mut request_refresh = false;
-                        if let Some(root) = self.workspace_tree.clone() {
-                            for child in &root.children {
+                        if let Some(root) = &self.workspace_tree {
+                            let children = root.children.clone();
+                            for child in &children {
                                 self.render_workspace_tree_node(ui, child, &mut request_refresh);
                             }
                         } else {
@@ -3961,10 +3965,10 @@ impl eframe::App for ChatApp {
                                                 )
                                                 .clicked()
                                             {
-                                                // We defer activation until after ComboBox rendering
-                                                // because egui keeps an immutable borrow over
-                                                // `self.models` during iteration inside this closure.
-                                                // Applying settings requires mutable borrows.
+                                                // Defer activation until after ComboBox rendering
+                                                // to avoid borrow checker conflicts: egui holds an
+                                                // immutable borrow of `self.models` during iteration,
+                                                // but activation requires mutable access to `self`.
                                                 picked_model_idx = Some(i);
                                             }
                                         }

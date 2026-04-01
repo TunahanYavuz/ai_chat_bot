@@ -136,7 +136,8 @@ impl Storage {
 const IGNORED_DIRS: &[&str] = &[".git", "target", "node_modules"];
 
 fn should_ignore_dir(name: &str) -> bool {
-    IGNORED_DIRS.iter().any(|d| d.eq_ignore_ascii_case(name))
+    let normalized = name.to_ascii_lowercase();
+    IGNORED_DIRS.iter().any(|d| *d == normalized)
 }
 
 fn file_name_or_path(path: &std::path::Path) -> String {
@@ -168,7 +169,7 @@ fn build_file_tree_sync(path: &std::path::Path) -> Result<FileNode> {
         return Ok(node);
     }
 
-    let mut entries: Vec<std::path::PathBuf> = Vec::new();
+    let mut entries: Vec<(std::path::PathBuf, bool, String)> = Vec::new();
     for entry in std::fs::read_dir(path)
         .with_context(|| format!("failed to read directory {}", path.display()))?
     {
@@ -176,21 +177,25 @@ fn build_file_tree_sync(path: &std::path::Path) -> Result<FileNode> {
             Ok(e) => e,
             Err(_) => continue,
         };
-        entries.push(entry.path());
+        let entry_path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let is_dir = metadata.is_dir();
+        let name = file_name_or_path(&entry_path);
+        entries.push((entry_path, is_dir, name));
     }
 
     entries.sort_by(|a, b| {
-        let a_dir = a.is_dir();
-        let b_dir = b.is_dir();
-        match b_dir.cmp(&a_dir) {
-            std::cmp::Ordering::Equal => file_name_or_path(a).cmp(&file_name_or_path(b)),
+        match b.1.cmp(&a.1) {
+            std::cmp::Ordering::Equal => a.2.cmp(&b.2),
             other => other,
         }
     });
 
-    for entry_path in entries {
-        let name = file_name_or_path(&entry_path);
-        if entry_path.is_dir() && should_ignore_dir(&name) {
+    for (entry_path, is_dir, name) in entries {
+        if is_dir && should_ignore_dir(&name) {
             continue;
         }
         if let Ok(child) = build_file_tree_sync(&entry_path) {
