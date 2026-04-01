@@ -10,7 +10,7 @@ use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use regex::Regex;
 use uuid::Uuid;
 
-use crate::api::{builtin_models, provider_models, ChatMessage, ModelInfo, ThinkingMode};
+use crate::api::{builtin_models, provider_models, ChatMessage, ModelInfo, RemoteModelInfo, ThinkingMode};
 use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT_MODEL_ID};
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
 use crate::setup::SetupWizard;
@@ -81,7 +81,7 @@ pub enum AppEvent {
     ChunkReceived(String, String),
     ResponseComplete(String),
     ResponseError(String, String),
-    ModelsLoaded(Vec<String>),
+    ModelsLoaded(Vec<RemoteModelInfo>),
     TerminalFinished {
         terminal_id: String,
         stdout: String,
@@ -221,7 +221,9 @@ pub struct ChatApp {
 
     models: Vec<ModelInfo>,
     selected_model_idx: usize,
-    remote_models: Vec<String>,
+    remote_models: Vec<RemoteModelInfo>,
+    model_waiting_command_output: bool,
+    model_access_outline_ok: Option<bool>,
     custom_model_id: String,
     selected_thinking_mode: ThinkingMode,
 
@@ -258,6 +260,42 @@ pub struct ChatApp {
 }
 
 impl ChatApp {
+    fn sanitized_command_stdout(stdout: &str, exit_code: i32) -> String {
+        if stdout.trim().is_empty() {
+            if exit_code == 0 {
+                "[Command executed successfully with no output]".to_string()
+            } else {
+                format!("[Command produced no stdout output (exit code: {})]", exit_code)
+            }
+        } else {
+            stdout.to_string()
+        }
+    }
+
+    fn selected_model_id(&self) -> String {
+        if self.custom_model_id.trim().is_empty() {
+            self.current_model()
+                .map(|m| m.id.clone())
+                .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string())
+        } else {
+            self.custom_model_id.trim().to_string()
+        }
+    }
+
+    fn refresh_model_access_outline(&mut self) {
+        if self.remote_models.is_empty() {
+            self.model_access_outline_ok = None;
+            return;
+        }
+        let selected = self.selected_model_id();
+        self.model_access_outline_ok = self
+            .remote_models
+            .iter()
+            .find(|m| m.id == selected)
+            .map(|m| !(m.gated || m.premium))
+            .or(Some(false));
+    }
+
     fn execution_json_block_regex() -> &'static Regex {
         static RE: OnceLock<Regex> = OnceLock::new();
         RE.get_or_init(|| Regex::new(r"```json\s*(?P<json>\{[\s\S]*?\})\s*```").expect("valid regex"))
@@ -648,6 +686,8 @@ impl ChatApp {
             models,
             selected_model_idx: 0,
             remote_models: vec![],
+            model_waiting_command_output: false,
+            model_access_outline_ok: None,
             custom_model_id,
             selected_thinking_mode: ThinkingMode::Auto,
             input_text: String::new(),
@@ -723,6 +763,8 @@ impl ChatApp {
             style.visuals.widgets.hovered.fg_stroke.color = TEXT_PRIMARY;
             style.visuals.widgets.active.bg_fill = ACCENT_SOFT;
             style.visuals.widgets.active.fg_stroke.color = TEXT_PRIMARY;
+            style.visuals.widgets.open.bg_fill = BG_SURFACE;
+            style.visuals.widgets.open.fg_stroke.color = TEXT_PRIMARY;
             style.visuals.selection.bg_fill = ACCENT_SOFT;
             style.visuals.selection.stroke.color = TEXT_PRIMARY;
             ctx.set_style(style);
@@ -767,6 +809,8 @@ impl ChatApp {
                 self.custom_model_id = model.id.clone();
             }
         }
+        self.remote_models.clear();
+        self.model_access_outline_ok = None;
 
         let api_key = self.settings.active_api_key();
         let base_url = self.settings.active_base_url();
@@ -1380,7 +1424,36 @@ Do not fabricate directory listings, command outputs, or success messages.",
                     }
                 }
                 AppEvent::ModelsLoaded(model_ids) => {
-                    self.remote_models = model_ids;
+                    self.remote_models = model_ids.clone();
+                    if !model_ids.is_empty() {
+                        self.models = model_ids
+                            .iter()
+                            .map(|m| {
+                                let mut name = m.id.clone();
+                                if m.premium {
+                                    name.push_str("  [Premium]");
+                                }
+                                if m.gated {
+                                    name.push_str("  [Gated]");
+                                }
+                                ModelInfo {
+                                    id: m.id.clone(),
+                                    name,
+                                    thinking_modes: vec![],
+                                }
+                            })
+                            .collect();
+                        if let Some(idx) = self
+                            .models
+                            .iter()
+                            .position(|m| m.id == self.settings.default_model)
+                        {
+                            self.selected_model_idx = idx;
+                        } else {
+                            self.selected_model_idx = 0;
+                        }
+                    }
+                    self.refresh_model_access_outline();
                 }
                 AppEvent::TerminalFinished {
                     terminal_id,
@@ -1390,6 +1463,7 @@ Do not fabricate directory listings, command outputs, or success messages.",
                 } => {
                     let mut continue_session: Option<usize> = None;
                     let mut system_result: Option<(usize, String)> = None;
+                    let sanitized_stdout = Self::sanitized_command_stdout(&stdout, exit_code);
                     if let Some(term) = self.terminals.iter_mut().find(|t| t.id == terminal_id) {
                         term.running = false;
                         term.exit_code = Some(exit_code);
@@ -1407,17 +1481,15 @@ Do not fabricate directory listings, command outputs, or success messages.",
                             }
                         }
                         term.output.push_str(&format!("\n[exit code: {}]\n", exit_code));
-                        if term.owner == TerminalOwner::AI {
+                        if term.owner == TerminalOwner::AI && self.model_waiting_command_output {
                             if let Some(session_idx) = term.linked_session_idx {
                                 let mut result = format!(
                                     "✅ Command executed (approved)\nCommand: `{}`\nWorking directory: `{}`\nExit code: {}",
                                     term.command, term.working_dir, exit_code
                                 );
-                                if !stdout.trim().is_empty() {
-                                    result.push_str("\n\nstdout:\n```text\n");
-                                    result.push_str(&stdout);
-                                    result.push_str("\n```");
-                                }
+                                result.push_str("\n\nstdout:\n```text\n");
+                                result.push_str(&sanitized_stdout);
+                                result.push_str("\n```");
                                 if !stderr.trim().is_empty() {
                                     result.push_str("\n\nstderr:\n```text\n");
                                     result.push_str(&stderr);
@@ -1432,6 +1504,7 @@ Do not fabricate directory listings, command outputs, or success messages.",
                     }
                     if let Some((session_idx, result)) = system_result {
                         self.append_system_message(Some(session_idx), result);
+                        self.model_waiting_command_output = false;
                     }
                     if let Some(session_idx) = continue_session {
                         self.dispatch_agent_requests(session_idx);
@@ -1695,11 +1768,11 @@ Do not fabricate directory listings, command outputs, or success messages.",
                         );
                         self.active_terminal_id = Some(id);
                     }
-                    if let Some(active_id) = self.active_terminal_id.clone() {
-                        if ui.button("🛑 Terminate").clicked() {
+                        if let Some(active_id) = self.active_terminal_id.clone() {
+                        if ui.button("Terminate").on_hover_text("Stop the running process").clicked() {
                             self.terminate_terminal(&active_id);
                         }
-                        if ui.button("✕ Close").clicked() {
+                        if ui.button("Close").on_hover_text("Close this terminal tab").clicked() {
                             self.remove_terminal(&active_id);
                         }
                     }
@@ -1751,18 +1824,30 @@ Do not fabricate directory listings, command outputs, or success messages.",
                         );
                     });
                     ui.horizontal(|ui| {
-                        ui.add(
-                            TextEdit::singleline(&mut term.input_buffer)
+                        let term_input = ui.add(
+                            TextEdit::multiline(&mut term.input_buffer)
+                                .desired_rows(2)
                                 .desired_width((ui.available_width() - TERMINAL_INPUT_RESERVED_WIDTH).max(120.0))
                                 .hint_text("command"),
                         );
-                        if ui.button("Run").clicked() && !term.input_buffer.trim().is_empty() {
+                        let submit_on_enter = term_input.has_focus()
+                            && ctx.input(|i| {
+                                i.key_pressed(egui::Key::Enter)
+                                    && !i.modifiers.shift
+                                    && !i.modifiers.command
+                                    && !i.modifiers.ctrl
+                                    && !i.modifiers.alt
+                            });
+                        if (ui.button("Run").clicked() || submit_on_enter)
+                            && !term.input_buffer.trim().is_empty()
+                        {
                             run_cmd = Some(term.input_buffer.trim().to_string());
                         }
                     });
                     if let Some(cmd) = run_cmd {
                         term.input_buffer.clear();
                         let terminal_id = term.id.clone();
+                        self.model_waiting_command_output = false;
                         self.spawn_terminal_command(&terminal_id, cmd);
                     }
                 } else {
@@ -1983,6 +2068,7 @@ impl eframe::App for ChatApp {
                                 action_session_idx,
                                 true,
                             );
+                            self.model_waiting_command_output = true;
                             self.spawn_terminal_command(&tid, command.clone());
                             self.notify("AI command started in dedicated terminal", NotificationKind::Info);
                         }
@@ -2346,25 +2432,51 @@ impl eframe::App for ChatApp {
 
                     ui.separator();
                     ui.collapsing("Model Selection", |ui| {
+                        self.refresh_model_access_outline();
                         let selected_model_name = self
                             .models
                             .get(self.selected_model_idx)
                             .map(|m| m.name.clone())
                             .unwrap_or_else(|| "(none)".to_string());
-                        egui::ComboBox::from_id_salt("model_selector")
-                            .selected_text(RichText::new(selected_model_name).color(TEXT_PRIMARY))
-                            .width(ui.available_width())
-                            .show_ui(ui, |ui| {
-                                for (i, m) in self.models.iter().enumerate() {
-                                    ui.selectable_value(&mut self.selected_model_idx, i, &m.name);
-                                }
-                                if !self.remote_models.is_empty() {
-                                    ui.separator();
-                                    ui.label("Remote model IDs:");
-                                    for id in self.remote_models.iter().take(5) {
-                                        ui.label(RichText::new(id).small().color(TEXT_MUTED));
-                                    }
-                                }
+                        let outline_color = match self.model_access_outline_ok {
+                            Some(true) => Color32::from_rgb(0x4C, 0xAF, 0x50),
+                            Some(false) => Color32::from_rgb(0xF2, 0xC9, 0x4C),
+                            None => BG_SURFACE_ALT,
+                        };
+                        egui::Frame::new()
+                            .fill(BG_SURFACE)
+                            .stroke(egui::Stroke::new(1.0, outline_color))
+                            .show(ui, |ui| {
+                                egui::ComboBox::from_id_salt("model_selector")
+                                    .selected_text(RichText::new(selected_model_name).color(TEXT_PRIMARY))
+                                    .width(ui.available_width())
+                                    .show_ui(ui, |ui| {
+                                        for (i, m) in self.models.iter().enumerate() {
+                                            ui.selectable_value(
+                                                &mut self.selected_model_idx,
+                                                i,
+                                                RichText::new(&m.name).color(TEXT_PRIMARY),
+                                            );
+                                        }
+                                        if !self.remote_models.is_empty() {
+                                            ui.separator();
+                                            ui.label(RichText::new("Remote model IDs:").color(TEXT_PRIMARY));
+                                            for m in self.remote_models.iter().take(5) {
+                                                let mut extra = String::new();
+                                                if m.premium {
+                                                    extra.push_str(" [Premium]");
+                                                }
+                                                if m.gated {
+                                                    extra.push_str(" [Gated]");
+                                                }
+                                                ui.label(
+                                                    RichText::new(format!("{}{}", m.id, extra))
+                                                        .small()
+                                                        .color(TEXT_PRIMARY),
+                                                );
+                                            }
+                                        }
+                                    });
                             });
                         ui.label(RichText::new("Custom model ID").small().color(TEXT_MUTED));
                         ui.horizontal(|ui| {
@@ -2384,6 +2496,7 @@ impl eframe::App for ChatApp {
                                 }
                                 self.settings.default_model = self.custom_model_id.trim().to_string();
                                 let _ = save_settings(&self.settings);
+                                self.refresh_model_access_outline();
                             }
                             if ui.button("From list").clicked() {
                                 self.custom_model_id.clear();
@@ -2392,17 +2505,30 @@ impl eframe::App for ChatApp {
                                     .map(|m| m.id.clone())
                                     .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
                                 let _ = save_settings(&self.settings);
+                                self.refresh_model_access_outline();
                             }
                         });
                         if !self.remote_models.is_empty() {
+                            let mut picked_model_id: Option<String> = None;
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new("Quick pick:").small().color(TEXT_MUTED));
-                                for id in self.remote_models.iter().take(8) {
-                                    if ui.small_button(id).clicked() {
-                                        self.custom_model_id = id.clone();
+                                for model in self.remote_models.iter().take(8) {
+                                    let mut label = model.id.clone();
+                                    if model.premium {
+                                        label.push_str(" [Premium]");
+                                    }
+                                    if model.gated {
+                                        label.push_str(" [Gated]");
+                                    }
+                                    if ui.small_button(label).clicked() {
+                                        picked_model_id = Some(model.id.clone());
                                     }
                                 }
                             });
+                            if let Some(model_id) = picked_model_id {
+                                self.custom_model_id = model_id;
+                                self.refresh_model_access_outline();
+                            }
                         }
 
                         let supports_thinking = self
@@ -2595,7 +2721,15 @@ impl eframe::App for ChatApp {
                                 .hint_text("Type a message…")
                                 .frame(true);
                             let response = ui.add(text_edit);
-                            if response.has_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter) && i.modifiers.ctrl) {
+                            if response.has_focus()
+                                && ctx.input(|i| {
+                                    i.key_pressed(egui::Key::Enter)
+                                        && !i.modifiers.shift
+                                        && !i.modifiers.command
+                                        && !i.modifiers.ctrl
+                                        && !i.modifiers.alt
+                                })
+                            {
                                 self.send_message();
                             }
 

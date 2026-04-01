@@ -36,138 +36,23 @@ impl ModelInfo {
     }
 }
 
-pub fn builtin_models() -> Vec<ModelInfo> {
-    provider_models("openai")
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemoteModelInfo {
+    pub id: String,
+    pub gated: bool,
+    pub premium: bool,
 }
 
-pub fn provider_models(provider: &str) -> Vec<ModelInfo> {
-    let p = provider.to_lowercase();
-    if p == "nvidia" {
-        return vec![
-            ModelInfo {
-                id: "meta/llama-3.3-70b-instruct".to_string(),
-                name: "Llama 3.3 70B Instruct".to_string(),
-                thinking_modes: vec![],
-            },
-            ModelInfo {
-                id: "nvidia/llama-3.1-nemotron-70b-instruct".to_string(),
-                name: "Nemotron 70B Instruct".to_string(),
-                thinking_modes: vec![],
-            },
-            ModelInfo {
-                id: "mistralai/mistral-large-2-instruct".to_string(),
-                name: "Mistral Large 2 Instruct".to_string(),
-                thinking_modes: vec![],
-            },
-        ];
-    }
-    if p == "openrouter" {
-        return vec![
-            ModelInfo {
-                id: "openai/gpt-4o".to_string(),
-                name: "OpenRouter GPT-4o".to_string(),
-                thinking_modes: vec![],
-            },
-            ModelInfo {
-                id: "openai/o1".to_string(),
-                name: "OpenAI O1 (OpenRouter)".to_string(),
-                thinking_modes: vec![
-                    ThinkingMode::Disabled,
-                    ThinkingMode::Auto,
-                    ThinkingMode::Low,
-                    ThinkingMode::Medium,
-                    ThinkingMode::High,
-                ],
-            },
-            ModelInfo {
-                id: "openai/o3-mini".to_string(),
-                name: "OpenAI O3 Mini (OpenRouter)".to_string(),
-                thinking_modes: vec![
-                    ThinkingMode::Disabled,
-                    ThinkingMode::Auto,
-                    ThinkingMode::Low,
-                    ThinkingMode::Medium,
-                    ThinkingMode::High,
-                ],
-            },
-            ModelInfo {
-                id: "anthropic/claude-3.5-sonnet".to_string(),
-                name: "Claude 3.5 Sonnet".to_string(),
-                thinking_modes: vec![ThinkingMode::Disabled, ThinkingMode::Auto],
-            },
-        ];
-    }
-    if p == "huggingface" {
-        return vec![
-            ModelInfo {
-                id: "meta-llama/Llama-3.1-8B-Instruct".to_string(),
-                name: "Llama 3.1 8B Instruct".to_string(),
-                thinking_modes: vec![],
-            },
-        ];
-    }
+pub fn builtin_models() -> Vec<ModelInfo> {
+    vec![ModelInfo {
+        id: "gpt-4o".to_string(),
+        name: "gpt-4o".to_string(),
+        thinking_modes: vec![],
+    }]
+}
 
-    vec![
-        ModelInfo {
-            id: "gpt-4o".to_string(),
-            name: "GPT-4o".to_string(),
-            thinking_modes: vec![],
-        },
-        ModelInfo {
-            id: "gpt-4o-mini".to_string(),
-            name: "GPT-4o Mini".to_string(),
-            thinking_modes: vec![],
-        },
-        ModelInfo {
-            id: "gpt-3.5-turbo".to_string(),
-            name: "GPT-3.5 Turbo".to_string(),
-            thinking_modes: vec![],
-        },
-        ModelInfo {
-            id: "o1".to_string(),
-            name: "O1".to_string(),
-            thinking_modes: vec![
-                ThinkingMode::Disabled,
-                ThinkingMode::Auto,
-                ThinkingMode::Low,
-                ThinkingMode::Medium,
-                ThinkingMode::High,
-            ],
-        },
-        ModelInfo {
-            id: "o1-mini".to_string(),
-            name: "O1 Mini".to_string(),
-            thinking_modes: vec![
-                ThinkingMode::Disabled,
-                ThinkingMode::Auto,
-                ThinkingMode::Low,
-                ThinkingMode::Medium,
-                ThinkingMode::High,
-            ],
-        },
-        ModelInfo {
-            id: "o1-preview".to_string(),
-            name: "O1 Preview".to_string(),
-            thinking_modes: vec![
-                ThinkingMode::Disabled,
-                ThinkingMode::Auto,
-                ThinkingMode::Low,
-                ThinkingMode::Medium,
-                ThinkingMode::High,
-            ],
-        },
-        ModelInfo {
-            id: "o3-mini".to_string(),
-            name: "O3 Mini".to_string(),
-            thinking_modes: vec![
-                ThinkingMode::Disabled,
-                ThinkingMode::Auto,
-                ThinkingMode::Low,
-                ThinkingMode::Medium,
-                ThinkingMode::High,
-            ],
-        },
-    ]
+pub fn provider_models(_provider: &str) -> Vec<ModelInfo> {
+    vec![]
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -381,10 +266,16 @@ impl OpenAIClient {
         Ok(full_content)
     }
 
-    pub async fn list_models(&self) -> Result<Vec<String>> {
+    pub async fn list_models(&self) -> Result<Vec<RemoteModelInfo>> {
         #[derive(Deserialize)]
         struct ModelItem {
             id: String,
+            #[serde(default)]
+            gated: Option<bool>,
+            #[serde(default, rename = "is_gated")]
+            is_gated: Option<bool>,
+            #[serde(default)]
+            premium: Option<bool>,
         }
         #[derive(Deserialize)]
         struct ModelsResponse {
@@ -400,12 +291,20 @@ impl OpenAIClient {
             .await?;
 
         if !response.status().is_success() {
-            return Ok(vec![]);
+            return Ok(Vec::new());
         }
 
         let models: ModelsResponse = response.json().await?;
-        let mut ids: Vec<String> = models.data.into_iter().map(|m| m.id).collect();
-        ids.sort();
-        Ok(ids)
+        let mut items: Vec<RemoteModelInfo> = models
+            .data
+            .into_iter()
+            .map(|m| RemoteModelInfo {
+                id: m.id,
+                gated: m.gated.or(m.is_gated).unwrap_or(false),
+                premium: m.premium.unwrap_or(false),
+            })
+            .collect();
+        items.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(items)
     }
 }
