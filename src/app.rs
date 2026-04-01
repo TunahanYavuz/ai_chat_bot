@@ -1378,9 +1378,9 @@ Do not fabricate directory listings, command outputs, or success messages.",
                                 msg.content = rendered;
 
                                 if self.pending_action.is_none() {
-                                    let pending_actions = Self::pending_actions_from_agent_actions(parsed.actions);
-                                    if !pending_actions.is_empty() {
-                                        let mut iter = pending_actions.into_iter();
+                                    let parsed_actions = Self::pending_actions_from_agent_actions(parsed.actions);
+                                    if !parsed_actions.is_empty() {
+                                        let mut iter = parsed_actions.into_iter();
                                         if let Some(action) = iter.next() {
                                             self.pending_action = Some(action);
                                             self.pending_action_session_idx = Some(active.session_idx);

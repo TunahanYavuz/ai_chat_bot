@@ -227,7 +227,7 @@ fn extract_balanced_json_object(input: &str) -> Option<&str> {
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    let end = start + offset + ch.len_utf8() + 1;
+                    let end = start + 1 + offset + ch.len_utf8();
                     return input.get(start..end);
                 }
             }

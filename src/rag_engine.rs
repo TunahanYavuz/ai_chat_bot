@@ -357,7 +357,11 @@ where
                     break;
                 }
 
-                start = end.saturating_sub(overlap);
+                let mut next_start = end.saturating_sub(overlap);
+                if next_start <= start {
+                    next_start = start + 1;
+                }
+                start = next_start;
             }
         }
 

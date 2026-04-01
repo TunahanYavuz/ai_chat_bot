@@ -301,6 +301,9 @@ fn build_minimal_pdf(title: &str, content: &str) -> Vec<u8> {
     pdf.push_str("xref\n0 6\n");
     pdf.push_str("0000000000 65535 f \n");
     for off in offsets.into_iter().skip(1) {
+        // PDF xref entries are fixed-width records:
+        // 10-digit offset + space + 5-digit generation + space + in-use flag + space + '\n'
+        // which totals 20 bytes per line.
         pdf.push_str(&format!("{off:010} 00000 n \n"));
     }
     pdf.push_str("trailer\n<< /Size 6 /Root 1 0 R >>\n");
