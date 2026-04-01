@@ -75,7 +75,7 @@ pub fn reasoning_config_for_model(model_name: &str) -> ModelReasoningConfig {
         return REASONING_NONE;
     }
 
-    let known_mappings: [(&str, ModelReasoningConfig); 20] = [
+    let known_mappings: &[(&str, ModelReasoningConfig)] = &[
         ("o1", REASONING_TIERED),
         ("o1-mini", REASONING_TIERED),
         ("o1-preview", REASONING_TIERED),
@@ -94,7 +94,6 @@ pub fn reasoning_config_for_model(model_name: &str) -> ModelReasoningConfig {
         ("qwen3", REASONING_BINARY),
         ("qwen2.5", REASONING_BINARY),
         ("qwen2.5-coder", REASONING_BINARY),
-        ("qwen1.5", REASONING_BINARY),
         ("qwen-long", REASONING_BINARY),
     ];
 

@@ -15,7 +15,8 @@ use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
 use crate::executor::{ActionExecutor, ExecutionPolicy, ExecutionStatus};
 use crate::models::{
-    reasoning_config_for_model, ModelReasoningConfig, ReasoningCapability, ThinkingMode,
+    get_model_capability, reasoning_config_for_model, ModelReasoningConfig, ReasoningCapability,
+    ThinkingMode,
 };
 use crate::parser::{ActionKind, AgentAction, CommandParams};
 use crate::rag_engine::{EmbeddingProvider, RagConfig, RagEngine};
@@ -41,6 +42,8 @@ const GOLD_DARK: Color32 = Color32::from_rgb(0x7A, 0x7A, 0x7A);
 const WHITE: Color32 = TEXT_PRIMARY;
 const DARK_TEXT: Color32 = TEXT_DARK;
 const LIGHT_TEXT: Color32 = TEXT_PRIMARY;
+const STATUS_SUCCESS: Color32 = Color32::from_rgb(0x66, 0xBB, 0x6A);
+const STATUS_ERROR: Color32 = Color32::from_rgb(0xEF, 0x53, 0x50);
 const CUSTOM_MODEL_INPUT_RESERVED_WIDTH: f32 = 132.0;
 const DELETE_CHAT_BUTTON_WIDTH: f32 = 36.0;
 const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
@@ -391,6 +394,8 @@ impl ChatApp {
         if trimmed.is_empty() {
             return "No additional details.".to_string();
         }
+        // Cap detail text to ~1200 chars so expanded blocks stay within a typical
+        // laptop-height viewport and avoid pushing active steps out of view.
         const MAX_CHARS: usize = 1200;
         if trimmed.chars().count() <= MAX_CHARS {
             return trimmed.to_string();
@@ -497,9 +502,21 @@ impl ChatApp {
                 }
 
                 ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                    for step in self.swarm_workflow.clone() {
+                    for idx in 0..self.swarm_workflow.len() {
+                        let (step_id, step_title, step_details, step_status) = {
+                            let step = &self.swarm_workflow[idx];
+                            (
+                                step.id.clone(),
+                                step.title.clone(),
+                                step.details.clone(),
+                                step.status,
+                            )
+                        };
                         ui.horizontal(|ui| {
-                            let expanded = self.workflow_expanded.entry(step.id.clone()).or_insert(false);
+                            let expanded = self
+                                .workflow_expanded
+                                .entry(step_id.clone())
+                                .or_insert(false);
                             let chevron = if *expanded { "▾" } else { "▸" };
                             if ui
                                 .add(
@@ -511,26 +528,31 @@ impl ChatApp {
                                 *expanded = !*expanded;
                             }
 
-                            match step.status {
+                            match step_status {
                                 WorkflowStepStatus::Running => ui.spinner(),
                                 WorkflowStepStatus::Success => {
-                                    ui.label(RichText::new("✅").color(Color32::from_rgb(0x66, 0xBB, 0x6A)))
+                                    ui.label(RichText::new("✅").color(STATUS_SUCCESS))
                                 }
                                 WorkflowStepStatus::Failed => {
-                                    ui.label(RichText::new("❌").color(Color32::from_rgb(0xEF, 0x53, 0x50)))
+                                    ui.label(RichText::new("❌").color(STATUS_ERROR))
                                 }
                             };
 
-                            ui.label(RichText::new(step.title).color(TEXT_PRIMARY));
+                            ui.label(RichText::new(step_title).color(TEXT_PRIMARY));
                         });
 
-                        if *self.workflow_expanded.get(&step.id).unwrap_or(&false) {
+                        if *self.workflow_expanded.get(&step_id).unwrap_or(&false) {
                             egui::Frame::new()
                                 .fill(BG_SURFACE_ALT)
                                 .corner_radius(6.0)
                                 .inner_margin(egui::Margin::same(8))
                                 .show(ui, |ui| {
-                                    ui.label(RichText::new(step.details).small().monospace().color(TEXT_MUTED));
+                                    ui.label(
+                                        RichText::new(step_details)
+                                            .small()
+                                            .monospace()
+                                            .color(TEXT_MUTED),
+                                    );
                                 });
                         }
                         ui.add_space(4.0);
@@ -913,7 +935,7 @@ impl ChatApp {
     }
 
     fn current_reasoning_capability(&self) -> ReasoningCapability {
-        self.active_reasoning_config().capability
+        get_model_capability(&self.selected_model_id())
     }
 
     fn refresh_model_access_outline(&mut self) {
@@ -1647,7 +1669,7 @@ impl ChatApp {
 
         let reasoning_capability = self.current_reasoning_capability();
         let tiered_reasoning_level = if matches!(reasoning_capability, ReasoningCapability::Tiered) {
-            Some(self.selected_thinking_mode.clone())
+            Some(self.selected_thinking_mode)
         } else {
             None
         };
@@ -2511,7 +2533,6 @@ impl ChatApp {
                                 ModelInfo {
                                     id: m.id.clone(),
                                     name,
-                                    thinking_modes: vec![],
                                 }
                             })
                             .collect();
@@ -3099,13 +3120,17 @@ impl ChatApp {
                             if ui.button("📋 Copy").clicked() {
                                 self.copy_to_clipboard(&msg.content);
                             }
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(msg.timestamp.format("%H:%M").to_string())
+                                            .small()
+                                            .color(Color32::from_rgb(160, 160, 160)),
+                                    );
+                                },
+                            );
                         });
-
-                        ui.label(
-                            RichText::new(msg.timestamp.format("%H:%M").to_string())
-                                .small()
-                                .color(Color32::from_rgb(160, 160, 160)),
-                        );
                     });
             },
         );
@@ -3699,6 +3724,10 @@ impl eframe::App for ChatApp {
                                                 )
                                                 .clicked()
                                             {
+                                                // We defer activation until after ComboBox rendering
+                                                // because egui keeps an immutable borrow over
+                                                // `self.models` during iteration inside this closure.
+                                                // Applying settings requires mutable borrows.
                                                 picked_model_idx = Some(i);
                                             }
                                         }
@@ -3732,16 +3761,20 @@ impl eframe::App for ChatApp {
                             });
                         ui.label(RichText::new("Custom model ID").small().color(TEXT_MUTED));
                         ui.horizontal(|ui| {
-                            let changed = ui
-                                .add(
+                            let custom_id_response = ui.add(
                                 TextEdit::singleline(&mut self.custom_model_id)
                                     .desired_width(
                                         ui.available_width() - CUSTOM_MODEL_INPUT_RESERVED_WIDTH,
                                     )
-                                    .hint_text("e.g. gpt-4o, meta-llama/Llama-3.1-8B-Instruct"),
-                                )
-                                .changed();
-                            if changed {
+                                    .hint_text(
+                                        "e.g. gpt-4o, meta-llama/Llama-3.1-8B-Instruct",
+                                    ),
+                            );
+                            let apply_custom_model = (custom_id_response.changed()
+                                && custom_id_response.lost_focus())
+                                || (custom_id_response.has_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                            if apply_custom_model {
                                 self.activate_model_selection();
                             }
                             if ui.button("From list").clicked() {
@@ -3749,7 +3782,7 @@ impl eframe::App for ChatApp {
                                 self.activate_model_selection();
                             }
                         });
-                    }
+                    });
 
                     ui.horizontal(|ui| {
                         ui.label("Execution policy:");
@@ -3786,31 +3819,30 @@ impl eframe::App for ChatApp {
 
                     let reasoning_cfg = self.active_reasoning_config();
                     match reasoning_cfg.capability {
-                            ReasoningCapability::None => {}
-                            ReasoningCapability::Binary => {
-                                ui.checkbox(
-                                    &mut self.binary_reasoning_enabled,
-                                    reasoning_cfg.binary_label,
-                                );
-                            }
-                            ReasoningCapability::Tiered => {
-                                ui.horizontal(|ui| {
-                                    ui.label(reasoning_cfg.tiered_label);
-                                    egui::ComboBox::from_id_salt("thinking_mode")
-                                        .selected_text(self.selected_thinking_mode.display_name())
-                                        .show_ui(ui, |ui| {
-                                            for mode in reasoning_cfg.tiered_modes {
-                                                ui.selectable_value(
-                                                    &mut self.selected_thinking_mode,
-                                                    *mode,
-                                                    mode.display_name(),
-                                                );
-                                            }
-                                        });
-                                });
-                            }
+                        ReasoningCapability::None => {}
+                        ReasoningCapability::Binary => {
+                            ui.checkbox(
+                                &mut self.binary_reasoning_enabled,
+                                reasoning_cfg.binary_label,
+                            );
                         }
-                    });
+                        ReasoningCapability::Tiered => {
+                            ui.horizontal(|ui| {
+                                ui.label(reasoning_cfg.tiered_label);
+                                egui::ComboBox::from_id_salt("thinking_mode")
+                                    .selected_text(self.selected_thinking_mode.display_name())
+                                    .show_ui(ui, |ui| {
+                                        for mode in reasoning_cfg.tiered_modes {
+                                            ui.selectable_value(
+                                                &mut self.selected_thinking_mode,
+                                                *mode,
+                                                mode.display_name(),
+                                            );
+                                        }
+                                    });
+                            });
+                        }
+                    }
 
                     ui.separator();
                     ui.collapsing("Settings", |ui| {
@@ -3929,6 +3961,10 @@ impl eframe::App for ChatApp {
                             }
                         });
                     });
+
+                ui.add_space(6.0);
+                self.render_workflow_visualizer(ui);
+                ui.add_space(8.0);
 
                 let input_height = 100.0;
                 let msg_height = ui.available_height() - input_height;
