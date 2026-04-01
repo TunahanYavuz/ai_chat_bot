@@ -20,7 +20,10 @@ const GOLD: Color32 = Color32::from_rgb(255, 208, 92);
 const GOLD_DARK: Color32 = Color32::from_rgb(214, 163, 50);
 const WHITE: Color32 = Color32::WHITE;
 const DARK_TEXT: Color32 = Color32::from_rgb(20, 10, 12);
+const LIGHT_TEXT: Color32 = Color32::from_rgb(235, 242, 250);
 const CUSTOM_MODEL_INPUT_RESERVED_WIDTH: f32 = 132.0;
+const DELETE_CHAT_BUTTON_WIDTH: f32 = 36.0;
+const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
 
 #[derive(Debug)]
 pub enum AppEvent {
@@ -395,6 +398,157 @@ impl ChatApp {
         });
     }
 
+    fn dispatch_agent_requests(&mut self, session_idx: usize) {
+        let model_id = if self.custom_model_id.trim().is_empty() {
+            self.current_model()
+                .map(|m| m.id.clone())
+                .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string())
+        } else {
+            self.custom_model_id.trim().to_string()
+        };
+
+        if !self.agents.iter().any(|a| a.enabled) {
+            self.notify("Enable at least one agent", NotificationKind::Error);
+            return;
+        }
+
+        for agent_idx in 0..self.agents.len() {
+            if !self.agents[agent_idx].enabled {
+                continue;
+            }
+            let agent_name = self.agents[agent_idx].name.clone();
+            let agent_prompt = self.agents[agent_idx].system_prompt.clone();
+            let request_id = Uuid::new_v4().to_string();
+            let assistant_msg = Message {
+                id: Uuid::new_v4().to_string(),
+                role: Role::Assistant,
+                content: String::new(),
+                attachments: vec![],
+                timestamp: Utc::now(),
+                is_streaming: true,
+            };
+            let assistant_msg_id = assistant_msg.id.clone();
+            if let Some(session) = self.sessions.get_mut(session_idx) {
+                session.messages.push(assistant_msg);
+            }
+
+            self.active_requests.insert(
+                request_id.clone(),
+                ActiveRequest {
+                    session_idx,
+                    message_id: assistant_msg_id,
+                    agent_name: agent_name.clone(),
+                },
+            );
+            self.activity_log.push(format!("{} started response", agent_name));
+
+            let mut api_messages: Vec<ChatMessage> = vec![];
+            let system_prompt = format!(
+                "You are agent '{}'. {} Working directory: {}. Shell execution: {}. \
+Never claim file writes or shell commands succeeded unless they actually ran with user approval. \
+If user asks to create/edit a file, respond ONLY with <write_file path=\"relative/or/absolute/path\">FILE_CONTENT</write_file>. \
+If user asks to run a command and shell execution is enabled, respond ONLY with <execute_command>THE_COMMAND</execute_command>. \
+Do not fabricate directory listings, command outputs, or success messages.",
+                agent_name,
+                agent_prompt,
+                self.settings.working_directory,
+                if self.settings.shell_execution_enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            );
+            api_messages.push(ChatMessage::with_cache_control("system", &system_prompt));
+
+            if let Some(session) = self.sessions.get(session_idx) {
+                for msg in &session.messages {
+                    if msg.is_streaming {
+                        continue;
+                    }
+                    let role = msg.role.as_str();
+                    if msg.attachments.iter().any(|a| a.image_base64.is_some()) {
+                        for att in &msg.attachments {
+                            if let Some(b64) = &att.image_base64 {
+                                api_messages.push(ChatMessage::with_image(role, &msg.content, b64, &att.mime_type));
+                            }
+                        }
+                    } else {
+                        let mut content = msg.content.clone();
+                        for att in &msg.attachments {
+                            if let Some(txt) = &att.text {
+                                content.push_str(&format!("\n\n[File: {}]\n{}", att.filename, txt));
+                            }
+                        }
+                        api_messages.push(ChatMessage::text(role, &content));
+                    }
+                }
+            }
+
+            let thinking_mode = if self.current_model().map(|m| m.supports_thinking()).unwrap_or(false) {
+                Some(self.selected_thinking_mode.clone())
+            } else {
+                None
+            };
+
+            let api_key = self.settings.active_api_key();
+            let base_url = self.settings.active_base_url();
+            let event_tx = self.event_tx.clone();
+            let req_id = request_id.clone();
+            let model_id = model_id.clone();
+
+            self.tokio_rt.spawn(async move {
+                let client = crate::api::OpenAIClient::new(&api_key, &base_url);
+                let req_id_clone = req_id.clone();
+                let tx_clone = event_tx.clone();
+
+                let result = client
+                    .chat_completion(&model_id, api_messages, thinking_mode.as_ref(), move |chunk| {
+                        let _ = tx_clone.send(AppEvent::ChunkReceived(req_id_clone.clone(), chunk));
+                    })
+                    .await;
+
+                match result {
+                    Ok(_) => {
+                        let _ = event_tx.send(AppEvent::ResponseComplete(req_id));
+                    }
+                    Err(e) => {
+                        let _ = event_tx.send(AppEvent::ResponseError(req_id, e.to_string()));
+                    }
+                }
+            });
+        }
+    }
+
+    fn delete_session_by_index(&mut self, idx: usize) {
+        let Some(session) = self.sessions.get(idx) else {
+            return;
+        };
+        let session_id = session.id.clone();
+        let session_name = session.name.clone();
+        let db_err = if let Ok(guard) = self.db.lock() {
+            if let Some(database) = guard.as_ref() {
+                database.delete_session(&session_id).err().map(|e| e.to_string())
+            } else {
+                None
+            }
+        } else {
+            Some("Database lock poisoned".to_string())
+        };
+        if let Some(err) = db_err {
+            self.notify(format!("Failed to delete conversation: {err}"), NotificationKind::Error);
+            return;
+        }
+
+        self.sessions.remove(idx);
+        self.current_session_idx = match self.current_session_idx {
+            Some(current) if current == idx => None,
+            Some(current) if current > idx => Some(current - 1),
+            other => other,
+        };
+        self.activity_log.push(format!("Deleted conversation: {}", session_name));
+        self.notify("Conversation deleted", NotificationKind::Info);
+    }
+
     fn new_session(&mut self) {
         let session = Session::new("New Chat");
         let db_session = DbSession {
@@ -575,124 +729,7 @@ impl ChatApp {
         }
         self.input_text.clear();
 
-        let model_id = if self.custom_model_id.trim().is_empty() {
-            self.current_model()
-                .map(|m| m.id.clone())
-                .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string())
-        } else {
-            self.custom_model_id.trim().to_string()
-        };
-
-        if !self.agents.iter().any(|a| a.enabled) {
-            self.notify("Enable at least one agent", NotificationKind::Error);
-            return;
-        }
-
-        for agent_idx in 0..self.agents.len() {
-            if !self.agents[agent_idx].enabled {
-                continue;
-            }
-            let agent_name = self.agents[agent_idx].name.clone();
-            let agent_prompt = self.agents[agent_idx].system_prompt.clone();
-            let request_id = Uuid::new_v4().to_string();
-            let assistant_msg = Message {
-                id: Uuid::new_v4().to_string(),
-                role: Role::Assistant,
-                content: String::new(),
-                attachments: vec![],
-                timestamp: Utc::now(),
-                is_streaming: true,
-            };
-            let assistant_msg_id = assistant_msg.id.clone();
-            if let Some(session) = self.sessions.get_mut(session_idx) {
-                session.messages.push(assistant_msg);
-            }
-
-            self.active_requests.insert(
-                request_id.clone(),
-                ActiveRequest {
-                    session_idx,
-                    message_id: assistant_msg_id,
-                    agent_name: agent_name.clone(),
-                },
-            );
-            self.activity_log.push(format!("{} started response", agent_name));
-
-            let mut api_messages: Vec<ChatMessage> = vec![];
-            let system_prompt = format!(
-                "You are agent '{}'. {} Working directory: {}. Shell execution: {}. \
-Never claim file writes or shell commands succeeded unless they actually ran with user approval. \
-If user asks to create/edit a file, respond ONLY with <write_file path=\"relative/or/absolute/path\">FILE_CONTENT</write_file>. \
-If user asks to run a command and shell execution is enabled, respond ONLY with <execute_command>THE_COMMAND</execute_command>. \
-Do not fabricate directory listings, command outputs, or success messages.",
-                agent_name,
-                agent_prompt,
-                self.settings.working_directory,
-                if self.settings.shell_execution_enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            );
-            api_messages.push(ChatMessage::with_cache_control("system", &system_prompt));
-
-            if let Some(session) = self.sessions.get(session_idx) {
-                for msg in &session.messages {
-                    if msg.is_streaming {
-                        continue;
-                    }
-                    let role = msg.role.as_str();
-                    if msg.attachments.iter().any(|a| a.image_base64.is_some()) {
-                        for att in &msg.attachments {
-                            if let Some(b64) = &att.image_base64 {
-                                api_messages.push(ChatMessage::with_image(role, &msg.content, b64, &att.mime_type));
-                            }
-                        }
-                    } else {
-                        let mut content = msg.content.clone();
-                        for att in &msg.attachments {
-                            if let Some(txt) = &att.text {
-                                content.push_str(&format!("\n\n[File: {}]\n{}", att.filename, txt));
-                            }
-                        }
-                        api_messages.push(ChatMessage::text(role, &content));
-                    }
-                }
-            }
-
-            let thinking_mode = if self.current_model().map(|m| m.supports_thinking()).unwrap_or(false) {
-                Some(self.selected_thinking_mode.clone())
-            } else {
-                None
-            };
-
-            let api_key = self.settings.active_api_key();
-            let base_url = self.settings.active_base_url();
-            let event_tx = self.event_tx.clone();
-            let req_id = request_id.clone();
-            let model_id = model_id.clone();
-
-            self.tokio_rt.spawn(async move {
-                let client = crate::api::OpenAIClient::new(&api_key, &base_url);
-                let req_id_clone = req_id.clone();
-                let tx_clone = event_tx.clone();
-
-                let result = client
-                    .chat_completion(&model_id, api_messages, thinking_mode.as_ref(), move |chunk| {
-                        let _ = tx_clone.send(AppEvent::ChunkReceived(req_id_clone.clone(), chunk));
-                    })
-                    .await;
-
-                match result {
-                    Ok(_) => {
-                        let _ = event_tx.send(AppEvent::ResponseComplete(req_id));
-                    }
-                    Err(e) => {
-                        let _ = event_tx.send(AppEvent::ResponseError(req_id, e.to_string()));
-                    }
-                }
-            });
-        }
+        self.dispatch_agent_requests(session_idx);
     }
 
     fn process_events(&mut self) {
@@ -963,7 +1000,7 @@ impl eframe::App for ChatApp {
                 .resizable(false)
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
-                    ui.visuals_mut().override_text_color = Some(DARK_TEXT);
+                    ui.visuals_mut().override_text_color = Some(LIGHT_TEXT);
                     match &action {
                         PendingAction::WriteFile { path, content } => {
                             ui.label(format!("Write file: {path}"));
@@ -979,10 +1016,10 @@ impl eframe::App for ChatApp {
                     }
                     ui.separator();
                     ui.horizontal(|ui| {
-                        if ui.button(RichText::new("✅ Approve").color(DARK_TEXT)).clicked() {
+                        if ui.button(RichText::new("✅ Approve").color(LIGHT_TEXT)).clicked() {
                             approved = true;
                         }
-                        if ui.button(RichText::new("❌ Reject").color(DARK_TEXT)).clicked() {
+                        if ui.button(RichText::new("❌ Reject").color(LIGHT_TEXT)).clicked() {
                             rejected = true;
                         }
                     });
@@ -1001,6 +1038,9 @@ impl eframe::App for ChatApp {
                                 action_session_idx,
                                 format!("❌ File write failed for `{}`: {}", full_path.display(), e),
                             );
+                            if let Some(idx) = action_session_idx {
+                                self.dispatch_agent_requests(idx);
+                            }
                         } else {
                             self.notify(format!("File written: {}", full_path.display()), NotificationKind::Info);
                             self.append_system_message(
@@ -1008,6 +1048,9 @@ impl eframe::App for ChatApp {
                                 format!("✅ File written (approved): `{}`", full_path.display()),
                             );
                             self.refresh_snapshots();
+                            if let Some(idx) = action_session_idx {
+                                self.dispatch_agent_requests(idx);
+                            }
                         }
                     }
                     PendingAction::ExecuteCommand { command } => {
@@ -1017,6 +1060,9 @@ impl eframe::App for ChatApp {
                                 action_session_idx,
                                 "❌ Command not executed: shell execution is disabled in settings.".to_string(),
                             );
+                            if let Some(idx) = action_session_idx {
+                                self.dispatch_agent_requests(idx);
+                            }
                         } else {
                             let wd = self.settings.working_directory.clone();
                             match crate::shell::execute_command(command, &wd) {
@@ -1037,6 +1083,9 @@ impl eframe::App for ChatApp {
                                         result.push_str("\n````");
                                     }
                                     self.append_system_message(action_session_idx, result);
+                                    if let Some(idx) = action_session_idx {
+                                        self.dispatch_agent_requests(idx);
+                                    }
                                 }
                                 Err(e) => {
                                     self.notify(format!("Command error: {e}"), NotificationKind::Error);
@@ -1044,6 +1093,9 @@ impl eframe::App for ChatApp {
                                         action_session_idx,
                                         format!("❌ Command execution failed for `{}`: {}", command, e),
                                     );
+                                    if let Some(idx) = action_session_idx {
+                                        self.dispatch_agent_requests(idx);
+                                    }
                                 }
                             }
                         }
@@ -1057,6 +1109,9 @@ impl eframe::App for ChatApp {
                     self.pending_action_session_idx,
                     "❌ Action rejected by user. No file write or command execution was performed.".to_string(),
                 );
+                if let Some(idx) = self.pending_action_session_idx {
+                    self.dispatch_agent_requests(idx);
+                }
                 self.pending_action = None;
                 self.pending_action_session_idx = None;
             }
@@ -1169,15 +1224,20 @@ impl eframe::App for ChatApp {
                             .get(idx)
                             .map(|s| s.name.clone())
                             .unwrap_or_else(|| "Conversation".to_string());
-                        let btn = egui::Button::new(RichText::new(format!("💬 {name}")).color(DARK_TEXT))
-                            .fill(if is_current { GOLD_DARK } else { SKY_BLUE_DARK })
-                            .min_size(Vec2::new(ui.available_width(), 28.0));
-                        if ui.add(btn).clicked() {
-                            self.current_session_idx = Some(idx);
-                            if self.sessions.get(idx).map(|s| s.messages.is_empty()).unwrap_or(false) {
-                                self.load_session_messages(idx);
+                        ui.horizontal(|ui| {
+                            let btn = egui::Button::new(RichText::new(format!("💬 {name}")).color(LIGHT_TEXT))
+                                .fill(if is_current { GOLD_DARK } else { SKY_BLUE_DARK })
+                                .min_size(Vec2::new((ui.available_width() - DELETE_CHAT_BUTTON_WIDTH).max(MIN_CHAT_BUTTON_WIDTH), 28.0));
+                            if ui.add(btn).clicked() {
+                                self.current_session_idx = Some(idx);
+                                if self.sessions.get(idx).map(|s| s.messages.is_empty()).unwrap_or(false) {
+                                    self.load_session_messages(idx);
+                                }
                             }
-                        }
+                            if ui.small_button("🗑").clicked() {
+                                self.delete_session_by_index(idx);
+                            }
+                        });
                     }
                 });
 
@@ -1414,7 +1474,7 @@ impl eframe::App for ChatApp {
                                 if ui
                                     .add_sized(
                                         [110.0, 28.0],
-                                        egui::Button::new(RichText::new("📎 Attach").color(DARK_TEXT)).fill(SKY_BLUE_DARK),
+                                        egui::Button::new(RichText::new("📎 Attach").color(LIGHT_TEXT)).fill(SKY_BLUE_DARK),
                                     )
                                     .clicked()
                                 {
