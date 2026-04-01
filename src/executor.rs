@@ -153,7 +153,7 @@ impl ActionExecutor {
             match request_permission(request).await {
                 ApprovalDecision::ApproveOnce => {
                     let report = self.execute_approved_action(action).await?;
-                    Ok((ExecutionStatus::Executed(report), false))
+                    Ok((ExecutionStatus::Executed(report), current_auto_approve_state))
                 }
                 ApprovalDecision::GrantTemporaryAccess => {
                     let report = self.execute_approved_action(action).await?;
@@ -161,10 +161,10 @@ impl ActionExecutor {
                 }
                 ApprovalDecision::Deny => Ok((
                     ExecutionStatus::AuthorizationDenied {
-                        action,
-                        reason: "Authorization Denied".to_string(),
+                        action: action.clone(),
+                        reason: format!("Authorization Denied for {:?}", action.action),
                     },
-                    false,
+                    current_auto_approve_state,
                 )),
             }
         } else {

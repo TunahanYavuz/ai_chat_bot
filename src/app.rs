@@ -1370,6 +1370,16 @@ impl ChatApp {
                         })
                         .await;
                 }
+                Ok(ExecutionStatus::AuthorizationDenied { reason, .. }) => {
+                    let _ = tx
+                        .send(AppEvent::TerminalFinished {
+                            terminal_id: tid,
+                            stdout: String::new(),
+                            stderr: reason,
+                            exit_code: -1,
+                        })
+                        .await;
+                }
                 Err(e) => {
                     let _ = tx
                         .send(AppEvent::TerminalFinished {
@@ -2021,7 +2031,7 @@ impl ChatApp {
             let mut final_parts: Vec<String> = Vec::new();
             let executor = ActionExecutor::new(working_dir);
 
-            let mut current_auto_approve_state = false;
+            let mut auto_approve_enabled = false;
 
             for step in queue {
                 let Some(role) = AgentRole::from_plan_name(&step.agent) else {
@@ -2183,7 +2193,7 @@ impl ChatApp {
                         .execute_action_with_permission(
                             action,
                             execution_policy,
-                            current_auto_approve_state,
+                            auto_approve_enabled,
                             move |approval_request| {
                                 let approval_event_tx = approval_event_tx.clone();
                                 let request_id_for_approval = request_id_for_approval.clone();
@@ -2191,26 +2201,51 @@ impl ChatApp {
                                 async move {
                                     let approval_id = Uuid::new_v4().to_string();
                                     let (tx, rx) = tokio::sync::oneshot::channel();
-                                    if let Ok(mut waiters) = approval_waiters.lock() {
+                                    let lock_ok = if let Ok(mut waiters) = approval_waiters.lock() {
                                         waiters.insert(approval_id.clone(), tx);
+                                        true
                                     } else {
+                                        false
+                                    };
+                                    if !lock_ok {
+                                        let _ = approval_event_tx
+                                            .send(AppEvent::SwarmWorkflowStep {
+                                                request_id: request_id_for_approval.clone(),
+                                                title: "Authorization callback failed".to_string(),
+                                                details: "Approval lock acquisition failed; defaulting to deny."
+                                                    .to_string(),
+                                            })
+                                            .await;
                                         return ApprovalDecision::Deny;
                                     }
                                     let _ = approval_event_tx
                                         .send(AppEvent::ExecutionApprovalRequested {
-                                            request_id: request_id_for_approval,
+                                            request_id: request_id_for_approval.clone(),
                                             approval_id,
                                             request: approval_request,
                                         })
                                         .await;
-                                    rx.await.unwrap_or(ApprovalDecision::Deny)
+                                    match rx.await {
+                                        Ok(decision) => decision,
+                                        Err(_) => {
+                                            let _ = approval_event_tx
+                                                .send(AppEvent::SwarmWorkflowStep {
+                                                    request_id: request_id_for_approval,
+                                                    title: "Authorization callback failed".to_string(),
+                                                    details: "Approval channel closed; defaulting to deny."
+                                                        .to_string(),
+                                                })
+                                                .await;
+                                            ApprovalDecision::Deny
+                                        }
+                                    }
                                 }
                             },
                         )
                         .await
                     {
                         Ok((status, next_auto_approve_state)) => {
-                            current_auto_approve_state = next_auto_approve_state;
+                            auto_approve_enabled = next_auto_approve_state;
                             match status {
                                 ExecutionStatus::Executed(report) => {
                                     let _ = event_tx
