@@ -1113,6 +1113,22 @@ Do not fabricate directory listings, command outputs, or success messages.",
     }
 
     fn syntax_highlight_for_path(path: &str, code: &str) -> LayoutJob {
+        fn is_escaped_closing_quote(buffer: &str, quote: char) -> bool {
+            let mut chars = buffer.chars().rev();
+            if chars.next() != Some(quote) {
+                return true;
+            }
+            let mut slash_count = 0;
+            for ch in chars {
+                if ch == '\\' {
+                    slash_count += 1;
+                } else {
+                    break;
+                }
+            }
+            slash_count % 2 == 1
+        }
+
         let ext = std::path::Path::new(path)
             .extension()
             .and_then(|s| s.to_str())
@@ -1132,62 +1148,55 @@ Do not fabricate directory listings, command outputs, or success messages.",
         let mut job = LayoutJob::default();
         let mut word = String::new();
         let mut in_string: Option<char> = None;
+        let base_text_format = TextFormat {
+            font_id: FontId::monospace(13.0),
+            color: text_color,
+            ..Default::default()
+        };
+        let base_string_format = TextFormat {
+            color: string_color,
+            ..base_text_format.clone()
+        };
+        let base_comment_format = TextFormat {
+            color: comment_color,
+            ..base_text_format.clone()
+        };
 
-        let push_word = |job: &mut LayoutJob, w: &mut String| {
-            if w.is_empty() {
+        let push_word = |layout_job: &mut LayoutJob, word_buffer: &mut String| {
+            if word_buffer.is_empty() {
                 return;
             }
-            let mut format = TextFormat {
-                font_id: FontId::monospace(13.0),
-                color: text_color,
-                ..Default::default()
-            };
+            let mut format = base_text_format.clone();
             let is_keyword = match ext.as_str() {
                 "rs" => matches!(
-                    w.as_str(),
+                    word_buffer.as_str(),
                     "fn" | "let" | "mut" | "pub" | "impl" | "struct" | "enum" | "match" | "if"
                         | "else" | "for" | "while" | "use" | "mod" | "return" | "const"
                         | "static" | "trait" | "type" | "async" | "await" | "unsafe" | "where"
                 ),
                 "py" => matches!(
-                    w.as_str(),
+                    word_buffer.as_str(),
                     "def" | "class" | "if" | "elif" | "else" | "for" | "while" | "import" | "from"
                         | "return" | "with" | "as" | "try" | "except" | "lambda" | "async"
                         | "await" | "yield" | "finally" | "raise" | "assert" | "pass"
                         | "break" | "continue" | "global" | "nonlocal" | "and" | "or" | "not"
                 ),
-                "md" => w.starts_with('#') || w == "```",
+                "md" => word_buffer.starts_with('#') || word_buffer == "```",
                 _ => false,
             };
             if is_keyword {
                 format.color = keyword_color;
             }
-            job.append(w, 0.0, format);
-            w.clear();
+            layout_job.append(word_buffer, 0.0, format);
+            word_buffer.clear();
         };
 
         for line in code.lines() {
             if ext == "py" {
                 let trimmed = line.trim_start();
                 if trimmed.starts_with('#') {
-                    job.append(
-                        line,
-                        0.0,
-                        TextFormat {
-                            font_id: FontId::monospace(13.0),
-                            color: comment_color,
-                            ..Default::default()
-                        },
-                    );
-                    job.append(
-                        "\n",
-                        0.0,
-                        TextFormat {
-                            font_id: FontId::monospace(13.0),
-                            color: text_color,
-                            ..Default::default()
-                        },
-                    );
+                    job.append(line, 0.0, base_comment_format.clone());
+                    job.append("\n", 0.0, base_text_format.clone());
                     continue;
                 }
             } else if let Some(comment_idx) = line.find("//") {
@@ -1201,24 +1210,8 @@ Do not fabricate directory listings, command outputs, or success messages.",
                     }
                     if let Some(quote) = in_string {
                         word.push(ch);
-                        let mut escaped = false;
-                        for s in word.chars().rev().skip(1) {
-                            if s == '\\' {
-                                escaped = !escaped;
-                            } else {
-                                break;
-                            }
-                        }
-                        if ch == quote && !escaped {
-                            job.append(
-                                &word,
-                                0.0,
-                                TextFormat {
-                                    font_id: FontId::monospace(13.0),
-                                    color: string_color,
-                                    ..Default::default()
-                                },
-                            );
+                        if ch == quote && !is_escaped_closing_quote(&word, quote) {
+                            job.append(&word, 0.0, base_string_format.clone());
                             word.clear();
                             in_string = None;
                         }
@@ -1228,36 +1221,12 @@ Do not fabricate directory listings, command outputs, or success messages.",
                         word.push(ch);
                     } else {
                         push_word(&mut job, &mut word);
-                        job.append(
-                            &ch.to_string(),
-                            0.0,
-                            TextFormat {
-                                font_id: FontId::monospace(13.0),
-                                color: text_color,
-                                ..Default::default()
-                            },
-                        );
+                        job.append(&ch.to_string(), 0.0, base_text_format.clone());
                     }
                 }
                 push_word(&mut job, &mut word);
-                job.append(
-                    comment,
-                    0.0,
-                    TextFormat {
-                        font_id: FontId::monospace(13.0),
-                        color: comment_color,
-                        ..Default::default()
-                    },
-                );
-                job.append(
-                    "\n",
-                    0.0,
-                    TextFormat {
-                        font_id: FontId::monospace(13.0),
-                        color: text_color,
-                        ..Default::default()
-                    },
-                );
+                job.append(comment, 0.0, base_comment_format.clone());
+                job.append("\n", 0.0, base_text_format.clone());
                 continue;
             }
 
@@ -1270,24 +1239,8 @@ Do not fabricate directory listings, command outputs, or success messages.",
                 }
                 if let Some(quote) = in_string {
                     word.push(ch);
-                    let mut escaped = false;
-                    for s in word.chars().rev().skip(1) {
-                        if s == '\\' {
-                            escaped = !escaped;
-                        } else {
-                            break;
-                        }
-                    }
-                    if ch == quote && !escaped {
-                        job.append(
-                            &word,
-                            0.0,
-                            TextFormat {
-                                font_id: FontId::monospace(13.0),
-                                color: string_color,
-                                ..Default::default()
-                            },
-                        );
+                    if ch == quote && !is_escaped_closing_quote(&word, quote) {
+                        job.append(&word, 0.0, base_string_format.clone());
                         word.clear();
                         in_string = None;
                     }
@@ -1297,27 +1250,11 @@ Do not fabricate directory listings, command outputs, or success messages.",
                     word.push(ch);
                 } else {
                     push_word(&mut job, &mut word);
-                    job.append(
-                        &ch.to_string(),
-                        0.0,
-                        TextFormat {
-                            font_id: FontId::monospace(13.0),
-                            color: text_color,
-                            ..Default::default()
-                        },
-                    );
+                    job.append(&ch.to_string(), 0.0, base_text_format.clone());
                 }
             }
             push_word(&mut job, &mut word);
-            job.append(
-                "\n",
-                0.0,
-                TextFormat {
-                    font_id: FontId::monospace(13.0),
-                    color: text_color,
-                    ..Default::default()
-                },
-            );
+            job.append("\n", 0.0, base_text_format.clone());
         }
 
         job
@@ -1337,13 +1274,7 @@ Do not fabricate directory listings, command outputs, or success messages.",
                 self.ensure_changed_file_tracked(path.clone());
                 self.notify(format!("Saved {}", path), NotificationKind::Info);
             }
-            Err(e) => self.notify(
-                format!(
-                    "Save failed for {}: {}. Check file permissions or path validity.",
-                    path, e
-                ),
-                NotificationKind::Error,
-            ),
+            Err(e) => self.notify(format!("Save failed for {}: {}", path, e), NotificationKind::Error),
         }
     }
 
@@ -1691,8 +1622,12 @@ Do not fabricate directory listings, command outputs, or success messages.",
                                 .small()
                                 .color(if selected { DARK_TEXT } else { LIGHT_TEXT }),
                         )
+                        .sense(egui::Sense::click())
                         .fill(if selected { GOLD } else { SKY_BLUE_DARK });
-                        if ui.add(button).clicked() {
+                        let response = ui
+                            .add(button)
+                            .on_hover_text(if is_dirty { "Unsaved changes" } else { "Saved" });
+                        if response.clicked() {
                             self.active_open_file = Some(path.clone());
                         }
                         if ui.small_button("✕").clicked() {
