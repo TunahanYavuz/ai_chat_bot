@@ -25,6 +25,46 @@ pub struct ApprovalRequest {
     pub reason: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionPolicy {
+    Manual,
+    ReadEdit,
+    Execute,
+    FullAccess,
+}
+
+impl ExecutionPolicy {
+    pub fn requires_manual_approval(self, action: &AgentAction) -> bool {
+        if self != ExecutionPolicy::FullAccess && action_requires_delete_safety(action) {
+            return true;
+        }
+        match self {
+            ExecutionPolicy::Manual => true,
+            ExecutionPolicy::ReadEdit => matches!(action.action, ActionKind::RunCmd),
+            ExecutionPolicy::Execute => false,
+            ExecutionPolicy::FullAccess => false,
+        }
+    }
+
+    pub fn approval_reason(self, action: &AgentAction) -> String {
+        if self != ExecutionPolicy::FullAccess && action_requires_delete_safety(action) {
+            return "Delete safety warning: destructive delete command/file deletion requires explicit confirmation".to_string();
+        }
+        match self {
+            ExecutionPolicy::Manual => {
+                "ExecutionPolicy::Manual requires explicit confirmation for all actions".to_string()
+            }
+            ExecutionPolicy::ReadEdit => {
+                "ExecutionPolicy::ReadEdit requires confirmation for command execution".to_string()
+            }
+            ExecutionPolicy::Execute => {
+                "ExecutionPolicy::Execute auto-approves commands and file edits".to_string()
+            }
+            ExecutionPolicy::FullAccess => "ExecutionPolicy::FullAccess auto-approves all actions".to_string(),
+        }
+    }
+}
+
 /// Normalized execution result returned to upper layers / LLM relay.
 #[derive(Debug, Clone)]
 pub struct ExecutionReport {
@@ -55,16 +95,17 @@ impl ActionExecutor {
         }
     }
 
-    /// Executes one action or yields an approval request depending on `auto_approve`.
+    /// Executes one action or yields an approval request depending on execution policy.
     pub async fn execute_action(
         &self,
         action: AgentAction,
-        auto_approve: bool,
+        policy: ExecutionPolicy,
     ) -> Result<ExecutionStatus> {
-        if !auto_approve {
+        if policy.requires_manual_approval(&action) {
+            let reason = policy.approval_reason(&action);
             return Ok(ExecutionStatus::AwaitingApproval(ApprovalRequest {
                 action,
-                reason: "Auto-Approve is disabled; explicit user confirmation required".to_string(),
+                reason,
             }));
         }
 
@@ -74,16 +115,16 @@ impl ActionExecutor {
 
     /// Executes a full action list in sequence.
     ///
-    /// If auto-approve is disabled, the function returns early with first pending approval.
+    /// If policy requires approval, the function returns early with first pending approval.
     pub async fn execute_actions(
         &self,
         actions: Vec<AgentAction>,
-        auto_approve: bool,
+        policy: ExecutionPolicy,
     ) -> Result<Vec<ExecutionStatus>> {
         let mut statuses = Vec::with_capacity(actions.len());
 
         for action in actions {
-            let status = self.execute_action(action, auto_approve).await?;
+            let status = self.execute_action(action, policy).await?;
             let needs_approval = matches!(status, ExecutionStatus::AwaitingApproval(_));
             statuses.push(status);
             if needs_approval {
@@ -351,4 +392,24 @@ fn escape_pdf_text(input: &str) -> String {
         .replace('(', "\\(")
         .replace(')', "\\)")
         .replace('\n', " ")
+}
+
+fn action_requires_delete_safety(action: &AgentAction) -> bool {
+    if let ActionKind::RunCmd = action.action {
+        let cmd = action
+            .parameters
+            .command
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let mut tokens = cmd.split_whitespace();
+        let first = tokens.next().unwrap_or_default();
+        if first == "rm" || first == "del" || first == "rmdir" {
+            return true;
+        }
+        return std::iter::once(first)
+            .chain(tokens)
+            .any(|tok| tok == "delete_file");
+    }
+    false
 }

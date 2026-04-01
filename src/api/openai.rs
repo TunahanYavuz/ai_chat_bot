@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThinkingMode {
-    Disabled,
-    Auto,
     Low,
     Medium,
     High,
@@ -14,12 +12,45 @@ pub enum ThinkingMode {
 impl ThinkingMode {
     pub fn as_reasoning_effort(&self) -> Option<&'static str> {
         match self {
-            ThinkingMode::Disabled | ThinkingMode::Auto => None,
             ThinkingMode::Low => Some("low"),
             ThinkingMode::Medium => Some("medium"),
             ThinkingMode::High => Some("high"),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningCapability {
+    None,
+    Binary,
+    Tiered,
+}
+
+pub fn get_model_capability(model_name: &str) -> ReasoningCapability {
+    let m = model_name.trim().to_lowercase();
+    if m.is_empty() {
+        return ReasoningCapability::None;
+    }
+
+    if m.starts_with("o1")
+        || m.starts_with("o3")
+        || m.contains("/o1")
+        || m.contains("/o3")
+        || m.contains("-o1")
+        || m.contains("-o3")
+    {
+        return ReasoningCapability::Tiered;
+    }
+
+    if m.contains("deepseek-reasoner")
+        || m.contains("deepseek-r1")
+        || m.contains("qwen-reasoner")
+        || m.contains("qwq")
+    {
+        return ReasoningCapability::Binary;
+    }
+
+    ReasoningCapability::None
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +128,8 @@ struct ChatRequest {
     messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_reasoning: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -228,29 +261,38 @@ impl OpenAIClient {
         &self,
         model: &str,
         messages: Vec<ChatMessage>,
-        thinking_mode: Option<&ThinkingMode>,
+        reasoning_capability: ReasoningCapability,
+        tiered_reasoning_level: Option<&ThinkingMode>,
+        binary_reasoning_enabled: bool,
         on_chunk: impl Fn(String) + Send + 'static,
     ) -> Result<String> {
         use futures_util::StreamExt;
 
         let normalized_messages = normalize_messages(messages);
-
-        let is_thinking_model = model.contains("o1") || model.contains("o3");
-        let supports_reasoning_effort = self
-            .base_url
-            .trim_end_matches('/')
-            .starts_with("https://api.openai.com/v1");
+        let supports_reasoning_effort = matches!(reasoning_capability, ReasoningCapability::Tiered)
+            && self
+                .base_url
+                .trim_end_matches('/')
+                .starts_with("https://api.openai.com/v1");
+        let include_reasoning =
+            if matches!(reasoning_capability, ReasoningCapability::Binary) && binary_reasoning_enabled
+            {
+                Some(true)
+            } else {
+                None
+            };
 
         let request = ChatRequest {
             model: model.to_string(),
             messages: normalized_messages,
-            reasoning_effort: if is_thinking_model && supports_reasoning_effort {
-                thinking_mode
+            reasoning_effort: if supports_reasoning_effort {
+                tiered_reasoning_level
                     .and_then(|m| m.as_reasoning_effort())
                     .map(str::to_string)
             } else {
                 None
             },
+            include_reasoning,
             stream: Some(true),
             max_tokens: None,
         };

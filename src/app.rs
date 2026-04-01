@@ -9,11 +9,12 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::api::{
-    builtin_models, provider_models, ChatMessage, ModelInfo, RemoteModelInfo, ThinkingMode,
+    builtin_models, get_model_capability, provider_models, ChatMessage, ModelInfo,
+    ReasoningCapability, RemoteModelInfo, ThinkingMode,
 };
 use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT_MODEL_ID};
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
-use crate::executor::{ActionExecutor, ExecutionStatus};
+use crate::executor::{ActionExecutor, ExecutionPolicy, ExecutionStatus};
 use crate::parser::{ActionKind, AgentAction, CommandParams};
 use crate::rag_engine::{EmbeddingProvider, RagConfig, RagEngine};
 use crate::setup::SetupWizard;
@@ -122,6 +123,10 @@ pub enum AppEvent {
     SwarmStatus {
         request_id: String,
         status: String,
+    },
+    PolicyBlocked {
+        request_id: String,
+        reason: String,
     },
 }
 
@@ -317,6 +322,8 @@ pub struct ChatApp {
     model_access_outline_ok: Option<bool>,
     custom_model_id: String,
     selected_thinking_mode: ThinkingMode,
+    binary_reasoning_enabled: bool,
+    execution_policy: ExecutionPolicy,
 
     input_text: String,
     pending_attachments: Vec<Attachment>,
@@ -350,6 +357,7 @@ pub struct ChatApp {
     show_left_sidebar: bool,
     show_activity_panel: bool,
     swarm_status: String,
+    policy_block_dialog: Option<String>,
 }
 
 impl ChatApp {
@@ -697,6 +705,8 @@ impl ChatApp {
                         Some(PendingAction::ExecuteCommand { command })
                     }
                 }
+                // Web actions execute via the internal web engine and do not require pending
+                // file/command approval UI prompts in this flow.
                 crate::parser::ActionKind::SearchWeb | crate::parser::ActionKind::ReadUrl => None,
             })
             .collect()
@@ -710,6 +720,10 @@ impl ChatApp {
         } else {
             self.custom_model_id.trim().to_string()
         }
+    }
+
+    fn current_reasoning_capability(&self) -> ReasoningCapability {
+        get_model_capability(&self.selected_model_id())
     }
 
     fn refresh_model_access_outline(&mut self) {
@@ -900,7 +914,7 @@ impl ChatApp {
                     url: None,
                 },
             };
-            let outcome = executor.execute_action(action, true).await;
+            let outcome = executor.execute_action(action, ExecutionPolicy::FullAccess).await;
             match outcome {
                 Ok(ExecutionStatus::Executed(report)) => {
                     let _ = tx
@@ -1201,7 +1215,10 @@ impl ChatApp {
             model_waiting_command_output: false,
             model_access_outline_ok: None,
             custom_model_id,
-            selected_thinking_mode: ThinkingMode::Auto,
+            // Tiered-capable models expose Low/Medium/High only, so use Medium as neutral default.
+            selected_thinking_mode: ThinkingMode::Medium,
+            binary_reasoning_enabled: true,
+            execution_policy: ExecutionPolicy::Manual,
             input_text: String::new(),
             pending_attachments: vec![],
             event_tx,
@@ -1245,6 +1262,7 @@ impl ChatApp {
             show_left_sidebar: true,
             show_activity_panel: false,
             swarm_status: "✅ Ready".to_string(),
+            policy_block_dialog: None,
         };
 
         if let Some(idx) = app
@@ -1431,15 +1449,14 @@ impl ChatApp {
             }
         }
 
-        let thinking_mode = if self
-            .current_model()
-            .map(|m| m.supports_thinking())
-            .unwrap_or(false)
-        {
+        let reasoning_capability = self.current_reasoning_capability();
+        let tiered_reasoning_level = if matches!(reasoning_capability, ReasoningCapability::Tiered) {
             Some(self.selected_thinking_mode.clone())
         } else {
             None
         };
+        let binary_reasoning_enabled = self.binary_reasoning_enabled;
+        let execution_policy = self.execution_policy;
 
         let event_tx = self.event_tx.clone();
         let req_id = request_id.clone();
@@ -1483,7 +1500,9 @@ impl ChatApp {
                 .chat_completion(
                     &model_id,
                     router_messages,
-                    thinking_mode.as_ref(),
+                    reasoning_capability,
+                    tiered_reasoning_level.as_ref(),
+                    binary_reasoning_enabled,
                     |_| {},
                 )
                 .await;
@@ -1544,7 +1563,14 @@ impl ChatApp {
                 role_messages.insert(0, ChatMessage::with_cache_control("system", &role_system_prompt));
 
                 let role_raw = match client
-                    .chat_completion(&model_id, role_messages.clone(), thinking_mode.as_ref(), |_| {})
+                    .chat_completion(
+                        &model_id,
+                        role_messages.clone(),
+                        reasoning_capability,
+                        tiered_reasoning_level.as_ref(),
+                        binary_reasoning_enabled,
+                        |_| {},
+                    )
                     .await
                 {
                     Ok(resp) => resp,
@@ -1575,7 +1601,14 @@ impl ChatApp {
                     ));
 
                     match client
-                        .chat_completion(&model_id, retry_messages, thinking_mode.as_ref(), |_| {})
+                        .chat_completion(
+                            &model_id,
+                            retry_messages,
+                            reasoning_capability,
+                            tiered_reasoning_level.as_ref(),
+                            binary_reasoning_enabled,
+                            |_| {},
+                        )
                         .await
                     {
                         Ok(retry_raw) => {
@@ -1642,7 +1675,10 @@ impl ChatApp {
                     continue;
                 }
 
-                match executor.execute_actions(filtered_actions, true).await {
+                match executor
+                    .execute_actions(filtered_actions, execution_policy)
+                    .await
+                {
                     Ok(statuses) => {
                         swarm_memory.push_str(&format!("\n[{} execution]\n", role.as_str()));
                         for status in statuses {
@@ -1658,6 +1694,12 @@ impl ChatApp {
                                         "action awaiting approval: {:?}\nreason: {}\n",
                                         req.action.action, req.reason
                                     ));
+                                    let _ = event_tx
+                                        .send(AppEvent::PolicyBlocked {
+                                            request_id: req_id.clone(),
+                                            reason: req.reason,
+                                        })
+                                        .await;
                                 }
                             }
                         }
@@ -2139,6 +2181,12 @@ impl ChatApp {
                 AppEvent::SwarmStatus { request_id, status } => {
                     if self.active_requests.contains_key(&request_id) {
                         self.swarm_status = status;
+                    }
+                }
+                AppEvent::PolicyBlocked { request_id, reason } => {
+                    if self.active_requests.contains_key(&request_id) {
+                        self.policy_block_dialog = Some(reason.clone());
+                        self.notify(reason, NotificationKind::Error);
                     }
                 }
                 AppEvent::ModelsLoaded(model_ids) => {
@@ -3409,60 +3457,86 @@ impl eframe::App for ChatApp {
                                     if model.gated {
                                         label.push_str(" [Gated]");
                                     }
-                                    if ui.small_button(label).clicked() {
-                                        picked_model_id = Some(model.id.clone());
-                                    }
+                                if ui.small_button(label).clicked() {
+                                    picked_model_id = Some(model.id.clone());
                                 }
-                            });
-                            if let Some(model_id) = picked_model_id {
-                                self.custom_model_id = model_id;
-                                self.refresh_model_access_outline();
                             }
+                        });
+                        if let Some(model_id) = picked_model_id {
+                            self.custom_model_id = model_id;
+                            self.refresh_model_access_outline();
                         }
+                    }
 
-                        let supports_thinking = self
-                            .current_model()
-                            .map(|m| m.supports_thinking())
-                            .unwrap_or(false);
-                        if supports_thinking {
-                            ui.horizontal(|ui| {
-                                ui.label("Thinking mode:");
-                                egui::ComboBox::from_id_salt("thinking_mode")
-                                    .selected_text(match self.selected_thinking_mode {
-                                        ThinkingMode::Disabled => "Disabled",
-                                        ThinkingMode::Auto => "Auto",
-                                        ThinkingMode::Low => "Low",
-                                        ThinkingMode::Medium => "Medium",
-                                        ThinkingMode::High => "High",
-                                    })
-                                    .show_ui(ui, |ui| {
-                                        ui.selectable_value(
-                                            &mut self.selected_thinking_mode,
-                                            ThinkingMode::Disabled,
-                                            "Disabled",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.selected_thinking_mode,
-                                            ThinkingMode::Auto,
-                                            "Auto",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.selected_thinking_mode,
-                                            ThinkingMode::Low,
-                                            "Low",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.selected_thinking_mode,
-                                            ThinkingMode::Medium,
-                                            "Medium",
-                                        );
-                                        ui.selectable_value(
-                                            &mut self.selected_thinking_mode,
-                                            ThinkingMode::High,
-                                            "High",
-                                        );
-                                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Execution policy:");
+                        egui::ComboBox::from_id_salt("execution_policy")
+                            .selected_text(match self.execution_policy {
+                                ExecutionPolicy::Manual => "Manual",
+                                ExecutionPolicy::ReadEdit => "ReadEdit",
+                                ExecutionPolicy::Execute => "Execute",
+                                ExecutionPolicy::FullAccess => "FullAccess",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(
+                                    &mut self.execution_policy,
+                                    ExecutionPolicy::Manual,
+                                    "Manual",
+                                );
+                                ui.selectable_value(
+                                    &mut self.execution_policy,
+                                    ExecutionPolicy::ReadEdit,
+                                    "ReadEdit",
+                                );
+                                ui.selectable_value(
+                                    &mut self.execution_policy,
+                                    ExecutionPolicy::Execute,
+                                    "Execute",
+                                );
+                                ui.selectable_value(
+                                    &mut self.execution_policy,
+                                    ExecutionPolicy::FullAccess,
+                                    "FullAccess",
+                                );
                             });
+                    });
+
+                    match self.current_reasoning_capability() {
+                            ReasoningCapability::None => {}
+                            ReasoningCapability::Binary => {
+                                ui.checkbox(
+                                    &mut self.binary_reasoning_enabled,
+                                    "Enable Reasoning / Thinking",
+                                );
+                            }
+                            ReasoningCapability::Tiered => {
+                                ui.horizontal(|ui| {
+                                    ui.label("Thinking level:");
+                                    egui::ComboBox::from_id_salt("thinking_mode")
+                                        .selected_text(match self.selected_thinking_mode {
+                                            ThinkingMode::Low => "Low",
+                                            ThinkingMode::Medium => "Medium",
+                                            ThinkingMode::High => "High",
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            ui.selectable_value(
+                                                &mut self.selected_thinking_mode,
+                                                ThinkingMode::Low,
+                                                "Low",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.selected_thinking_mode,
+                                                ThinkingMode::Medium,
+                                                "Medium",
+                                            );
+                                            ui.selectable_value(
+                                                &mut self.selected_thinking_mode,
+                                                ThinkingMode::High,
+                                                "High",
+                                            );
+                                        });
+                                });
+                            }
                         }
                     });
 
@@ -3504,6 +3578,27 @@ impl eframe::App for ChatApp {
         }
 
         self.render_file_workspace_panel(ctx);
+
+        if let Some(reason) = self.policy_block_dialog.clone() {
+            let mut close_dialog = false;
+            egui::Window::new("🛡️ Policy Blocked Action")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.visuals_mut().override_text_color = Some(LIGHT_TEXT);
+                    ui.label(RichText::new("Action blocked by execution policy").strong());
+                    ui.separator();
+                    ui.label(reason);
+                    ui.separator();
+                    if ui.button("OK").clicked() {
+                        close_dialog = true;
+                    }
+                });
+            if close_dialog {
+                self.policy_block_dialog = None;
+            }
+        }
 
         if self.show_activity_panel {
             egui::SidePanel::right("activity")
