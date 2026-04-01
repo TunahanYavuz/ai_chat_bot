@@ -4,7 +4,8 @@ use std::sync::OnceLock;
 
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
-use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, Vec2};
+use egui::text::LayoutJob;
+use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, TextFormat, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use regex::Regex;
 use uuid::Uuid;
@@ -14,16 +15,24 @@ use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
 use crate::setup::SetupWizard;
 
-const BURGUNDY: Color32 = Color32::from_rgb(26, 35, 50);
-const BURGUNDY_LIGHT: Color32 = Color32::from_rgb(45, 58, 82);
-const BURGUNDY_DARK: Color32 = Color32::from_rgb(17, 24, 37);
-const SKY_BLUE: Color32 = Color32::from_rgb(176, 226, 255);
-const SKY_BLUE_DARK: Color32 = Color32::from_rgb(86, 154, 214);
-const GOLD: Color32 = Color32::from_rgb(255, 208, 92);
-const GOLD_DARK: Color32 = Color32::from_rgb(214, 163, 50);
-const WHITE: Color32 = Color32::WHITE;
-const DARK_TEXT: Color32 = Color32::from_rgb(20, 10, 12);
-const LIGHT_TEXT: Color32 = Color32::from_rgb(235, 242, 250);
+const BG_PRIMARY: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
+const BG_SURFACE: Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);
+const BG_SURFACE_ALT: Color32 = Color32::from_rgb(0x36, 0x36, 0x36);
+const ACCENT: Color32 = Color32::from_rgb(0x56, 0x9A, 0xD6);
+const ACCENT_SOFT: Color32 = Color32::from_rgb(0x3D, 0x6A, 0x8C);
+const TEXT_PRIMARY: Color32 = Color32::from_rgb(0xE0, 0xE0, 0xE0);
+const TEXT_MUTED: Color32 = Color32::from_rgb(0xB5, 0xB5, 0xB5);
+const TEXT_DARK: Color32 = Color32::from_rgb(0x10, 0x10, 0x10);
+const BURGUNDY: Color32 = BG_PRIMARY;
+const BURGUNDY_LIGHT: Color32 = BG_SURFACE_ALT;
+const BURGUNDY_DARK: Color32 = BG_SURFACE;
+const SKY_BLUE: Color32 = ACCENT;
+const SKY_BLUE_DARK: Color32 = ACCENT_SOFT;
+const GOLD: Color32 = Color32::from_rgb(0xD9, 0xD9, 0xD9);
+const GOLD_DARK: Color32 = Color32::from_rgb(0x7A, 0x7A, 0x7A);
+const WHITE: Color32 = TEXT_PRIMARY;
+const DARK_TEXT: Color32 = TEXT_DARK;
+const LIGHT_TEXT: Color32 = TEXT_PRIMARY;
 const CUSTOM_MODEL_INPUT_RESERVED_WIDTH: f32 = 132.0;
 const DELETE_CHAT_BUTTON_WIDTH: f32 = 36.0;
 const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
@@ -243,6 +252,10 @@ pub struct ChatApp {
     changed_files: Vec<String>,
     opened_files: Vec<String>,
     active_open_file: Option<String>,
+    editor_buffers: HashMap<String, String>,
+    editor_dirty: HashMap<String, bool>,
+    show_left_sidebar: bool,
+    show_activity_panel: bool,
 }
 
 impl ChatApp {
@@ -446,11 +459,18 @@ impl ChatApp {
         if !self.opened_files.iter().any(|p| p == &path) {
             self.opened_files.push(path.clone());
         }
+        if !self.editor_buffers.contains_key(&path) {
+            let content = Self::read_text_file_for_view(&path);
+            self.editor_buffers.insert(path.clone(), content);
+            self.editor_dirty.insert(path.clone(), false);
+        }
         self.active_open_file = Some(path);
     }
 
     fn close_file_in_workspace(&mut self, path: &str) {
         self.opened_files.retain(|p| p != path);
+        self.editor_buffers.remove(path);
+        self.editor_dirty.remove(path);
         if self.active_open_file.as_deref() == Some(path) {
             self.active_open_file = self.opened_files.last().cloned();
         }
@@ -668,6 +688,10 @@ impl ChatApp {
             changed_files: vec![],
             opened_files: vec![],
             active_open_file: None,
+            editor_buffers: HashMap::new(),
+            editor_dirty: HashMap::new(),
+            show_left_sidebar: true,
+            show_activity_panel: false,
         };
 
         if let Some(idx) = app
@@ -686,15 +710,22 @@ impl ChatApp {
         if dark_mode {
             let mut style = (*ctx.style()).clone();
             style.visuals = egui::Visuals::dark();
-            style.visuals.override_text_color = Some(WHITE);
-            style.visuals.panel_fill = BURGUNDY;
-            style.visuals.window_fill = BURGUNDY_DARK;
-            style.visuals.extreme_bg_color = BURGUNDY_DARK;
-            style.visuals.widgets.noninteractive.bg_fill = BURGUNDY;
-            style.visuals.widgets.inactive.bg_fill = BURGUNDY_LIGHT;
-            style.visuals.widgets.hovered.bg_fill = BURGUNDY_LIGHT;
-            style.visuals.widgets.active.bg_fill = GOLD_DARK;
-            style.visuals.selection.bg_fill = GOLD_DARK;
+            style.visuals.override_text_color = Some(TEXT_PRIMARY);
+            style.visuals.faint_bg_color = BG_SURFACE;
+            style.visuals.panel_fill = BG_PRIMARY;
+            style.visuals.window_fill = BG_SURFACE;
+            style.visuals.extreme_bg_color = BG_PRIMARY;
+            style.visuals.code_bg_color = BG_SURFACE_ALT;
+            style.visuals.widgets.noninteractive.bg_fill = BG_SURFACE;
+            style.visuals.widgets.noninteractive.fg_stroke.color = TEXT_PRIMARY;
+            style.visuals.widgets.inactive.bg_fill = BG_SURFACE_ALT;
+            style.visuals.widgets.inactive.fg_stroke.color = TEXT_PRIMARY;
+            style.visuals.widgets.hovered.bg_fill = BG_SURFACE_ALT;
+            style.visuals.widgets.hovered.fg_stroke.color = TEXT_PRIMARY;
+            style.visuals.widgets.active.bg_fill = ACCENT_SOFT;
+            style.visuals.widgets.active.fg_stroke.color = TEXT_PRIMARY;
+            style.visuals.selection.bg_fill = ACCENT_SOFT;
+            style.visuals.selection.stroke.color = TEXT_PRIMARY;
             ctx.set_style(style);
         } else {
             ctx.set_visuals(egui::Visuals::light());
@@ -1082,6 +1113,216 @@ Do not fabricate directory listings, command outputs, or success messages.",
         }
     }
 
+    fn syntax_highlight_for_path(path: &str, code: &str) -> LayoutJob {
+        let ext = std::path::Path::new(path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_lowercase();
+
+        let keyword_color = match ext.as_str() {
+            "rs" => Color32::from_rgb(120, 210, 255),
+            "py" => Color32::from_rgb(255, 220, 120),
+            "md" => Color32::from_rgb(150, 215, 170),
+            _ => Color32::from_rgb(180, 205, 255),
+        };
+        let string_color = Color32::from_rgb(230, 180, 120);
+        let comment_color = Color32::from_rgb(130, 140, 150);
+        let text_color = TEXT_PRIMARY;
+
+        let mut job = LayoutJob::default();
+        let mut word = String::new();
+        let mut in_string: Option<char> = None;
+
+        let push_word = |job: &mut LayoutJob, w: &mut String| {
+            if w.is_empty() {
+                return;
+            }
+            let mut format = TextFormat {
+                font_id: FontId::monospace(13.0),
+                color: text_color,
+                ..Default::default()
+            };
+            let is_keyword = match ext.as_str() {
+                "rs" => matches!(
+                    w.as_str(),
+                    "fn" | "let" | "mut" | "pub" | "impl" | "struct" | "enum" | "match" | "if"
+                        | "else" | "for" | "while" | "use" | "mod" | "return"
+                ),
+                "py" => matches!(
+                    w.as_str(),
+                    "def" | "class" | "if" | "elif" | "else" | "for" | "while" | "import" | "from"
+                        | "return" | "with" | "as" | "try" | "except" | "lambda"
+                ),
+                "md" => w.starts_with('#') || w == "```",
+                _ => false,
+            };
+            if is_keyword {
+                format.color = keyword_color;
+            }
+            job.append(w, 0.0, format);
+            w.clear();
+        };
+
+        for line in code.lines() {
+            if ext == "py" {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with('#') {
+                    job.append(
+                        line,
+                        0.0,
+                        TextFormat {
+                            font_id: FontId::monospace(13.0),
+                            color: comment_color,
+                            ..Default::default()
+                        },
+                    );
+                    job.append(
+                        "\n",
+                        0.0,
+                        TextFormat {
+                            font_id: FontId::monospace(13.0),
+                            color: text_color,
+                            ..Default::default()
+                        },
+                    );
+                    continue;
+                }
+            } else if let Some(comment_idx) = line.find("//") {
+                let (left, comment) = line.split_at(comment_idx);
+                for ch in left.chars() {
+                    if in_string.is_none() && (ch == '"' || ch == '\'') {
+                        push_word(&mut job, &mut word);
+                        in_string = Some(ch);
+                        word.push(ch);
+                        continue;
+                    }
+                    if let Some(quote) = in_string {
+                        word.push(ch);
+                        if ch == quote {
+                            job.append(
+                                &word,
+                                0.0,
+                                TextFormat {
+                                    font_id: FontId::monospace(13.0),
+                                    color: string_color,
+                                    ..Default::default()
+                                },
+                            );
+                            word.clear();
+                            in_string = None;
+                        }
+                        continue;
+                    }
+                    if ch.is_ascii_alphanumeric() || ch == '_' || (ext == "md" && ch == '#') {
+                        word.push(ch);
+                    } else {
+                        push_word(&mut job, &mut word);
+                        job.append(
+                            &ch.to_string(),
+                            0.0,
+                            TextFormat {
+                                font_id: FontId::monospace(13.0),
+                                color: text_color,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
+                push_word(&mut job, &mut word);
+                job.append(
+                    comment,
+                    0.0,
+                    TextFormat {
+                        font_id: FontId::monospace(13.0),
+                        color: comment_color,
+                        ..Default::default()
+                    },
+                );
+                job.append(
+                    "\n",
+                    0.0,
+                    TextFormat {
+                        font_id: FontId::monospace(13.0),
+                        color: text_color,
+                        ..Default::default()
+                    },
+                );
+                continue;
+            }
+
+            for ch in line.chars() {
+                if in_string.is_none() && (ch == '"' || ch == '\'') {
+                    push_word(&mut job, &mut word);
+                    in_string = Some(ch);
+                    word.push(ch);
+                    continue;
+                }
+                if let Some(quote) = in_string {
+                    word.push(ch);
+                    if ch == quote {
+                        job.append(
+                            &word,
+                            0.0,
+                            TextFormat {
+                                font_id: FontId::monospace(13.0),
+                                color: string_color,
+                                ..Default::default()
+                            },
+                        );
+                        word.clear();
+                        in_string = None;
+                    }
+                    continue;
+                }
+                if ch.is_ascii_alphanumeric() || ch == '_' || (ext == "md" && ch == '#') {
+                    word.push(ch);
+                } else {
+                    push_word(&mut job, &mut word);
+                    job.append(
+                        &ch.to_string(),
+                        0.0,
+                        TextFormat {
+                            font_id: FontId::monospace(13.0),
+                            color: text_color,
+                            ..Default::default()
+                        },
+                    );
+                }
+            }
+            push_word(&mut job, &mut word);
+            job.append(
+                "\n",
+                0.0,
+                TextFormat {
+                    font_id: FontId::monospace(13.0),
+                    color: text_color,
+                    ..Default::default()
+                },
+            );
+        }
+
+        job
+    }
+
+    fn save_active_editor_file(&mut self) {
+        let Some(path) = self.active_open_file.clone() else {
+            return;
+        };
+        let Some(content) = self.editor_buffers.get(&path).cloned() else {
+            return;
+        };
+        let file_path = std::path::Path::new(&path);
+        match crate::files::write_text_file(file_path, &content) {
+            Ok(_) => {
+                self.editor_dirty.insert(path.clone(), false);
+                self.ensure_changed_file_tracked(path.clone());
+                self.notify(format!("Saved {}", path), NotificationKind::Info);
+            }
+            Err(e) => self.notify(format!("Save failed for {}: {}", path, e), NotificationKind::Error),
+        }
+    }
+
     fn send_message(&mut self) {
         let text = self.input_text.trim().to_string();
         if text.is_empty() && self.pending_attachments.is_empty() {
@@ -1375,7 +1616,7 @@ Do not fabricate directory listings, command outputs, or success messages.",
             .frame(egui::Frame::new().fill(BURGUNDY_DARK).inner_margin(egui::Margin::same(8)))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Changed Files").color(GOLD).strong());
+                    ui.label(RichText::new("Editor").color(TEXT_PRIMARY).strong());
                     if ui.small_button("📂 Open File").clicked() {
                         if let Some(path) = rfd::FileDialog::new().pick_file() {
                             self.open_file_in_workspace(path.to_string_lossy().to_string());
@@ -1383,24 +1624,26 @@ Do not fabricate directory listings, command outputs, or success messages.",
                     }
                 });
                 ui.separator();
-                ScrollArea::vertical().max_height(160.0).show(ui, |ui| {
-                    let changed = self.changed_files.clone();
-                    for path in changed {
-                        ui.horizontal(|ui| {
-                            if ui.small_button("Open").clicked() {
-                                self.open_file_in_workspace(path.clone());
-                            }
-                            ui.label(RichText::new(path.clone()).small().color(LIGHT_TEXT));
-                        });
-                    }
-                    if self.changed_files.is_empty() {
-                        ui.label(RichText::new("No changed files yet").small().color(SKY_BLUE));
-                    }
+                ui.collapsing("Changed Files", |ui| {
+                    ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                        let changed = self.changed_files.clone();
+                        for path in changed {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Open").clicked() {
+                                    self.open_file_in_workspace(path.clone());
+                                }
+                                ui.label(RichText::new(path.clone()).small().color(LIGHT_TEXT));
+                            });
+                        }
+                        if self.changed_files.is_empty() {
+                            ui.label(RichText::new("No changed files yet").small().color(TEXT_MUTED));
+                        }
+                    });
                 });
                 ui.separator();
 
                 if self.opened_files.is_empty() {
-                    ui.label(RichText::new("No file opened").small().color(SKY_BLUE));
+                    ui.label(RichText::new("No file opened").small().color(TEXT_MUTED));
                     return;
                 }
 
@@ -1408,15 +1651,21 @@ Do not fabricate directory listings, command outputs, or success messages.",
                     let opened = self.opened_files.clone();
                     for path in opened {
                         let selected = self.active_open_file.as_deref() == Some(path.as_str());
+                        let is_dirty = self.editor_dirty.get(&path).copied().unwrap_or(false);
+                        let filename = std::path::Path::new(&path)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(&path)
+                            .to_string();
+                        let label = if is_dirty {
+                            format!("{} •", filename)
+                        } else {
+                            filename
+                        };
                         let button = egui::Button::new(
-                            RichText::new(
-                                std::path::Path::new(&path)
-                                    .file_name()
-                                    .and_then(|s| s.to_str())
-                                    .unwrap_or(&path),
-                            )
-                            .small()
-                            .color(if selected { DARK_TEXT } else { LIGHT_TEXT }),
+                            RichText::new(label)
+                                .small()
+                                .color(if selected { DARK_TEXT } else { LIGHT_TEXT }),
                         )
                         .fill(if selected { GOLD } else { SKY_BLUE_DARK });
                         if ui.add(button).clicked() {
@@ -1430,16 +1679,41 @@ Do not fabricate directory listings, command outputs, or success messages.",
                 ui.separator();
 
                 if let Some(path) = self.active_open_file.clone() {
-                    ui.label(RichText::new(path.clone()).small().color(SKY_BLUE));
-                    let content = Self::read_text_file_for_view(&path);
-                    ScrollArea::vertical().show(ui, |ui| {
-                        ui.add(
-                            TextEdit::multiline(&mut content.clone())
-                                .desired_width(ui.available_width())
-                                .desired_rows(24)
-                                .interactive(false),
-                        );
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(path.clone()).small().color(TEXT_MUTED));
+                        if ui.button("💾 Save").clicked() {
+                            self.save_active_editor_file();
+                        }
                     });
+                    if let Some(buffer) = self.editor_buffers.get_mut(&path) {
+                        let ext = std::path::Path::new(&path)
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("txt")
+                            .to_lowercase();
+                        ui.label(
+                            RichText::new(format!("Language: {}", ext))
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
+                        let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap_width: f32| {
+                            let mut layout_job = Self::syntax_highlight_for_path(&path, text.as_str());
+                            layout_job.wrap.max_width = wrap_width;
+                            ui.fonts_mut(|f| f.layout_job(layout_job))
+                        };
+                        ScrollArea::vertical().show(ui, |ui| {
+                            let resp = ui.add(
+                                TextEdit::multiline(buffer)
+                                    .desired_width(ui.available_width())
+                                    .desired_rows(24)
+                                    .font(FontId::monospace(13.0))
+                                    .layouter(&mut layouter),
+                            );
+                            if resp.changed() {
+                                self.editor_dirty.insert(path.clone(), true);
+                            }
+                        });
+                    }
                 }
             });
     }
@@ -2018,187 +2292,259 @@ impl eframe::App for ChatApp {
                 });
         }
 
-        egui::SidePanel::left("sidebar")
-            .resizable(true)
-            .default_width(260.0)
-            .min_width(180.0)
-            .frame(egui::Frame::new().fill(SKY_BLUE).inner_margin(egui::Margin::same(8)))
-            .show(ctx, |ui| {
-                ui.visuals_mut().override_text_color = Some(DARK_TEXT);
-                ui.label(
-                    RichText::new("🤖 AI Chat Bot")
-                        .font(FontId::proportional(18.0))
-                        .color(BURGUNDY_DARK)
-                        .strong(),
-                );
-                ui.separator();
+        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::S)) {
+            self.save_active_editor_file();
+        }
 
+        egui::TopBottomPanel::top("layout_controls").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
                 if ui
-                    .add_sized(
-                        [ui.available_width(), 32.0],
-                        egui::Button::new(RichText::new("＋ New Chat").color(DARK_TEXT)).fill(GOLD),
-                    )
+                    .button(if self.show_left_sidebar {
+                        "◀ Hide Sidebar"
+                    } else {
+                        "▶ Show Sidebar"
+                    })
                     .clicked()
                 {
-                    self.new_session();
+                    self.show_left_sidebar = !self.show_left_sidebar;
                 }
-
-                ui.separator();
-                ui.label(RichText::new("Conversations").strong().color(BURGUNDY_DARK));
-                ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
-                    for idx in 0..self.sessions.len() {
-                        let is_current = self.current_session_idx == Some(idx);
-                        let name = self
-                            .sessions
-                            .get(idx)
-                            .map(|s| s.name.clone())
-                            .unwrap_or_else(|| "Conversation".to_string());
-                        ui.horizontal(|ui| {
-                            let btn = egui::Button::new(RichText::new(format!("💬 {name}")).color(LIGHT_TEXT))
-                                .fill(if is_current { GOLD_DARK } else { SKY_BLUE_DARK })
-                                .min_size(Vec2::new((ui.available_width() - DELETE_CHAT_BUTTON_WIDTH).max(MIN_CHAT_BUTTON_WIDTH), 28.0));
-                            if ui.add(btn).clicked() {
-                                self.current_session_idx = Some(idx);
-                                if self.sessions.get(idx).map(|s| s.messages.is_empty()).unwrap_or(false) {
-                                    self.load_session_messages(idx);
-                                }
-                            }
-                            if ui.small_button("🗑").clicked() {
-                                self.delete_session_by_index(idx);
-                            }
-                        });
-                    }
-                });
-
-                ui.separator();
-                ui.label(RichText::new("Model").strong().color(BURGUNDY_DARK));
-                let selected_model_name = self
-                    .models
-                    .get(self.selected_model_idx)
-                    .map(|m| m.name.clone())
-                    .unwrap_or_else(|| "(none)".to_string());
-                egui::ComboBox::from_id_salt("model_selector")
-                    .selected_text(selected_model_name)
-                    .width(ui.available_width())
-                    .show_ui(ui, |ui| {
-                        for (i, m) in self.models.iter().enumerate() {
-                            ui.selectable_value(&mut self.selected_model_idx, i, &m.name);
-                        }
-                        if !self.remote_models.is_empty() {
-                            ui.separator();
-                            ui.label("Remote model IDs:");
-                            for id in self.remote_models.iter().take(5) {
-                                ui.label(RichText::new(id).small());
-                            }
-                        }
-                    });
-                ui.label(RichText::new("Custom model ID").small().color(DARK_TEXT));
-                ui.horizontal(|ui| {
-                    ui.add(
-                        TextEdit::singleline(&mut self.custom_model_id)
-                            .desired_width(ui.available_width() - CUSTOM_MODEL_INPUT_RESERVED_WIDTH)
-                            .hint_text("e.g. gpt-4o, meta-llama/Llama-3.1-8B-Instruct"),
-                    );
-                    if ui.button("Use").clicked() {
-                        if self.custom_model_id.trim().is_empty() {
-                            self.custom_model_id = self
-                                .current_model()
-                                .map(|m| m.id.clone())
-                                .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
-                        }
-                        self.settings.default_model = self.custom_model_id.trim().to_string();
-                        let _ = save_settings(&self.settings);
-                    }
-                    if ui.button("From list").clicked() {
-                        self.custom_model_id.clear();
-                        self.settings.default_model = self
-                            .current_model()
-                            .map(|m| m.id.clone())
-                            .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
-                        let _ = save_settings(&self.settings);
-                    }
-                });
-                if !self.remote_models.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Quick pick:").small().color(DARK_TEXT));
-                        for id in self.remote_models.iter().take(8) {
-                            if ui.small_button(id).clicked() {
-                                self.custom_model_id = id.clone();
-                            }
-                        }
-                    });
-                }
-
-                let supports_thinking = self.current_model().map(|m| m.supports_thinking()).unwrap_or(false);
-                if supports_thinking {
-                    ui.horizontal(|ui| {
-                        ui.label("Thinking mode:");
-                        egui::ComboBox::from_id_salt("thinking_mode")
-                            .selected_text(match self.selected_thinking_mode {
-                                ThinkingMode::Disabled => "Disabled",
-                                ThinkingMode::Auto => "Auto",
-                                ThinkingMode::Low => "Low",
-                                ThinkingMode::Medium => "Medium",
-                                ThinkingMode::High => "High",
-                            })
-                            .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.selected_thinking_mode, ThinkingMode::Disabled, "Disabled");
-                                ui.selectable_value(&mut self.selected_thinking_mode, ThinkingMode::Auto, "Auto");
-                                ui.selectable_value(&mut self.selected_thinking_mode, ThinkingMode::Low, "Low");
-                                ui.selectable_value(&mut self.selected_thinking_mode, ThinkingMode::Medium, "Medium");
-                                ui.selectable_value(&mut self.selected_thinking_mode, ThinkingMode::High, "High");
-                            });
-                    });
-                }
-
-                ui.separator();
-                ui.label(RichText::new("Agents").strong().color(BURGUNDY_DARK));
-                for agent in &mut self.agents {
-                    ui.checkbox(&mut agent.enabled, &agent.name);
-                }
-
-                ui.separator();
-                ui.checkbox(&mut self.settings.shell_execution_enabled, "Shell execution");
-                ui.checkbox(&mut self.settings.dark_mode, "Dark mode");
-                if ui.button("Apply theme").clicked() {
-                    Self::apply_theme(ctx, self.settings.dark_mode);
-                    let _ = save_settings(&self.settings);
-                }
-
-                ui.label(RichText::new("Working Dir").strong().color(BURGUNDY_DARK));
-                ui.label(RichText::new(&self.settings.working_directory).small());
-                if ui.button("📁 Change Directory").clicked() {
-                    self.select_working_dir();
-                }
-
-                if ui.button("Shadow rollback").clicked() {
-                    self.show_snapshots = true;
-                    self.refresh_snapshots();
-                }
-                if ui.button("⚙ Settings").clicked() {
-                    self.show_settings = true;
+                if ui
+                    .button(if self.show_activity_panel {
+                        "◀ Hide Activity"
+                    } else {
+                        "▶ Show Activity"
+                    })
+                    .clicked()
+                {
+                    self.show_activity_panel = !self.show_activity_panel;
                 }
             });
+        });
+
+        if self.show_left_sidebar {
+            egui::SidePanel::left("sidebar")
+                .resizable(true)
+                .default_width(260.0)
+                .min_width(180.0)
+                .frame(egui::Frame::new().fill(BG_SURFACE).inner_margin(egui::Margin::same(8)))
+                .show(ctx, |ui| {
+                    ui.label(
+                        RichText::new("🤖 AI Chat Bot")
+                            .font(FontId::proportional(18.0))
+                            .color(TEXT_PRIMARY)
+                            .strong(),
+                    );
+                    ui.separator();
+
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 32.0],
+                            egui::Button::new(RichText::new("＋ New Chat").color(TEXT_DARK)).fill(GOLD),
+                        )
+                        .clicked()
+                    {
+                        self.new_session();
+                    }
+
+                    ui.separator();
+                    ui.collapsing("Conversations", |ui| {
+                        ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
+                            for idx in 0..self.sessions.len() {
+                                let is_current = self.current_session_idx == Some(idx);
+                                let name = self
+                                    .sessions
+                                    .get(idx)
+                                    .map(|s| s.name.clone())
+                                    .unwrap_or_else(|| "Conversation".to_string());
+                                ui.horizontal(|ui| {
+                                    let btn = egui::Button::new(
+                                        RichText::new(format!("💬 {name}")).color(LIGHT_TEXT),
+                                    )
+                                    .fill(if is_current { GOLD_DARK } else { SKY_BLUE_DARK })
+                                    .min_size(Vec2::new(
+                                        (ui.available_width() - DELETE_CHAT_BUTTON_WIDTH)
+                                            .max(MIN_CHAT_BUTTON_WIDTH),
+                                        28.0,
+                                    ));
+                                    if ui.add(btn).clicked() {
+                                        self.current_session_idx = Some(idx);
+                                        if self
+                                            .sessions
+                                            .get(idx)
+                                            .map(|s| s.messages.is_empty())
+                                            .unwrap_or(false)
+                                        {
+                                            self.load_session_messages(idx);
+                                        }
+                                    }
+                                    if ui.small_button("🗑").clicked() {
+                                        self.delete_session_by_index(idx);
+                                    }
+                                });
+                            }
+                        });
+                    });
+
+                    ui.separator();
+                    ui.collapsing("Model Selection", |ui| {
+                        let selected_model_name = self
+                            .models
+                            .get(self.selected_model_idx)
+                            .map(|m| m.name.clone())
+                            .unwrap_or_else(|| "(none)".to_string());
+                        egui::ComboBox::from_id_salt("model_selector")
+                            .selected_text(RichText::new(selected_model_name).color(TEXT_PRIMARY))
+                            .width(ui.available_width())
+                            .show_ui(ui, |ui| {
+                                for (i, m) in self.models.iter().enumerate() {
+                                    ui.selectable_value(&mut self.selected_model_idx, i, &m.name);
+                                }
+                                if !self.remote_models.is_empty() {
+                                    ui.separator();
+                                    ui.label("Remote model IDs:");
+                                    for id in self.remote_models.iter().take(5) {
+                                        ui.label(RichText::new(id).small().color(TEXT_MUTED));
+                                    }
+                                }
+                            });
+                        ui.label(RichText::new("Custom model ID").small().color(TEXT_MUTED));
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                TextEdit::singleline(&mut self.custom_model_id)
+                                    .desired_width(
+                                        ui.available_width() - CUSTOM_MODEL_INPUT_RESERVED_WIDTH,
+                                    )
+                                    .hint_text("e.g. gpt-4o, meta-llama/Llama-3.1-8B-Instruct"),
+                            );
+                            if ui.button("Use").clicked() {
+                                if self.custom_model_id.trim().is_empty() {
+                                    self.custom_model_id = self
+                                        .current_model()
+                                        .map(|m| m.id.clone())
+                                        .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+                                }
+                                self.settings.default_model = self.custom_model_id.trim().to_string();
+                                let _ = save_settings(&self.settings);
+                            }
+                            if ui.button("From list").clicked() {
+                                self.custom_model_id.clear();
+                                self.settings.default_model = self
+                                    .current_model()
+                                    .map(|m| m.id.clone())
+                                    .unwrap_or_else(|| DEFAULT_MODEL_ID.to_string());
+                                let _ = save_settings(&self.settings);
+                            }
+                        });
+                        if !self.remote_models.is_empty() {
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(RichText::new("Quick pick:").small().color(TEXT_MUTED));
+                                for id in self.remote_models.iter().take(8) {
+                                    if ui.small_button(id).clicked() {
+                                        self.custom_model_id = id.clone();
+                                    }
+                                }
+                            });
+                        }
+
+                        let supports_thinking = self
+                            .current_model()
+                            .map(|m| m.supports_thinking())
+                            .unwrap_or(false);
+                        if supports_thinking {
+                            ui.horizontal(|ui| {
+                                ui.label("Thinking mode:");
+                                egui::ComboBox::from_id_salt("thinking_mode")
+                                    .selected_text(match self.selected_thinking_mode {
+                                        ThinkingMode::Disabled => "Disabled",
+                                        ThinkingMode::Auto => "Auto",
+                                        ThinkingMode::Low => "Low",
+                                        ThinkingMode::Medium => "Medium",
+                                        ThinkingMode::High => "High",
+                                    })
+                                    .show_ui(ui, |ui| {
+                                        ui.selectable_value(
+                                            &mut self.selected_thinking_mode,
+                                            ThinkingMode::Disabled,
+                                            "Disabled",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.selected_thinking_mode,
+                                            ThinkingMode::Auto,
+                                            "Auto",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.selected_thinking_mode,
+                                            ThinkingMode::Low,
+                                            "Low",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.selected_thinking_mode,
+                                            ThinkingMode::Medium,
+                                            "Medium",
+                                        );
+                                        ui.selectable_value(
+                                            &mut self.selected_thinking_mode,
+                                            ThinkingMode::High,
+                                            "High",
+                                        );
+                                    });
+                            });
+                        }
+                    });
+
+                    ui.separator();
+                    ui.collapsing("Settings", |ui| {
+                        for agent in &mut self.agents {
+                            ui.checkbox(&mut agent.enabled, &agent.name);
+                        }
+                        ui.separator();
+                        ui.checkbox(&mut self.settings.shell_execution_enabled, "Shell execution");
+                        ui.checkbox(&mut self.settings.dark_mode, "Dark mode");
+                        if ui.button("Apply theme").clicked() {
+                            Self::apply_theme(ctx, self.settings.dark_mode);
+                            let _ = save_settings(&self.settings);
+                        }
+
+                        ui.label(RichText::new("Working Dir").strong().color(TEXT_PRIMARY));
+                        ui.label(RichText::new(&self.settings.working_directory).small());
+                        if ui.button("📁 Change Directory").clicked() {
+                            self.select_working_dir();
+                        }
+                        if ui.button("Shadow rollback").clicked() {
+                            self.show_snapshots = true;
+                            self.refresh_snapshots();
+                        }
+                        if ui.button("⚙ Advanced Settings").clicked() {
+                            self.show_settings = true;
+                        }
+                    });
+                });
+        }
 
         self.render_file_workspace_panel(ctx);
 
-        egui::SidePanel::right("activity")
-            .resizable(true)
-            .default_width(220.0)
-            .frame(egui::Frame::new().fill(BURGUNDY_DARK).inner_margin(egui::Margin::same(8)))
-            .show(ctx, |ui| {
-                ui.label(RichText::new("Activity Monitor").color(GOLD).strong());
-                ui.separator();
-                for req in self.active_requests.values() {
-                    ui.label(RichText::new(format!("⏳ {} is responding", req.agent_name)).color(SKY_BLUE));
-                }
-                ui.separator();
-                ScrollArea::vertical().show(ui, |ui| {
-                    for line in self.activity_log.iter().rev().take(20) {
-                        ui.label(RichText::new(line).small().color(WHITE));
-                    }
+        if self.show_activity_panel {
+            egui::SidePanel::right("activity")
+                .resizable(true)
+                .default_width(220.0)
+                .frame(egui::Frame::new().fill(BURGUNDY_DARK).inner_margin(egui::Margin::same(8)))
+                .show(ctx, |ui| {
+                    ui.collapsing("Activity Monitor", |ui| {
+                        for req in self.active_requests.values() {
+                            ui.label(
+                                RichText::new(format!("⏳ {} is responding", req.agent_name))
+                                    .color(SKY_BLUE),
+                            );
+                        }
+                        ui.separator();
+                        ScrollArea::vertical().show(ui, |ui| {
+                            for line in self.activity_log.iter().rev().take(20) {
+                                ui.label(RichText::new(line).small().color(WHITE));
+                            }
+                        });
+                    });
                 });
-            });
+        }
 
         self.render_bottom_terminal_panel(ctx);
 
