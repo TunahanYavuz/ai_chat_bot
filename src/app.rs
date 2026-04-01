@@ -70,6 +70,8 @@ Never output JSON outside the json block.
 
 Always use valid, escaped characters inside the JSON payload.
 
+GLOBAL NLU PROTOCOL: The user may speak to you in ANY language (e.g., Turkish, Spanish, etc.). You must understand and execute their intent. However, your structural output MUST remain strictly in English. The headers MUST be exactly 'MESSAGE:' and 'PLAN:'. The JSON keys and actions (e.g., 'create_file', 'run_cmd') MUST remain exactly as defined in the schema. You may translate the *content* of the MESSAGE and PLAN into the user's language, but NEVER translate the structural keys.
+
 If a user asks a simple conversational question that does not require system execution, keep the actions array empty ([]).
 
 THINK BEFORE YOU ACT: Ensure the commands are safe for a Linux/Unix environment."#;

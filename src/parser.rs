@@ -58,7 +58,7 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
     let (message, plan_items) = extract_message_and_plan(&cleaned_text);
 
     let (actions, json_parse_error) = if let Some(block) = json_block {
-        match serde_json::from_str::<ActionEnvelope>(block) {
+        match serde_json::from_str::<ActionEnvelope>(&block) {
             Ok(envelope) => (envelope.actions, None),
             Err(err) => (Vec::new(), Some(format!("JSON parse failed: {err}"))),
         }
@@ -166,10 +166,11 @@ fn clean_inline_section(text: &str) -> String {
     text.trim().to_string()
 }
 
-fn extract_json_block(text: &str) -> Option<&str> {
+fn extract_json_block(text: &str) -> Option<String> {
     let captures = json_fence_regex().captures(text)?;
     let fenced_body = captures.name("body")?.as_str();
-    extract_balanced_json_object(fenced_body)
+    let sanitized = sanitize_fenced_json_body(fenced_body);
+    extract_balanced_json_object(&sanitized).map(str::to_string)
 }
 
 fn strip_json_block(text: &str) -> String {
@@ -183,12 +184,34 @@ fn json_fence_regex() -> &'static Regex {
 
 fn tag_matcher_message() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?im)^\s*MESSAGE:\s*").expect("message regex must be valid"))
+    RE.get_or_init(|| {
+        Regex::new(r"(?im)^\s*(?:\*\*)?\s*MESSAGE\s*(?:\*\*)?\s*:\s*")
+            .expect("message regex must be valid")
+    })
 }
 
 fn tag_matcher_plan() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"(?im)^\s*PLAN:\s*").expect("plan regex must be valid"))
+    RE.get_or_init(|| {
+        Regex::new(r"(?im)^\s*(?:\*\*)?\s*PLAN\s*(?:\*\*)?\s*:\s*")
+            .expect("plan regex must be valid")
+    })
+}
+
+fn sanitize_fenced_json_body(body: &str) -> String {
+    let without_bom = body.trim().trim_start_matches('\u{feff}');
+    let mut cleaned = String::new();
+
+    for line in without_bom.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            continue;
+        }
+        cleaned.push_str(line);
+        cleaned.push('\n');
+    }
+
+    cleaned.trim().to_string()
 }
 
 fn extract_balanced_json_object(input: &str) -> Option<&str> {
