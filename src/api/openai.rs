@@ -1,7 +1,10 @@
 use anyhow::{anyhow, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use crate::models::{ReasoningCapability, ThinkingMode};
+use std::sync::Arc;
+use crate::models::{
+    provider_adapter_for, ProviderAdapter, ProviderRequestOptions, ReasoningCapability, ThinkingMode,
+};
 
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
@@ -79,21 +82,6 @@ struct ChatRequest {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct ChatChoice {
-    pub message: ChatResponseMessage,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ChatResponseMessage {
-    pub content: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ChatResponse {
-    pub choices: Vec<ChatChoice>,
-}
-
-#[derive(Debug, Deserialize)]
 struct StreamDelta {
     content: Option<String>,
 }
@@ -113,6 +101,7 @@ pub struct OpenAIClient {
     client: Client,
     api_key: String,
     base_url: String,
+    adapter: Arc<dyn ProviderAdapter>,
 }
 
 fn chat_message_text_content(msg: &ChatMessage) -> String {
@@ -163,25 +152,35 @@ fn normalize_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
 }
 
 impl OpenAIClient {
-    pub fn new(api_key: &str, base_url: &str) -> Self {
+    pub fn with_provider(provider_key: &str, api_key: &str, base_url: &str) -> Self {
         Self {
             client: Client::new(),
             api_key: api_key.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
+            adapter: provider_adapter_for(provider_key),
         }
     }
 
-    async fn chat_completion_non_stream(&self, mut request: ChatRequest) -> Result<String> {
-        request.stream = None;
+    async fn chat_completion_non_stream(
+        &self,
+        model: &str,
+        messages: &[ChatMessage],
+        options: &ProviderRequestOptions,
+    ) -> Result<String> {
+        let payload_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .collect();
+        let mut opts = options.clone();
+        opts.stream = false;
+        let payload = self.adapter.build_chat_payload(model, &payload_messages, &opts);
 
-        let url = format!("{}/chat/completions", self.base_url);
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&request)
-            .send()
-            .await?;
+        let url = self.adapter.chat_endpoint(&self.base_url);
+        let mut request = self.client.post(&url);
+        for (k, v) in self.adapter.auth_headers(&self.api_key) {
+            request = request.header(k, v);
+        }
+        let response = request.json(&payload).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -189,12 +188,10 @@ impl OpenAIClient {
             return Err(anyhow!("API error {}: {}", status, body));
         }
 
-        let parsed: ChatResponse = response.json().await?;
-        let text = parsed
-            .choices
-            .into_iter()
-            .next()
-            .and_then(|choice| choice.message.content)
+        let parsed: serde_json::Value = response.json().await?;
+        let text = self
+            .adapter
+            .parse_non_stream_text(&parsed)
             .unwrap_or_default();
         Ok(text)
     }
@@ -238,14 +235,27 @@ impl OpenAIClient {
             max_tokens: None,
         };
 
-        let url = format!("{}/chat/completions", self.base_url);
-        let response = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&request)
-            .send()
-            .await?;
+        let payload_messages: Vec<serde_json::Value> = request
+            .messages
+            .iter()
+            .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
+            .collect();
+        let options = ProviderRequestOptions {
+            reasoning_effort: request.reasoning_effort.clone(),
+            include_reasoning: request.include_reasoning,
+            stream: true,
+            max_tokens: request.max_tokens,
+        };
+        let payload = self
+            .adapter
+            .build_chat_payload(model, &payload_messages, &options);
+
+        let url = self.adapter.chat_endpoint(&self.base_url);
+        let mut req = self.client.post(&url);
+        for (k, v) in self.adapter.auth_headers(&self.api_key) {
+            req = req.header(k, v);
+        }
+        let response = req.json(&payload).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -263,9 +273,16 @@ impl OpenAIClient {
 
             for line in text.lines() {
                 if let Some(data) = line.strip_prefix("data: ") {
-                    if data.trim() == "[DONE]" {
+                    if self.adapter.stream_done(data) {
                         stream_finished = true;
                         break;
+                    }
+                    if let Some(content) = self.adapter.stream_delta_text(data) {
+                        if !content.is_empty() {
+                            full_content.push_str(&content);
+                            on_chunk(content);
+                        }
+                        continue;
                     }
                     if let Ok(parsed) = serde_json::from_str::<StreamChunk>(data) {
                         for choice in parsed.choices {
@@ -289,7 +306,9 @@ impl OpenAIClient {
 
         if full_content.trim().is_empty() && stream_finished {
             eprintln!("Streaming response completed empty; retrying once with non-stream request");
-            let fallback_text = self.chat_completion_non_stream(request).await?;
+            let fallback_text = self
+                .chat_completion_non_stream(model, &request.messages, &options)
+                .await?;
             if !fallback_text.is_empty() {
                 on_chunk(fallback_text.clone());
             }
@@ -315,13 +334,12 @@ impl OpenAIClient {
             data: Vec<ModelItem>,
         }
 
-        let url = format!("{}/models", self.base_url);
-        let response = self
-            .client
-            .get(&url)
-            .bearer_auth(&self.api_key)
-            .send()
-            .await?;
+        let url = self.adapter.models_endpoint(&self.base_url);
+        let mut request = self.client.get(&url);
+        for (k, v) in self.adapter.auth_headers(&self.api_key) {
+            request = request.header(k, v);
+        }
+        let response = request.send().await?;
 
         if !response.status().is_success() {
             return Ok(Vec::new());

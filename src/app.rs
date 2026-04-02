@@ -32,7 +32,7 @@ use crate::telemetry::collect_telemetry_cached;
 use crate::watcher::run_workspace_watcher;
 use qdrant_client::Qdrant;
 
-fn show_emojis<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+fn with_emoji_context<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
     add_contents(ui)
 }
 
@@ -66,6 +66,8 @@ const QDRANT_URL: &str = "http://127.0.0.1:6334";
 const AUTONOMOUS_SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
 const AUTONOMOUS_WORKFLOW_PREFIX: &str = "[AUTONOMOUS CRON-SWARM]";
 const AUTONOMOUS_SESSION_NAME: &str = "Autonomous Briefing";
+const QUOTA_EXHAUSTED_TEXT_COLOR: Color32 = Color32::from_rgb(220, 75, 75);
+const TOKEN_ESTIMATE_CHARS_PER_TOKEN: f64 = 4.0;
 const AUTONOMOUS_TRIGGER_KEYWORDS: [&str; 6] = [
     "every day",
     "every morning",
@@ -243,6 +245,141 @@ pub struct ImageData {
 struct VisionStaging {
     images: Vec<ImageData>,
     undo_stack: Vec<ImageData>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct QuotaMetrics {
+    tokens_used: u64,
+    request_count: u64,
+    max_tokens: u64,
+    max_requests: u64,
+}
+
+#[derive(Debug, Clone)]
+struct QuotaManager {
+    per_provider: HashMap<String, QuotaMetrics>,
+}
+
+impl Default for QuotaManager {
+    fn default() -> Self {
+        let mut per_provider = HashMap::new();
+        per_provider.insert(
+            "openai".to_string(),
+            QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            },
+        );
+        per_provider.insert(
+            "anthropic".to_string(),
+            QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            },
+        );
+        per_provider.insert(
+            "deepseek".to_string(),
+            QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            },
+        );
+        per_provider.insert(
+            "huggingface".to_string(),
+            QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            },
+        );
+        per_provider.insert(
+            "openrouter".to_string(),
+            QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            },
+        );
+        per_provider.insert(
+            "nvidia".to_string(),
+            QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            },
+        );
+        per_provider.insert(
+            "custom".to_string(),
+            QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            },
+        );
+        Self { per_provider }
+    }
+}
+
+impl QuotaManager {
+    fn ensure_provider(&mut self, provider_key: &str) {
+        self.per_provider
+            .entry(provider_key.to_string())
+            .or_insert_with(|| QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            });
+    }
+
+    fn record_usage(&mut self, provider_key: &str, estimated_tokens: u64) {
+        self.ensure_provider(provider_key);
+        if let Some(m) = self.per_provider.get_mut(provider_key) {
+            m.request_count = m.request_count.saturating_add(1);
+            m.tokens_used = m.tokens_used.saturating_add(estimated_tokens);
+        }
+    }
+
+    fn metrics(&self, provider_key: &str) -> QuotaMetrics {
+        self.per_provider
+            .get(provider_key)
+            .cloned()
+            .unwrap_or_else(|| QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            })
+    }
+
+    fn usage_ratio(&self, provider_key: &str) -> f32 {
+        let m = self.metrics(provider_key);
+        let token_ratio = if m.max_tokens == 0 {
+            1.0
+        } else {
+            (m.tokens_used as f32 / m.max_tokens as f32).clamp(0.0, 1.0)
+        };
+        let request_ratio = if m.max_requests == 0 {
+            1.0
+        } else {
+            (m.request_count as f32 / m.max_requests as f32).clamp(0.0, 1.0)
+        };
+        token_ratio.max(request_ratio)
+    }
+
+    fn exhausted(&self, provider_key: &str) -> bool {
+        self.usage_ratio(provider_key) >= 1.0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -461,6 +598,7 @@ pub struct ChatApp {
     pending_attachments: Vec<Attachment>,
     vision_staging: VisionStaging,
     vision_thumbnail_cache: HashMap<String, egui::TextureHandle>,
+    quota_manager: QuotaManager,
 
     event_tx: tokio::sync::mpsc::Sender<AppEvent>,
     event_rx: tokio::sync::mpsc::Receiver<AppEvent>,
@@ -743,7 +881,7 @@ impl ChatApp {
                 .unwrap_or(false);
             let chevron = if expanded_now { "▾" } else { "▸" };
             let mut toggle = false;
-            show_emojis(ui, |ui| {
+            with_emoji_context(ui, |ui| {
                 ui.horizontal(|ui| {
                     if ui
                         .add(egui::Button::new(chevron).frame(false))
@@ -785,7 +923,7 @@ impl ChatApp {
         }
 
         let selected = self.active_open_file.as_deref() == Some(node.path.as_str());
-        let resp = show_emojis(ui, |ui| {
+        let resp = with_emoji_context(ui, |ui| {
             ui.horizontal(|ui| {
                 EmojiLabel::new("📄").show(ui);
                 ui.selectable_label(
@@ -903,7 +1041,7 @@ impl ChatApp {
     }
 
     fn render_workflow_visualizer(&mut self, ui: &mut egui::Ui) {
-        show_emojis(ui, |ui| {
+        with_emoji_context(ui, |ui| {
             egui::Frame::new()
                 .fill(Color32::from_rgba_unmultiplied(0x22, 0x24, 0x2A, 0xB8))
                 .corner_radius(8.0)
@@ -1374,6 +1512,64 @@ impl ChatApp {
         } else {
             self.custom_model_id.trim().to_string()
         }
+    }
+
+    fn active_provider_key(&self) -> String {
+        self.settings.selected_provider.key().to_string()
+    }
+
+    fn provider_key_for_model(&self, model_id: &str) -> String {
+        let m = model_id.to_ascii_lowercase();
+        if m.contains("claude") || m.contains("anthropic") {
+            return "anthropic".to_string();
+        }
+        if m.contains("deepseek") {
+            return "deepseek".to_string();
+        }
+        if m.contains("huggingface") || m.contains("hf.co") {
+            return "huggingface".to_string();
+        }
+        self.active_provider_key()
+    }
+
+    fn estimate_tokens_from_messages(messages: &[ChatMessage]) -> u64 {
+        let mut total_chars = 0usize;
+        for m in messages {
+            total_chars = total_chars.saturating_add(m.role.len());
+            if let Some(text) = m.content.as_str() {
+                total_chars = total_chars.saturating_add(text.len());
+            } else if let Some(arr) = m.content.as_array() {
+                for item in arr {
+                    if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                        total_chars = total_chars.saturating_add(t.len());
+                    }
+                }
+            }
+        }
+        ((total_chars as f64 / TOKEN_ESTIMATE_CHARS_PER_TOKEN).ceil() as u64).max(1)
+    }
+
+    fn quota_usage_color(usage: f32) -> Color32 {
+        let u = usage.clamp(0.0, 1.0);
+        if u <= 0.60 {
+            let t = u / 0.60;
+            let r = (70.0 + (40.0 * t)) as u8;
+            let g = (170.0 + (60.0 * t)) as u8;
+            let b = (95.0 - (35.0 * t)) as u8;
+            return Color32::from_rgb(r, g, b);
+        }
+        if u <= 0.85 {
+            let t = (u - 0.60) / 0.25;
+            let r = (110.0 + (125.0 * t)) as u8;
+            let g = (230.0 - (80.0 * t)) as u8;
+            let b = (60.0 - (20.0 * t)) as u8;
+            return Color32::from_rgb(r, g, b);
+        }
+        let t = (u - 0.85) / 0.15;
+        let r = (235.0 - (25.0 * t)) as u8;
+        let g = (150.0 - (110.0 * t)) as u8;
+        let b = (40.0 - (20.0 * t)) as u8;
+        Color32::from_rgb(r, g, b)
     }
 
     fn current_reasoning_capability(&self) -> ReasoningCapability {
@@ -1877,6 +2073,7 @@ impl ChatApp {
             pending_attachments: vec![],
             vision_staging: VisionStaging::default(),
             vision_thumbnail_cache: HashMap::new(),
+            quota_manager: QuotaManager::default(),
             event_tx,
             event_rx,
             tokio_rt: rt,
@@ -2046,9 +2243,10 @@ impl ChatApp {
 
         let api_key = self.settings.active_api_key();
         let base_url = self.settings.active_base_url();
+        let provider_key = self.active_provider_key();
         let tx = self.event_tx.clone();
         self.tokio_rt.spawn(async move {
-            let client = crate::api::OpenAIClient::new(&api_key, &base_url);
+            let client = crate::api::OpenAIClient::with_provider(&provider_key, &api_key, &base_url);
             let model_ids: Vec<crate::api::openai::RemoteModelInfo> =
                 client.list_models().await.unwrap_or_default();
             let _ = tx.send(AppEvent::ModelsLoaded(model_ids)).await;
@@ -2167,6 +2365,11 @@ impl ChatApp {
         let event_tx = self.event_tx.clone();
         let req_id = request_id.clone();
         let model_id = model_id.clone();
+        let provider_key = self.provider_key_for_model(&model_id);
+        self.quota_manager.record_usage(
+            &provider_key,
+            Self::estimate_tokens_from_messages(&api_messages).saturating_add(64),
+        );
         let shared_rag_client = self.rag_client.clone();
         let approval_waiters = self.approval_waiters.clone();
         let mcp_manager = self.mcp_manager.clone();
@@ -2227,7 +2430,7 @@ impl ChatApp {
                 }
             }
 
-            let client = crate::api::OpenAIClient::new(&api_key, &base_url);
+            let client = crate::api::OpenAIClient::with_provider(&provider_key, &api_key, &base_url);
             let _ = event_tx
                 .send(AppEvent::SwarmStatus {
                     request_id: req_id.clone(),
@@ -3214,6 +3417,11 @@ impl ChatApp {
 
     fn send_message(&mut self) {
         let text = self.input_text.trim().to_string();
+        let provider_key = self.active_provider_key();
+        if self.quota_manager.exhausted(&provider_key) {
+            self.notify("Quota exhausted for active provider", NotificationKind::Error);
+            return;
+        }
         if text.is_empty() && self.pending_attachments.is_empty() {
             return;
         };
@@ -4093,7 +4301,7 @@ impl ChatApp {
         let width = ui.available_width();
         let max_bubble = (width * 0.75).min(700.0);
 
-        show_emojis(ui, |ui| {
+        with_emoji_context(ui, |ui| {
             ui.with_layout(
                 if is_user {
                     egui::Layout::right_to_left(egui::Align::TOP)
@@ -5060,6 +5268,38 @@ impl eframe::App for ChatApp {
                             self.ensure_thinking_mode_valid_for_model();
                         }
                     });
+                    ui.separator();
+                    ui.collapsing("API Health", |ui| {
+                        let provider_key = self.active_provider_key();
+                        self.quota_manager.ensure_provider(&provider_key);
+                        let metrics = self.quota_manager.metrics(&provider_key);
+                        let usage = self.quota_manager.usage_ratio(&provider_key);
+                        let color = Self::quota_usage_color(usage);
+                        let bar = egui::ProgressBar::new(usage)
+                            .show_percentage()
+                            .fill(color)
+                            .desired_width(ui.available_width())
+                            .text(format!("{:.1}% used", usage * 100.0));
+                        ui.add(bar);
+                        ui.label(
+                            RichText::new(format!(
+                                "tokens: {}/{} | requests: {}/{}",
+                                metrics.tokens_used,
+                                metrics.max_tokens,
+                                metrics.request_count,
+                                metrics.max_requests
+                            ))
+                            .small()
+                            .color(TEXT_MUTED),
+                        );
+                        if self.quota_manager.exhausted(&provider_key) {
+                            ui.label(
+                                RichText::new("Quota Exhausted")
+                                    .small()
+                                    .color(QUOTA_EXHAUSTED_TEXT_COLOR),
+                            );
+                        }
+                    });
 
                     ui.horizontal(|ui| {
                         ui.label("Execution policy:");
@@ -5477,6 +5717,8 @@ impl eframe::App for ChatApp {
                                 .hint_text("Type a message…")
                                 .frame(true);
                             let response = ui.add(text_edit);
+                            let provider_key = self.active_provider_key();
+                            let quota_exhausted = self.quota_manager.exhausted(&provider_key);
                             if response.has_focus()
                                 && ctx.input(|i| {
                                     i.key_pressed(egui::Key::Enter)
@@ -5485,22 +5727,23 @@ impl eframe::App for ChatApp {
                                         && !i.modifiers.ctrl
                                         && !i.modifiers.alt
                                 })
+                                && !quota_exhausted
                             {
                                 self.send_message();
                             }
 
                             ui.vertical(|ui| {
-                                if ui
-                                    .add_sized(
-                                        [110.0, 36.0],
-                                        egui::Button::new(
-                                            RichText::new("📤 Send").color(DARK_TEXT),
-                                        )
-                                        .fill(GOLD),
-                                    )
-                                    .clicked()
-                                {
+                                let send_resp = ui.add_enabled(
+                                    !quota_exhausted,
+                                    egui::Button::new(RichText::new("📤 Send").color(DARK_TEXT))
+                                        .fill(GOLD)
+                                        .min_size(Vec2::new(110.0, 36.0)),
+                                );
+                                if send_resp.clicked() {
                                     self.send_message();
+                                }
+                                if quota_exhausted {
+                                    send_resp.on_hover_text("Quota Exhausted");
                                 }
                                 if ui
                                     .add_sized(
