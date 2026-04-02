@@ -52,6 +52,7 @@ const STATUS_ERROR: Color32 = Color32::from_rgb(0xEF, 0x53, 0x50);
 const CUSTOM_MODEL_INPUT_RESERVED_WIDTH: f32 = 132.0;
 const DELETE_CHAT_BUTTON_WIDTH: f32 = 36.0;
 const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
+const CONVERSATIONS_LIST_MAX_HEIGHT_RATIO: f32 = 0.32;
 const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const WORKFLOW_STEP_DETAIL_MAX_CHARS: usize = 1200;
@@ -3841,7 +3842,7 @@ impl ChatApp {
                         bottom: 10,
                     })
                     .show(ui, |ui| {
-                        ui.with_layout(egui::Layout::left_to_right(egui::Align::TOP), |ui| {
+                        ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
                             ui.set_max_width(max_bubble - 24.0);
 
                             let role_label = if is_user { "You" } else { "Assistant" };
@@ -4568,41 +4569,68 @@ impl eframe::App for ChatApp {
 
                     ui.separator();
                     ui.collapsing("Conversations", |ui| {
-                        ScrollArea::vertical().max_height(200.0).show(ui, |ui| {
-                            for idx in 0..self.sessions.len() {
-                                let is_current = self.current_session_idx == Some(idx);
-                                let name = self
-                                    .sessions
-                                    .get(idx)
-                                    .map(|s| s.name.clone())
-                                    .unwrap_or_else(|| "Conversation".to_string());
-                                ui.horizontal(|ui| {
-                                    let btn = egui::Button::new(
-                                        RichText::new(format!("💬 {name}")).color(LIGHT_TEXT),
-                                    )
-                                    .fill(if is_current { GOLD_DARK } else { SKY_BLUE_DARK })
-                                    .min_size(Vec2::new(
-                                        (ui.available_width() - DELETE_CHAT_BUTTON_WIDTH)
-                                            .max(MIN_CHAT_BUTTON_WIDTH),
-                                        28.0,
-                                    ));
-                                    if ui.add(btn).clicked() {
-                                        self.current_session_idx = Some(idx);
-                                        if self
-                                            .sessions
-                                            .get(idx)
-                                            .map(|s| s.messages.is_empty())
-                                            .unwrap_or(false)
-                                        {
-                                            self.load_session_messages(idx);
-                                        }
-                                    }
-                                    if ui.small_button("🗑").clicked() {
-                                        self.delete_session_by_index(idx);
-                                    }
-                                });
+                        let list_max_height =
+                            (ui.available_height() * CONVERSATIONS_LIST_MAX_HEIGHT_RATIO)
+                                .max(200.0);
+                        let sessions_snapshot: Vec<(usize, String, String, bool)> = self
+                            .sessions
+                            .iter()
+                            .enumerate()
+                            .map(|(idx, session)| {
+                                (
+                                    idx,
+                                    session.id.clone(),
+                                    session.name.clone(),
+                                    self.current_session_idx == Some(idx),
+                                )
+                            })
+                            .collect();
+                        let mut pending_select: Option<usize> = None;
+                        let mut pending_delete: Option<usize> = None;
+                        ScrollArea::vertical()
+                            .max_height(list_max_height)
+                            .show(ui, |ui| {
+                                for (idx, session_id, name, is_current) in &sessions_snapshot {
+                                    ui.push_id(session_id, |ui| {
+                                        ui.horizontal(|ui| {
+                                            let btn = egui::Button::new(
+                                                RichText::new(format!("💬 {name}"))
+                                                    .color(LIGHT_TEXT),
+                                            )
+                                            .fill(if *is_current {
+                                                GOLD_DARK
+                                            } else {
+                                                SKY_BLUE_DARK
+                                            })
+                                            .min_size(Vec2::new(
+                                                (ui.available_width() - DELETE_CHAT_BUTTON_WIDTH)
+                                                    .max(MIN_CHAT_BUTTON_WIDTH),
+                                                28.0,
+                                            ));
+                                            if ui.add(btn).clicked() {
+                                                pending_select = Some(*idx);
+                                            }
+                                            if ui.small_button("🗑").clicked() {
+                                                pending_delete = Some(*idx);
+                                            }
+                                        });
+                                    });
+                                }
+                            });
+
+                        if let Some(idx) = pending_delete {
+                            self.delete_session_by_index(idx);
+                        } else if let Some(idx) = pending_select {
+                            self.current_session_idx = Some(idx);
+                            if self
+                                .sessions
+                                .get(idx)
+                                .map(|s| s.messages.is_empty())
+                                .unwrap_or(false)
+                            {
+                                self.load_session_messages(idx);
                             }
-                        });
+                        }
                     });
 
                     ui.separator();
@@ -5065,6 +5093,8 @@ impl eframe::App for ChatApp {
             .title_bar(true)
             .resizable(true)
             .default_size(Vec2::new(360.0, 220.0))
+            .min_size(Vec2::new(300.0, 180.0))
+            .max_size(Vec2::new(700.0, 380.0))
             .default_pos(egui::pos2(290.0, 96.0))
             .frame(
                 egui::Frame::new()
