@@ -52,6 +52,7 @@ const STATUS_ERROR: Color32 = Color32::from_rgb(0xEF, 0x53, 0x50);
 const CUSTOM_MODEL_INPUT_RESERVED_WIDTH: f32 = 132.0;
 const DELETE_CHAT_BUTTON_WIDTH: f32 = 36.0;
 const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
+const CONVERSATIONS_LIST_MAX_HEIGHT_RATIO: f32 = 0.32;
 const TERMINAL_INPUT_RESERVED_WIDTH: f32 = 260.0;
 const EVENT_CHANNEL_CAPACITY: usize = 1024;
 const WORKFLOW_STEP_DETAIL_MAX_CHARS: usize = 1200;
@@ -4568,7 +4569,9 @@ impl eframe::App for ChatApp {
 
                     ui.separator();
                     ui.collapsing("Conversations", |ui| {
-                        let list_max_height = (ui.available_height() * 0.32).max(200.0);
+                        let list_max_height =
+                            (ui.available_height() * CONVERSATIONS_LIST_MAX_HEIGHT_RATIO)
+                                .max(200.0);
                         let sessions_snapshot: Vec<(usize, String, String, bool)> = self
                             .sessions
                             .iter()
