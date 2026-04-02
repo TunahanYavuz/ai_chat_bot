@@ -12,6 +12,8 @@ mod swarm;
 mod telemetry;
 mod web_engine;
 mod models;
+mod mcp_client;
+mod screen_awareness;
 mod watcher;
 
 use std::sync::Arc;
