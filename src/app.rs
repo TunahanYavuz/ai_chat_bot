@@ -1,8 +1,9 @@
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use egui::text::LayoutJob;
-use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, TextFormat, Vec2};
+use egui::{Color32, FontDefinitions, FontFamily, FontId, RichText, ScrollArea, TextEdit, TextFormat, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use egui_twemoji::EmojiLabel;
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,10 @@ use crate::telemetry::collect_telemetry_cached;
 use crate::watcher::run_workspace_watcher;
 use qdrant_client::Qdrant;
 
+fn show_emojis<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    add_contents(ui)
+}
+
 const BG_PRIMARY: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
 const BG_SURFACE: Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);
 const BG_SURFACE_ALT: Color32 = Color32::from_rgb(0x36, 0x36, 0x36);
@@ -48,8 +53,6 @@ const GOLD_DARK: Color32 = Color32::from_rgb(0x7A, 0x7A, 0x7A);
 const WHITE: Color32 = TEXT_PRIMARY;
 const DARK_TEXT: Color32 = TEXT_DARK;
 const LIGHT_TEXT: Color32 = TEXT_PRIMARY;
-const STATUS_SUCCESS: Color32 = Color32::from_rgb(0x66, 0xBB, 0x6A);
-const STATUS_ERROR: Color32 = Color32::from_rgb(0xEF, 0x53, 0x50);
 const CUSTOM_MODEL_INPUT_RESERVED_WIDTH: f32 = 132.0;
 const DELETE_CHAT_BUTTON_WIDTH: f32 = 36.0;
 const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
@@ -508,6 +511,25 @@ pub struct ChatApp {
 }
 
 impl ChatApp {
+    fn init_emoji_support(ctx: &egui::Context) {
+        egui_extras::install_image_loaders(ctx);
+
+        let mut fonts = FontDefinitions::default();
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            if let Some(chain) = fonts.families.get_mut(&family) {
+                if let Some(emoji_idx) = chain.iter().position(|name| name == "emoji-icon-font") {
+                    let emoji = chain.remove(emoji_idx);
+                    chain.push(emoji);
+                }
+                if let Some(noto_idx) = chain.iter().position(|name| name == "NotoEmoji-Regular") {
+                    let noto = chain.remove(noto_idx);
+                    chain.push(noto);
+                }
+            }
+        }
+        ctx.set_fonts(fonts);
+    }
+
     fn ingest_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
         if dropped_files.is_empty() {
@@ -712,8 +734,6 @@ impl ChatApp {
         request_refresh: &mut bool,
     ) {
         let is_dir = node.is_dir;
-        let node_marker = if is_dir { "[D]" } else { "[F]" };
-        let label = format!("{node_marker} {}", node.name);
 
         if is_dir {
             let expanded_now = self
@@ -723,19 +743,23 @@ impl ChatApp {
                 .unwrap_or(false);
             let chevron = if expanded_now { "▾" } else { "▸" };
             let mut toggle = false;
-            ui.horizontal(|ui| {
-                if ui
-                    .add(egui::Button::new(chevron).frame(false))
-                    .clicked()
-                {
-                    toggle = true;
-                }
-                let resp = ui.selectable_label(false, RichText::new(label).color(TEXT_PRIMARY));
-                resp.context_menu(|ui| {
-                    if ui.button("Refresh").clicked() {
-                        *request_refresh = true;
-                        ui.close_menu();
+            show_emojis(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new(chevron).frame(false))
+                        .clicked()
+                    {
+                        toggle = true;
                     }
+                    EmojiLabel::new("📁").show(ui);
+                    let resp =
+                        ui.selectable_label(false, RichText::new(&node.name).color(TEXT_PRIMARY));
+                    resp.context_menu(|ui| {
+                        if ui.button("Refresh").clicked() {
+                            *request_refresh = true;
+                            ui.close_menu();
+                        }
+                    });
                 });
             });
             if toggle {
@@ -761,10 +785,16 @@ impl ChatApp {
         }
 
         let selected = self.active_open_file.as_deref() == Some(node.path.as_str());
-        let resp = ui.selectable_label(
-            selected,
-            RichText::new(label).color(if selected { GOLD } else { TEXT_PRIMARY }),
-        );
+        let resp = show_emojis(ui, |ui| {
+            ui.horizontal(|ui| {
+                EmojiLabel::new("📄").show(ui);
+                ui.selectable_label(
+                    selected,
+                    RichText::new(&node.name).color(if selected { GOLD } else { TEXT_PRIMARY }),
+                )
+            })
+            .inner
+        });
         if resp.double_clicked() {
             self.spawn_workspace_file_open(node.path.clone());
         }
@@ -873,12 +903,13 @@ impl ChatApp {
     }
 
     fn render_workflow_visualizer(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::new()
-            .fill(Color32::from_rgba_unmultiplied(0x22, 0x24, 0x2A, 0xB8))
-            .corner_radius(8.0)
-            .stroke(egui::Stroke::new(1.0, BG_SURFACE_ALT))
-            .inner_margin(egui::Margin::same(10))
-            .show(ui, |ui| {
+        show_emojis(ui, |ui| {
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(0x22, 0x24, 0x2A, 0xB8))
+                .corner_radius(8.0)
+                .stroke(egui::Stroke::new(1.0, BG_SURFACE_ALT))
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("Swarm Workflow")
@@ -890,7 +921,7 @@ impl ChatApp {
                     if !self.active_requests.is_empty() {
                         ui.spinner();
                     }
-                    ui.label(RichText::new(&self.swarm_status).small().color(TEXT_MUTED));
+                    EmojiLabel::new(&self.swarm_status).show(ui);
                 });
                 ui.add_space(8.0);
 
@@ -933,10 +964,10 @@ impl ChatApp {
                             match step_status {
                                 WorkflowStepStatus::Running => ui.spinner(),
                                 WorkflowStepStatus::Success => {
-                                    ui.label(RichText::new("✅").color(STATUS_SUCCESS))
+                                    EmojiLabel::new("✅").show(ui)
                                 }
                                 WorkflowStepStatus::Failed => {
-                                    ui.label(RichText::new("❌").color(STATUS_ERROR))
+                                    EmojiLabel::new("❌").show(ui)
                                 }
                             };
 
@@ -960,7 +991,8 @@ impl ChatApp {
                         ui.add_space(4.0);
                     }
                 });
-            });
+                });
+        });
     }
 
     fn clean_copy_text(content: &str) -> String {
@@ -1804,6 +1836,7 @@ impl ChatApp {
 
     pub fn new(cc: &eframe::CreationContext, rt: Arc<tokio::runtime::Runtime>) -> Self {
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        Self::init_emoji_support(&cc.egui_ctx);
         let settings = load_settings();
         let db_path = settings.db_path.clone();
         Self::apply_theme(&cc.egui_ctx, settings.dark_mode);
@@ -4060,13 +4093,14 @@ impl ChatApp {
         let width = ui.available_width();
         let max_bubble = (width * 0.75).min(700.0);
 
-        ui.with_layout(
-            if is_user {
-                egui::Layout::right_to_left(egui::Align::TOP)
-            } else {
-                egui::Layout::left_to_right(egui::Align::TOP)
-            },
-            |ui| {
+        show_emojis(ui, |ui| {
+            ui.with_layout(
+                if is_user {
+                    egui::Layout::right_to_left(egui::Align::TOP)
+                } else {
+                    egui::Layout::left_to_right(egui::Align::TOP)
+                },
+                |ui| {
                 ui.set_max_width(max_bubble);
 
                 let (bg_color, text_color) = if is_user {
@@ -4125,25 +4159,27 @@ impl ChatApp {
                             for att in &msg.attachments {
                                 ui.separator();
                                 if att.image_base64.is_some() {
-                                    if ui
-                                        .button(
-                                            RichText::new(format!(
-                                                "🖼 {} (click to download)",
-                                                att.filename
-                                            ))
-                                            .color(SKY_BLUE)
-                                            .small(),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.download_image(att);
-                                    }
+                                    ui.horizontal(|ui| {
+                                        EmojiLabel::new("🖼").show(ui);
+                                        if ui
+                                            .button(
+                                                RichText::new(format!(
+                                                    "{} (click to download)",
+                                                    att.filename
+                                                ))
+                                                .color(SKY_BLUE)
+                                                .small(),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.download_image(att);
+                                        }
+                                    });
                                 } else {
-                                    ui.label(
-                                        RichText::new(format!("📄 {}", att.filename))
-                                            .color(SKY_BLUE)
-                                            .small(),
-                                    );
+                                    ui.horizontal(|ui| {
+                                        EmojiLabel::new("📄").show(ui);
+                                        ui.label(RichText::new(&att.filename).color(SKY_BLUE).small());
+                                    });
                                 }
                             }
 
@@ -4158,8 +4194,9 @@ impl ChatApp {
                             });
                         });
                     });
-            },
-        );
+                },
+            );
+        });
     }
 }
 
@@ -5331,25 +5368,28 @@ impl eframe::App for ChatApp {
                     .show(ui, |ui| {
                         ui.group(|ui| {
                             ui.horizontal(|ui| {
-                                ui.label(RichText::new("🧠 Vision Staging").color(GOLD).strong());
+                                EmojiLabel::new("🧠").show(ui);
+                                ui.label(RichText::new("Vision Staging").color(GOLD).strong());
                                 if ui
                                     .add_enabled(
                                         !self.vision_staging.undo_stack.is_empty(),
-                                        egui::Button::new("↩️ Undo (Ctrl+Z)"),
+                                        egui::Button::new("Undo (Ctrl+Z)"),
                                     )
                                     .clicked()
                                 {
                                     self.undo_staged_delete();
                                 }
+                                EmojiLabel::new("↩️").show(ui);
                                 if ui
                                     .add_enabled(
                                         !self.vision_staging.images.is_empty(),
-                                        egui::Button::new("🚀 Send to Swarm"),
+                                        egui::Button::new("Send to Swarm"),
                                     )
                                     .clicked()
                                 {
                                     self.send_staged_images_to_swarm();
                                 }
+                                EmojiLabel::new("🚀").show(ui);
                             });
                             if self.vision_staging.images.is_empty() {
                                 ui.label(
@@ -5398,9 +5438,12 @@ impl eframe::App for ChatApp {
                                                             .small()
                                                             .color(SKY_BLUE),
                                                     );
-                                                    if ui.small_button("🗑️ Delete").clicked() {
-                                                        pending_delete_idx = Some(idx);
-                                                    }
+                                                    ui.horizontal(|ui| {
+                                                        EmojiLabel::new("🗑️").show(ui);
+                                                        if ui.small_button("Delete").clicked() {
+                                                            pending_delete_idx = Some(idx);
+                                                        }
+                                                    });
                                                 });
                                             }
                                         });
