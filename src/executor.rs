@@ -19,6 +19,7 @@ use crate::{
 };
 
 const EMPTY_COMMAND_SUCCESS_MSG: &str = "[System: Command executed successfully with no output]";
+pub const MAX_SELF_HEAL_RETRY_LIMIT: usize = 3;
 const SUPPORTED_DOCUMENT_FORMATS: [&str; 2] = ["pdf", "docx"];
 const TERMINAL_ACTION_TIMEOUT_SECS: u64 = 90;
 const FILE_ACTION_TIMEOUT_SECS: u64 = 15;
@@ -668,7 +669,7 @@ impl ActionExecutor {
     }
 
     async fn execute_command(&self, cmd: &str) -> Result<ExecutionReport> {
-        let normalized_cmd = self.normalize_generated_script_command(cmd);
+        let normalized_cmd = self.normalize_command_for_safe_execution(cmd);
         let mut command = if cfg!(target_os = "windows") {
             let mut c = Command::new("cmd");
             c.args(["/C", &normalized_cmd]);
@@ -749,7 +750,7 @@ impl ActionExecutor {
     where
         F: FnMut(bool, String) + Send + 'static,
     {
-        let normalized_cmd = self.normalize_generated_script_command(cmd);
+        let normalized_cmd = self.normalize_command_for_safe_execution(cmd);
         let mut command = if cfg!(target_os = "windows") {
             let mut c = Command::new("cmd");
             c.args(["/C", &normalized_cmd]);
@@ -942,6 +943,11 @@ impl ActionExecutor {
         self.workspace_root.join(bucket).join(normalized)
     }
 
+    fn normalize_command_for_safe_execution(&self, cmd: &str) -> String {
+        let maybe_non_interactive = make_install_command_non_interactive(cmd);
+        self.normalize_generated_script_command(&maybe_non_interactive)
+    }
+
     fn normalize_generated_script_command(&self, cmd: &str) -> String {
         let trimmed = cmd.trim();
         if trimmed.is_empty() {
@@ -1087,6 +1093,75 @@ fn should_skip_timeout_for_ui_app(cmd: &str) -> bool {
         "npm run dev",
     ];
     ui_indicators.iter().any(|pat| normalized.contains(pat))
+}
+
+fn make_install_command_non_interactive(cmd: &str) -> String {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+
+    if is_pacman_install_command(trimmed) {
+        let mut rebuilt = trimmed.to_string();
+        if !contains_flag(trimmed, "--noconfirm") {
+            rebuilt.push_str(" --noconfirm");
+        }
+        if !contains_flag(trimmed, "--needed") {
+            rebuilt.push_str(" --needed");
+        }
+        return rebuilt;
+    }
+
+    if (lower.contains("apt-get install")
+        || lower.contains("apt install")
+        || lower.contains("dnf install")
+        || lower.contains("yum install")
+        || lower.contains("zypper install"))
+        && !contains_flag(trimmed, "-y")
+        && !contains_flag(trimmed, "--yes")
+    {
+        return format!("{trimmed} -y");
+    }
+
+    if lower.starts_with("npx ") && !contains_flag(trimmed, "--yes") {
+        return format!("{trimmed} --yes");
+    }
+
+    trimmed.to_string()
+}
+
+fn contains_flag(cmd: &str, flag: &str) -> bool {
+    cmd.split_whitespace().any(|part| part == flag)
+}
+
+fn is_pacman_install_command(cmd: &str) -> bool {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.is_empty() {
+        return false;
+    }
+    let idx = if parts[0] == "sudo" {
+        if parts.len() < 2 {
+            return false;
+        }
+        1
+    } else {
+        0
+    };
+    let has_pacman_bin = parts.get(idx).is_some_and(|p| *p == "pacman");
+    let has_sync_flag = parts
+        .iter()
+        .skip(idx + 1)
+        .any(|arg| arg.eq_ignore_ascii_case("--sync") || is_pacman_short_sync_flag(arg));
+    has_pacman_bin && has_sync_flag
+}
+
+fn is_pacman_short_sync_flag(arg: &str) -> bool {
+    if !arg.starts_with("-S") {
+        return false;
+    }
+    // Exclude query/list flags that are not install/upgrade operations.
+    !(arg.starts_with("-Ss") || arg.starts_with("-Si") || arg.starts_with("-Sl"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1286,6 +1361,64 @@ fn build_minimal_pdf(title: &str, content: &str) -> Vec<u8> {
     pdf.push_str(&format!("startxref\n{}\n%%EOF\n", xref_start));
 
     pdf.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_pacman_install_command, make_install_command_non_interactive};
+
+    #[test]
+    fn keeps_empty_command_unchanged() {
+        assert_eq!(make_install_command_non_interactive("   "), "");
+    }
+
+    #[test]
+    fn appends_pacman_noninteractive_flags() {
+        let cmd = "sudo pacman -S pandoc";
+        let normalized = make_install_command_non_interactive(cmd);
+        assert!(normalized.contains("--noconfirm"));
+        assert!(normalized.contains("--needed"));
+    }
+
+    #[test]
+    fn preserves_existing_pacman_flags() {
+        let cmd = "pacman -S --noconfirm --needed nodejs";
+        let normalized = make_install_command_non_interactive(cmd);
+        assert_eq!(normalized, cmd);
+    }
+
+    #[test]
+    fn appends_apt_yes_flag() {
+        let cmd = "sudo apt-get install ripgrep";
+        assert_eq!(
+            make_install_command_non_interactive(cmd),
+            "sudo apt-get install ripgrep -y"
+        );
+    }
+
+    #[test]
+    fn appends_npx_yes_flag() {
+        let cmd = "npx @modelcontextprotocol/server-everything";
+        assert_eq!(
+            make_install_command_non_interactive(cmd),
+            "npx @modelcontextprotocol/server-everything --yes"
+        );
+    }
+
+    #[test]
+    fn does_not_duplicate_npx_yes_flag() {
+        let cmd = "npx --yes @modelcontextprotocol/server-everything";
+        assert_eq!(make_install_command_non_interactive(cmd), cmd);
+    }
+
+    #[test]
+    fn pacman_install_detection_supports_common_forms() {
+        assert!(is_pacman_install_command("pacman -S pandoc"));
+        assert!(is_pacman_install_command("sudo pacman -Syu"));
+        assert!(is_pacman_install_command("pacman --sync python"));
+        assert!(!is_pacman_install_command("pacman -Ss pandoc"));
+        assert!(!is_pacman_install_command("pacman -h"));
+    }
 }
 
 fn escape_pdf_text(input: &str) -> String {
