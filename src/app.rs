@@ -97,6 +97,7 @@ You can output the following actions inside the JSON array:
 - "create_pdf": Generates a PDF file. (Requires: 'path', 'title', 'content')
 - "generate_document": Generates a PDF or DOCX from markdown. (Requires: 'format' [pdf/docx], 'path', 'markdown_content')
 - "run_cmd": Executes a terminal command. (Requires: 'command')
+- "run_and_observe": Starts app/server in background, waits, then captures screen. (Requires: 'command', Optional: 'delay_secs', 'target')
 - "capture_screen": Captures focused window or monitor screenshot for visual debugging. (Optional: 'target' like 'focused_window', 'primary_monitor', 'window:Terminal')
 - "mcp_connect": Connects to an MCP server process over stdio. (Requires: 'server_id', 'mcp_command', Optional: 'mcp_args')
 - "mcp_list_tools": Lists tools exposed by a connected MCP server. (Requires: 'server_id')
@@ -167,6 +168,10 @@ pub enum AppEvent {
         file_path: String,
         error: Option<String>,
     },
+    VisionStaged {
+        request_id: String,
+        image: ImageData,
+    },
     DbError(String),
     SwarmStatus {
         request_id: String,
@@ -218,6 +223,23 @@ pub struct Attachment {
     pub image_base64: Option<String>,
     pub mime_type: String,
     pub raw_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageData {
+    id: String,
+    filename: String,
+    png_bytes: Vec<u8>,
+    mime_type: String,
+    source: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VisionStaging {
+    images: Vec<ImageData>,
+    undo_stack: Vec<ImageData>,
 }
 
 #[derive(Debug, Clone)]
@@ -434,6 +456,8 @@ pub struct ChatApp {
 
     input_text: String,
     pending_attachments: Vec<Attachment>,
+    vision_staging: VisionStaging,
+    vision_thumbnail_cache: HashMap<String, egui::TextureHandle>,
 
     event_tx: tokio::sync::mpsc::Sender<AppEvent>,
     event_rx: tokio::sync::mpsc::Receiver<AppEvent>,
@@ -1301,6 +1325,7 @@ impl ChatApp {
                 crate::parser::ActionKind::SearchWeb
                 | crate::parser::ActionKind::ReadUrl
                 | crate::parser::ActionKind::CaptureScreen
+                | crate::parser::ActionKind::RunAndObserve
                 | crate::parser::ActionKind::McpConnect
                 | crate::parser::ActionKind::McpListTools
                 | crate::parser::ActionKind::McpCallTool
@@ -1817,6 +1842,8 @@ impl ChatApp {
             execution_policy: ExecutionPolicy::Manual,
             input_text: String::new(),
             pending_attachments: vec![],
+            vision_staging: VisionStaging::default(),
+            vision_thumbnail_cache: HashMap::new(),
             event_tx,
             event_rx,
             tokio_rt: rt,
@@ -2367,17 +2394,22 @@ impl ChatApp {
                         AgentRole::CodeArchitect => !matches!(
                             a.action,
                             ActionKind::RunCmd
+                                | ActionKind::RunAndObserve
                                 | ActionKind::McpConnect
                                 | ActionKind::McpListTools
                                 | ActionKind::McpCallTool
                                 | ActionKind::McpDisconnect
                         ),
-                        AgentRole::SystemAdmin => !matches!(a.action, ActionKind::RunCmd) || shell_enabled,
+                        AgentRole::SystemAdmin => {
+                            !matches!(a.action, ActionKind::RunCmd | ActionKind::RunAndObserve)
+                                || shell_enabled
+                        }
                         AgentRole::WebResearcher => matches!(
                             a.action,
                             ActionKind::SearchWeb
                                 | ActionKind::ReadUrl
                                 | ActionKind::CaptureScreen
+                                | ActionKind::RunAndObserve
                                 | ActionKind::McpConnect
                                 | ActionKind::McpListTools
                                 | ActionKind::McpCallTool
@@ -2398,6 +2430,12 @@ impl ChatApp {
                         ActionKind::CaptureScreen if !screen_awareness_enabled => {
                             swarm_memory.push_str(
                                 "\n[Screen Awareness blocked]\ncapture_screen ignored because Screen Awareness is disabled in settings.\n",
+                            );
+                            None
+                        }
+                        ActionKind::RunAndObserve if !screen_awareness_enabled => {
+                            swarm_memory.push_str(
+                                "\n[Screen Awareness blocked]\nrun_and_observe ignored because Screen Awareness is disabled in settings.\n",
                             );
                             None
                         }
@@ -2510,6 +2548,26 @@ impl ChatApp {
                             auto_approve_enabled = next_auto_approve_state;
                             match status {
                                 ExecutionStatus::Executed(report) => {
+                                    if let Some(png_bytes) = report.screenshot_png_bytes.clone() {
+                                        let image = ImageData {
+                                            id: Uuid::new_v4().to_string(),
+                                            filename: crate::screen_awareness::default_filename(),
+                                            png_bytes,
+                                            mime_type: "image/png".to_string(),
+                                            source: report
+                                                .screenshot_source
+                                                .clone()
+                                                .unwrap_or_else(|| "focused_window".to_string()),
+                                            width: report.screenshot_width.unwrap_or(0),
+                                            height: report.screenshot_height.unwrap_or(0),
+                                        };
+                                        let _ = event_tx
+                                            .send(AppEvent::VisionStaged {
+                                                request_id: req_id.clone(),
+                                                image,
+                                            })
+                                            .await;
+                                    }
                                     let _ = event_tx
                                         .send(AppEvent::SwarmWorkflowStep {
                                             request_id: req_id.clone(),
@@ -3173,6 +3231,72 @@ impl ChatApp {
         self.dispatch_agent_requests(session_idx);
     }
 
+    fn stage_image(&mut self, image: ImageData) {
+        self.vision_staging.images.push(image);
+    }
+
+    fn delete_staged_image(&mut self, index: usize) {
+        if index < self.vision_staging.images.len() {
+            let removed = self.vision_staging.images.remove(index);
+            self.vision_thumbnail_cache.remove(&removed.id);
+            self.vision_staging.undo_stack.push(removed);
+        }
+    }
+
+    fn undo_staged_delete(&mut self) {
+        if let Some(image) = self.vision_staging.undo_stack.pop() {
+            self.vision_staging.images.push(image);
+        }
+    }
+
+    fn send_staged_images_to_swarm(&mut self) {
+        if self.vision_staging.images.is_empty() {
+            self.notify("Vision staging is empty", NotificationKind::Info);
+            return;
+        }
+        if self.input_text.trim().is_empty() {
+            self.notify(
+                "Add a message before sending staged screenshots to Swarm",
+                NotificationKind::Error,
+            );
+            return;
+        }
+
+        let staged = std::mem::take(&mut self.vision_staging.images);
+        self.vision_staging.undo_stack.clear();
+        self.vision_thumbnail_cache.clear();
+        for img in staged {
+            self.pending_attachments.push(Attachment {
+                filename: img.filename,
+                text: None,
+                image_base64: Some(general_purpose::STANDARD.encode(&img.png_bytes)),
+                mime_type: img.mime_type,
+                raw_bytes: img.png_bytes,
+            });
+        }
+        self.send_message();
+    }
+
+    fn staging_texture<'a>(
+        &'a mut self,
+        ctx: &egui::Context,
+        image: &ImageData,
+    ) -> Option<&'a egui::TextureHandle> {
+        if !self.vision_thumbnail_cache.contains_key(&image.id) {
+            let rgba = image::load_from_memory(&image.png_bytes).ok()?.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let pixels = rgba.into_raw();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+            let tex = ctx.load_texture(
+                format!("vision_thumb_{}", image.id),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.vision_thumbnail_cache.insert(image.id.clone(), tex);
+        }
+        self.vision_thumbnail_cache.get(&image.id)
+    }
+
     fn process_events(&mut self) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
@@ -3295,6 +3419,11 @@ impl ChatApp {
                 } => {
                     if self.active_requests.contains_key(&request_id) {
                         self.begin_workflow_step(&request_id, title, details);
+                    }
+                }
+                AppEvent::VisionStaged { request_id, image } => {
+                    if self.active_requests.contains_key(&request_id) {
+                        self.stage_image(image);
                     }
                 }
                 AppEvent::ExecutionApprovalRequested {
@@ -4089,6 +4218,27 @@ impl eframe::App for ChatApp {
                                     .unwrap_or(""),
                             );
                         }
+                        ActionKind::RunAndObserve => {
+                            ui.label("Run and observe command:");
+                            ui.monospace(
+                                pending
+                                    .request
+                                    .action
+                                    .parameters
+                                    .command
+                                    .as_deref()
+                                    .unwrap_or(""),
+                            );
+                            ui.label(format!(
+                                "delay_secs={}",
+                                pending
+                                    .request
+                                    .action
+                                    .parameters
+                                    .delay_secs
+                                    .unwrap_or(3)
+                            ));
+                        }
                         ActionKind::EditFile => {
                             let path = pending
                                 .request
@@ -4684,27 +4834,30 @@ impl eframe::App for ChatApp {
                         .inner_margin(egui::Margin::same(8)),
                 )
                 .show(ctx, |ui| {
-                    ui.label(
-                        RichText::new("AI Chat Bot")
-                            .font(FontId::proportional(18.0))
-                            .color(TEXT_PRIMARY)
-                            .strong(),
-                    );
-                    ui.separator();
+                    ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("AI Chat Bot")
+                                    .font(FontId::proportional(18.0))
+                                    .color(TEXT_PRIMARY)
+                                    .strong(),
+                            );
+                            ui.separator();
 
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 32.0],
-                            egui::Button::new(RichText::new("＋ New Chat").color(TEXT_DARK))
-                                .fill(GOLD),
-                        )
-                        .clicked()
-                    {
-                        self.new_session();
-                    }
+                            if ui
+                                .add_sized(
+                                    [ui.available_width(), 32.0],
+                                    egui::Button::new(RichText::new("＋ New Chat").color(TEXT_DARK))
+                                        .fill(GOLD),
+                                )
+                                .clicked()
+                            {
+                                self.new_session();
+                            }
 
-                    ui.separator();
-                    ui.collapsing("Conversations", |ui| {
+                            ui.separator();
+                            ui.collapsing("Conversations", |ui| {
                         let list_max_height =
                             (ui.available_height() * CONVERSATIONS_LIST_MAX_HEIGHT_RATIO)
                                 .max(200.0);
@@ -4948,7 +5101,7 @@ impl eframe::App for ChatApp {
                         );
                         ui.checkbox(
                             &mut self.settings.screen_awareness_enabled,
-                            "Screen Awareness (capture_screen)",
+                            "Screen Awareness (capture_screen, run_and_observe)",
                         );
                         ui.checkbox(&mut self.settings.mcp_enabled, "MCP integration");
                         ui.checkbox(&mut self.settings.dark_mode, "Dark mode");
@@ -5043,6 +5196,7 @@ impl eframe::App for ChatApp {
                             self.notify("Schedules saved.", NotificationKind::Info);
                         }
                     });
+                        });
                 });
         }
 
@@ -5175,6 +5329,92 @@ impl eframe::App for ChatApp {
                     .fill(BURGUNDY_DARK)
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(RichText::new("🧠 Vision Staging").color(GOLD).strong());
+                                if ui
+                                    .add_enabled(
+                                        !self.vision_staging.undo_stack.is_empty(),
+                                        egui::Button::new("↩️ Undo (Ctrl+Z)"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.undo_staged_delete();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !self.vision_staging.images.is_empty(),
+                                        egui::Button::new("🚀 Send to Swarm"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.send_staged_images_to_swarm();
+                                }
+                            });
+                            if self.vision_staging.images.is_empty() {
+                                ui.label(
+                                    RichText::new("No staged screenshots yet.").small().color(TEXT_MUTED),
+                                );
+                            } else {
+                                let mut pending_delete_idx: Option<usize> = None;
+                                ScrollArea::horizontal()
+                                    .auto_shrink([false, false])
+                                    .id_salt("vision_staging_filmstrip")
+                                    .max_height(130.0)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            for idx in 0..self.vision_staging.images.len() {
+                                                let staged = self.vision_staging.images[idx].clone();
+                                                ui.group(|ui| {
+                                                    if let Some(tex) =
+                                                        self.staging_texture(ctx, &staged)
+                                                    {
+                                                        ui.add(
+                                                            egui::Image::new(tex)
+                                                                .fit_to_exact_size(Vec2::new(96.0, 72.0)),
+                                                        );
+                                                    } else {
+                                                        ui.label(
+                                                            RichText::new("Preview unavailable")
+                                                                .small()
+                                                                .color(TEXT_MUTED),
+                                                        );
+                                                    }
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "{}×{}",
+                                                            staged.width, staged.height
+                                                        ))
+                                                        .small()
+                                                        .color(TEXT_MUTED),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(&staged.source)
+                                                            .small()
+                                                            .color(TEXT_MUTED),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(&staged.filename)
+                                                            .small()
+                                                            .color(SKY_BLUE),
+                                                    );
+                                                    if ui.small_button("🗑️ Delete").clicked() {
+                                                        pending_delete_idx = Some(idx);
+                                                    }
+                                                });
+                                            }
+                                        });
+                                    });
+                                if let Some(idx) = pending_delete_idx {
+                                    self.delete_staged_image(idx);
+                                }
+                            }
+                        });
+
+                        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
+                            self.undo_staged_delete();
+                        }
+
                         if !self.pending_attachments.is_empty() {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new("📎 Attachments:").color(GOLD).small());
