@@ -207,6 +207,8 @@ FAILURE HANDLING:
     )
 }
 
+/// Returns the dedicated Synthesizer role prompt used for final swarm output composition.
+/// This keeps Synthesizer policy centralized alongside other role prompts in this module.
 pub fn get_synthesizer_system_prompt() -> String {
     format!(
         r#"You are Synthesizer in a multi-agent swarm.

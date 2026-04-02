@@ -1101,7 +1101,7 @@ fn make_install_command_non_interactive(cmd: &str) -> String {
     }
     let lower = trimmed.to_ascii_lowercase();
 
-    if lower.contains("pacman -s") {
+    if is_pacman_install_command(trimmed) {
         let mut rebuilt = trimmed.to_string();
         if !contains_flag(trimmed, "--noconfirm") {
             rebuilt.push_str(" --noconfirm");
@@ -1123,9 +1123,8 @@ fn make_install_command_non_interactive(cmd: &str) -> String {
         return format!("{trimmed} -y");
     }
 
-    if lower.starts_with("npx ") && !contains_flag(trimmed, "-y") && !contains_flag(trimmed, "--yes")
-    {
-        return format!("{trimmed} -y");
+    if lower.starts_with("npx ") && !contains_flag(trimmed, "--yes") {
+        return format!("{trimmed} --yes");
     }
 
     trimmed.to_string()
@@ -1133,6 +1132,35 @@ fn make_install_command_non_interactive(cmd: &str) -> String {
 
 fn contains_flag(cmd: &str, flag: &str) -> bool {
     cmd.split_whitespace().any(|part| part == flag)
+}
+
+fn is_pacman_install_command(cmd: &str) -> bool {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.is_empty() {
+        return false;
+    }
+    let idx = if parts[0] == "sudo" {
+        if parts.len() < 2 {
+            return false;
+        }
+        1
+    } else {
+        0
+    };
+    let has_pacman_bin = parts.get(idx).is_some_and(|p| *p == "pacman");
+    let has_sync_flag = parts
+        .iter()
+        .skip(idx + 1)
+        .any(|arg| arg.eq_ignore_ascii_case("--sync") || is_pacman_short_sync_flag(arg));
+    has_pacman_bin && has_sync_flag
+}
+
+fn is_pacman_short_sync_flag(arg: &str) -> bool {
+    if !arg.starts_with("-S") {
+        return false;
+    }
+    // Exclude query/list flags that are not install/upgrade operations.
+    !(arg.starts_with("-Ss") || arg.starts_with("-Si") || arg.starts_with("-Sl"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1332,6 +1360,64 @@ fn build_minimal_pdf(title: &str, content: &str) -> Vec<u8> {
     pdf.push_str(&format!("startxref\n{}\n%%EOF\n", xref_start));
 
     pdf.into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_pacman_install_command, make_install_command_non_interactive};
+
+    #[test]
+    fn keeps_empty_command_unchanged() {
+        assert_eq!(make_install_command_non_interactive("   "), "");
+    }
+
+    #[test]
+    fn appends_pacman_noninteractive_flags() {
+        let cmd = "sudo pacman -S pandoc";
+        let normalized = make_install_command_non_interactive(cmd);
+        assert!(normalized.contains("--noconfirm"));
+        assert!(normalized.contains("--needed"));
+    }
+
+    #[test]
+    fn preserves_existing_pacman_flags() {
+        let cmd = "pacman -S --noconfirm --needed nodejs";
+        let normalized = make_install_command_non_interactive(cmd);
+        assert_eq!(normalized, cmd);
+    }
+
+    #[test]
+    fn appends_apt_yes_flag() {
+        let cmd = "sudo apt-get install ripgrep";
+        assert_eq!(
+            make_install_command_non_interactive(cmd),
+            "sudo apt-get install ripgrep -y"
+        );
+    }
+
+    #[test]
+    fn appends_npx_yes_flag() {
+        let cmd = "npx @modelcontextprotocol/server-everything";
+        assert_eq!(
+            make_install_command_non_interactive(cmd),
+            "npx @modelcontextprotocol/server-everything --yes"
+        );
+    }
+
+    #[test]
+    fn does_not_duplicate_npx_yes_flag() {
+        let cmd = "npx --yes @modelcontextprotocol/server-everything";
+        assert_eq!(make_install_command_non_interactive(cmd), cmd);
+    }
+
+    #[test]
+    fn pacman_install_detection_supports_common_forms() {
+        assert!(is_pacman_install_command("pacman -S pandoc"));
+        assert!(is_pacman_install_command("sudo pacman -Syu"));
+        assert!(is_pacman_install_command("pacman --sync python"));
+        assert!(!is_pacman_install_command("pacman -Ss pandoc"));
+        assert!(!is_pacman_install_command("pacman -h"));
+    }
 }
 
 fn escape_pdf_text(input: &str) -> String {

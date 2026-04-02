@@ -5741,46 +5741,6 @@ impl eframe::App for ChatApp {
                         });
                     });
 
-                ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
-                    egui::Frame::new()
-                        .fill(BURGUNDY)
-                        .inner_margin(egui::Margin {
-                            left: 12,
-                            right: 12,
-                            top: 8,
-                            bottom: 4,
-                        })
-                        .show(ui, |ui| {
-                            ScrollArea::vertical()
-                                .id_salt("messages_scroll")
-                                .stick_to_bottom(true)
-                                .show(ui, |ui| {
-                                    if let Some(idx) = self.current_session_idx {
-                                        let msg_count = self
-                                            .sessions
-                                            .get(idx)
-                                            .map(|s| s.messages.len())
-                                            .unwrap_or(0);
-                                        for msg_idx in 0..msg_count {
-                                            let msg = self.sessions[idx].messages[msg_idx].clone();
-                                            self.render_message(ui, &msg);
-                                            ui.add_space(6.0);
-                                        }
-                                    } else {
-                                        ui.centered_and_justified(|ui| {
-                                            ui.label(
-                                                RichText::new(
-                                                    "Select or create a conversation to begin",
-                                                )
-                                                .color(Color32::from_rgb(180, 130, 135))
-                                                .font(FontId::proportional(16.0)),
-                                            );
-                                        });
-                                    }
-                                });
-                        });
-                });
-
                 egui::TopBottomPanel::bottom("chat_input_docked")
                     .resizable(false)
                     .show_inside(ui, |ui| {
@@ -5948,6 +5908,47 @@ impl eframe::App for ChatApp {
                                 });
                             });
                     });
+
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    egui::Frame::new()
+                        .fill(BURGUNDY)
+                        .inner_margin(egui::Margin {
+                            left: 12,
+                            right: 12,
+                            top: 8,
+                            bottom: 4,
+                        })
+                        .show(ui, |ui| {
+                            ScrollArea::vertical()
+                                .id_salt("messages_scroll")
+                                .auto_shrink([false, false])
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    if let Some(idx) = self.current_session_idx {
+                                        let msg_count = self
+                                            .sessions
+                                            .get(idx)
+                                            .map(|s| s.messages.len())
+                                            .unwrap_or(0);
+                                        for msg_idx in 0..msg_count {
+                                            let msg = self.sessions[idx].messages[msg_idx].clone();
+                                            self.render_message(ui, &msg);
+                                            ui.add_space(6.0);
+                                        }
+                                    } else {
+                                        ui.centered_and_justified(|ui| {
+                                            ui.label(
+                                                RichText::new(
+                                                    "Select or create a conversation to begin",
+                                                )
+                                                .color(Color32::from_rgb(180, 130, 135))
+                                                .font(FontId::proportional(16.0)),
+                                            );
+                                        });
+                                    }
+                                });
+                        });
+                });
             });
 
         egui::Window::new("Swarm Workflow")
