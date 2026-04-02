@@ -141,13 +141,30 @@ pub struct Settings {
     pub mcp_launch_command: String,
     #[serde(default)]
     pub mcp_launch_args: Vec<String>,
+    #[serde(default = "default_rag_top_k_limit")]
+    pub rag_top_k_limit: u64,
+    #[serde(default = "default_rag_similarity_threshold")]
+    pub rag_similarity_threshold: f32,
 }
 
 fn default_dark_mode() -> bool {
     true
 }
 
+fn default_rag_top_k_limit() -> u64 {
+    5
+}
+
+fn default_rag_similarity_threshold() -> f32 {
+    0.75
+}
+
 impl Settings {
+    pub fn clamp_rag_settings(&mut self) {
+        self.rag_top_k_limit = self.rag_top_k_limit.clamp(1, 20);
+        self.rag_similarity_threshold = self.rag_similarity_threshold.clamp(0.0, 1.0);
+    }
+
     /// API key for the currently selected provider.
     pub fn active_api_key(&self) -> String {
         if let Some(cfg) = self.provider_configs.get(self.selected_provider.key()) {
@@ -268,6 +285,8 @@ impl Default for Settings {
             mcp_enabled: false,
             mcp_launch_command: "npx".to_string(),
             mcp_launch_args: vec!["-y".to_string(), "@modelcontextprotocol/server-everything".to_string()],
+            rag_top_k_limit: default_rag_top_k_limit(),
+            rag_similarity_threshold: default_rag_similarity_threshold(),
         }
     }
 }

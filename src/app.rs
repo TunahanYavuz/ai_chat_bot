@@ -17,6 +17,7 @@ use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
 use crate::executor::{
     ActionExecutor, ApprovalDecision, ApprovalRequest, ExecutionPolicy, ExecutionStatus,
+    MAX_SELF_HEAL_RETRY_LIMIT,
 };
 use crate::mcp_client::McpManager;
 use crate::models::{
@@ -27,13 +28,25 @@ use crate::parser::ActionKind;
 use crate::rag_engine::{EmbeddingProvider, RagConfig, RagEngine};
 use crate::setup::SetupWizard;
 use crate::storage::{ChatSession, Storage, StoredMessage, StoredQuotaMetrics, StoredRole};
-use crate::swarm::{get_synthesizer_system_prompt, get_system_prompt, parse_router_plan, AgentRole, RoutedTask};
+use crate::swarm::{
+    get_synthesizer_system_prompt, get_system_prompt, host_os_prompt_header, parse_router_plan,
+    AgentRole, RoutedTask,
+};
 use crate::telemetry::collect_telemetry_cached;
+use crate::web_engine::WebEngine;
 use crate::watcher::run_workspace_watcher;
 use qdrant_client::Qdrant;
 
 fn with_emoji_context<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
     add_contents(ui)
+}
+
+fn truncate_for_search(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for ch in input.chars().take(max_chars) {
+        out.push(ch);
+    }
+    out
 }
 
 const BG_PRIMARY: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
@@ -76,6 +89,8 @@ const AUTONOMOUS_TRIGGER_KEYWORDS: [&str; 6] = [
     "her gün",
     "zamanla",
 ];
+const SELF_HEALING_QUERY_MAX_CHARS: usize = 320;
+const SELF_HEALING_DOC_EXCERPT_MAX_CHARS: usize = 1600;
 /// Prepended as the first system prompt for API requests so responses include
 /// a user-facing message plus a machine-readable ```json ... ``` execution block.
 const CORE_OS_SYSTEM_PROMPT: &str = r#"You are 'CoreOS', an advanced local File System and Command Line Interface (CLI) Agent. Your purpose is to assist the user by generating precise, executable commands while maintaining a helpful, conversational tone.
@@ -657,6 +672,7 @@ pub struct ChatApp {
     db_path: String,
     storage: Option<Storage>,
     rag_client: Option<Arc<Qdrant>>,
+    host_os_prompt: String,
     mcp_manager: Arc<McpManager>,
     pending_action: Option<PendingAction>,
     pending_actions_queue: VecDeque<PendingAction>,
@@ -2169,6 +2185,7 @@ impl ChatApp {
             db_path,
             storage,
             rag_client: crate::rag_engine::RagEngine::<OpenAIEmbeddingProvider>::init_shared_qdrant_client(QDRANT_URL).ok(),
+            host_os_prompt: host_os_prompt_header(),
             mcp_manager: Arc::new(McpManager::new()),
             pending_action: None,
             pending_actions_queue: VecDeque::new(),
@@ -2426,6 +2443,10 @@ impl ChatApp {
         let mcp_enabled = self.settings.mcp_enabled;
         let mcp_launch_command = self.settings.mcp_launch_command.clone();
         let mcp_launch_args = self.settings.mcp_launch_args.clone();
+        let host_os_prompt = self.host_os_prompt.clone();
+        self.settings.clamp_rag_settings();
+        let rag_top_k_limit = self.settings.rag_top_k_limit;
+        let rag_similarity_threshold = self.settings.rag_similarity_threshold;
 
         if let Some(session) = self.sessions.get(session_idx) {
             for msg in &session.messages {
@@ -2512,6 +2533,7 @@ impl ChatApp {
             } else {
                 "MCP TOOL REGISTRY:\n- MCP integration is disabled in runtime settings.".to_string()
             };
+            let web_engine = WebEngine::new().ok();
             let _ = event_tx
                 .send(AppEvent::SwarmWorkflowStep {
                     request_id: req_id.clone(),
@@ -2528,8 +2550,10 @@ impl ChatApp {
                     base_url: base_url.clone(),
                     model: "text-embedding-3-small".to_string(),
                 };
-                let rag_cfg = RagConfig::with_workspace(working_dir.clone(), 1536);
-                if let Some(rag_client) = shared_rag_client {
+                let mut rag_cfg = RagConfig::with_workspace(working_dir.clone(), 1536);
+                rag_cfg.top_k = rag_top_k_limit;
+                rag_cfg.similarity_threshold = rag_similarity_threshold;
+                if let Some(rag_client) = shared_rag_client.clone() {
                     if let Ok(engine) = RagEngine::new(rag_cfg, provider, rag_client).await {
                         if let Ok(snippets) = engine.semantic_search(&query).await {
                             rag_context = RagEngine::<OpenAIEmbeddingProvider>::format_repository_context(&snippets);
@@ -2549,7 +2573,7 @@ impl ChatApp {
             let mut router_messages = api_messages.clone();
             let router_prompt = get_system_prompt(&AgentRole::Router);
             let router_system_prompt = format!(
-                "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{mcp_tool_context}\n\n{rag_context}\n\n{router_prompt}\n\nUser request:\n{query}"
+                "{host_os_prompt}\n\n{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{mcp_tool_context}\n\n{rag_context}\n\n{router_prompt}\n\nUser request:\n{query}"
             );
             let _ = event_tx
                 .send(AppEvent::SwarmWorkflowStep {
@@ -2610,8 +2634,9 @@ impl ChatApp {
 
             let mut swarm_memory = String::new();
             let mut final_parts: Vec<String> = Vec::new();
+            let executor_working_dir = working_dir.clone();
             let executor = ActionExecutor::new(
-                working_dir,
+                executor_working_dir,
                 if mcp_enabled {
                     Some(mcp_manager.clone())
                 } else {
@@ -2654,7 +2679,7 @@ impl ChatApp {
                     swarm_memory.clone()
                 };
                 let role_system_prompt = format!(
-                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{mcp_tool_context}\n\n{rag_context}\n\n{role_prompt}\n\nAssigned task:\n{}\n\nSwarm memory:\n{}",
+                    "{host_os_prompt}\n\n{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{mcp_tool_context}\n\n{rag_context}\n\n{role_prompt}\n\nAssigned task:\n{}\n\nSwarm memory:\n{}",
                     step.task, memory_block
                 );
                 role_messages.insert(0, ChatMessage::with_cache_control("system", &role_system_prompt));
@@ -2872,6 +2897,11 @@ impl ChatApp {
 
                 swarm_memory.push_str(&format!("\n[{} execution]\n", role.as_str()));
                 for action in filtered_actions {
+                    let original_command = if matches!(role, AgentRole::SystemAdmin | AgentRole::CodeArchitect) {
+                        action.parameters.command.clone()
+                    } else {
+                        None
+                    };
                     let request_id_for_approval = req_id.clone();
                     let approval_event_tx = event_tx.clone();
                     let approval_waiters = approval_waiters.clone();
@@ -2973,6 +3003,81 @@ impl ChatApp {
                                             "[synthesizer_timeout_hint]\nA command timed out. Analyze partial output, identify root cause, and propose an autonomous retry/fix strategy.\n",
                                         );
                                     }
+                                    let should_self_heal = matches!(role, AgentRole::SystemAdmin | AgentRole::CodeArchitect)
+                                        && report.action == "run_cmd"
+                                        && !report.success
+                                        && report.exit_code != 0
+                                        && !report.stderr.trim().is_empty();
+                                    if should_self_heal {
+                                        for retry_idx in 1..=MAX_SELF_HEAL_RETRY_LIMIT {
+                                            let Some(original_cmd) = original_command.clone() else {
+                                                break;
+                                            };
+                                            let heal_query = truncate_for_search(
+                                                &format!(
+                                                    "Role: {} | Command: {} | Host OS: {} | Arch: {} | Stderr: {} | Task: find updated syntax and official docs.",
+                                                    role.as_str(),
+                                                    original_cmd,
+                                                    std::env::consts::OS,
+                                                    std::env::consts::ARCH,
+                                                    report.stderr
+                                                ),
+                                                SELF_HEALING_QUERY_MAX_CHARS,
+                                            );
+                                            let _ = event_tx
+                                                .send(AppEvent::SwarmWorkflowStep {
+                                                    request_id: req_id.clone(),
+                                                    title: format!("{}: self-heal web search #{retry_idx}", role.as_str()),
+                                                    details: heal_query.clone(),
+                                                })
+                                                .await;
+                                            let (Some(web), Some(rag_client)) =
+                                                (web_engine.as_ref(), shared_rag_client.clone())
+                                            else {
+                                                break;
+                                            };
+                                            let results = match web.search_web(&heal_query).await {
+                                                Ok(r) if !r.is_empty() => r,
+                                                _ => break,
+                                            };
+                                            let doc_url = results[0].url.clone();
+                                            let readback = match web.read_url(&doc_url).await {
+                                                Ok(t) if !t.trim().is_empty() => t,
+                                                _ => break,
+                                            };
+                                            let excerpt = truncate_for_search(
+                                                &readback,
+                                                SELF_HEALING_DOC_EXCERPT_MAX_CHARS,
+                                            );
+                                            let mut learn_cfg = RagConfig::with_workspace(working_dir.clone(), 1536);
+                                            learn_cfg.top_k = rag_top_k_limit;
+                                            learn_cfg.similarity_threshold = rag_similarity_threshold;
+                                            let provider = OpenAIEmbeddingProvider {
+                                                api_key: api_key.clone(),
+                                                base_url: base_url.clone(),
+                                                model: "text-embedding-3-small".to_string(),
+                                            };
+                                            if let Ok(learn_engine) =
+                                                RagEngine::new(learn_cfg, provider, rag_client).await
+                                            {
+                                                let _ = learn_engine
+                                                    .upsert_learning_snippet(
+                                                        &format!("self-heal {} retry {}", role.as_str(), retry_idx),
+                                                        &format!(
+                                                            "query: {}\nsource: {}\ncommand: {}\nstderr: {}\nlearned_doc_excerpt:\n{}",
+                                                            heal_query, doc_url, original_cmd, report.stderr, excerpt
+                                                        ),
+                                                    )
+                                                    .await;
+                                            }
+                                            swarm_memory.push_str(&format!(
+                                                "[self_heal_research]\nretry={retry_idx}\nquery={}\nsource={}\nsummary={}\n",
+                                                heal_query,
+                                                doc_url,
+                                                truncate_for_search(&results[0].snippet, 300)
+                                            ));
+                                        }
+                                    }
                                 }
                                 ExecutionStatus::AuthorizationDenied { action, reason } => {
                                     let _ = event_tx
@@ -3034,7 +3139,7 @@ impl ChatApp {
 
                 let synth_role_prompt = get_synthesizer_system_prompt();
                 let synth_system_prompt = format!(
-                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{rag_context}\n\n{synth_role_prompt}\n\nUser request:\n{query}\n\nSwarm memory:\n{swarm_memory}",
+                    "{host_os_prompt}\n\n{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{rag_context}\n\n{synth_role_prompt}\n\nUser request:\n{query}\n\nSwarm memory:\n{swarm_memory}",
                     swarm_memory = swarm_memory
                 );
                 let mut synth_messages = api_messages.clone();
@@ -5183,11 +5288,29 @@ impl eframe::App for ChatApp {
                                     .collect();
                             }
                             ui.end_row();
+
+                            ui.label("RAG Top-K Limit:");
+                            ui.add(
+                                egui::Slider::new(&mut self.settings.rag_top_k_limit, 1..=20)
+                                    .text("Top-K"),
+                            );
+                            ui.end_row();
+
+                            ui.label("RAG Similarity Threshold:");
+                            ui.add(
+                                egui::Slider::new(
+                                    &mut self.settings.rag_similarity_threshold,
+                                    0.0..=1.0,
+                                )
+                                .text("Threshold"),
+                            );
+                            ui.end_row();
                         });
 
                     ui.separator();
                     ui.horizontal(|ui| {
                         if ui.button("Save").clicked() {
+                            self.settings.clamp_rag_settings();
                             self.settings.set_provider_config(
                                 &selected_provider,
                                 &self.settings.get_provider_api_key(&selected_provider),

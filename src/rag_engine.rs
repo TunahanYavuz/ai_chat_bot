@@ -24,6 +24,7 @@ pub struct RagConfig {
     pub chunk_size_chars: usize,
     pub chunk_overlap_chars: usize,
     pub top_k: u64,
+    pub similarity_threshold: f32,
 }
 
 impl RagConfig {
@@ -36,7 +37,8 @@ impl RagConfig {
             embedding_size,
             chunk_size_chars: 1200,
             chunk_overlap_chars: 150,
-            top_k: 3,
+            top_k: 5,
+            similarity_threshold: 0.75,
         }
     }
 }
@@ -272,6 +274,7 @@ where
         let snippets = response
             .result
             .into_iter()
+            .filter(|point| point.score >= self.config.similarity_threshold)
             .map(|point| {
                 let file_path = point
                     .payload
@@ -301,6 +304,42 @@ where
             out.push_str(&format!("{}. {}\n\n", idx + 1, snippet));
         }
         out.trim_end().to_string()
+    }
+
+    /// Stores one self-healing learning snippet into Qdrant for future retrieval.
+    pub async fn upsert_learning_snippet(&self, title: &str, content: &str) -> Result<()> {
+        let title = title.trim();
+        let content = content.trim();
+        if content.is_empty() {
+            return Ok(());
+        }
+        let packed = format!("{title}\n{content}");
+        let vector = self
+            .embedder
+            .embed(&packed)
+            .await
+            .context("failed to embed learning snippet")?;
+        let mut payload = std::collections::HashMap::new();
+        payload.insert("file_path".to_string(), Value::from(format!("[learned] {title}")));
+        payload.insert("snippet".to_string(), Value::from(content.to_string()));
+        self.client
+            .upsert_points(UpsertPoints {
+                collection_name: self.config.collection_name.clone(),
+                wait: Some(true),
+                points: vec![PointStruct::new(
+                    deterministic_chunk_id("[learned]", 0, &packed),
+                    vector,
+                    payload,
+                )],
+                ordering: None,
+                shard_key_selector: None,
+                update_filter: None,
+                timeout: None,
+                update_mode: None,
+            })
+            .await
+            .context("failed to upsert learning snippet into qdrant")?;
+        Ok(())
     }
 
     async fn ensure_collection(&self) -> Result<()> {

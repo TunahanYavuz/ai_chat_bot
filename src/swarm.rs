@@ -58,6 +58,23 @@ const DEPENDENCY_AWARENESS_PROTOCOL: &str = r#"DEPENDENCY AWARENESS PROTOCOL:
 - Re-verify after installation and only then run the primary task command.
 - Keep install commands non-interactive."#;
 
+const SELF_HEALING_PROTOCOL: &str = r#"AUTONOMOUS SELF-HEALING PROTOCOL:
+- If command execution fails with non-zero exit code and useful stderr/stdout evidence, do not give up immediately.
+- For syntax/doc drift or unknown-flag/tool-usage failures, emit autonomous web-research actions:
+  1) search_web using the failing tool + exact error text,
+  2) read_url for authoritative docs/changelog pages,
+  3) update the fix plan, then retry with corrected command.
+- Keep retries bounded and safe; prefer minimal command changes.
+- Persist learned syntax guidance via RAG memory when available."#;
+
+pub fn host_os_prompt_header() -> String {
+    format!(
+        "Host OS: {}, Arch: {}\nYou must tailor all terminal commands, package manager invocations (apt, pacman, brew, winget), and file path formats (slashes vs backslashes) strictly to this Host OS.",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRole {
     Router,
@@ -203,7 +220,7 @@ FAILURE HANDLING:
             .to_string(),
     };
     format!(
-        "{base}\n\n{UNIVERSAL_NLU_PROTOCOL}\n\n{STRICT_JSON_ACTION_SCHEMA}\n\n{ERROR_RECOVERY_PROTOCOL}\n\n{SECURITY_GUARDRAILS_PROTOCOL}\n\n{DEPENDENCY_AWARENESS_PROTOCOL}\n\n{VISUAL_QA_PROTOCOL}\n\n{WEB_SYNTHESIS_PROTOCOL}\n\n{MCP_PROTOCOL}\n\n{DIRECTORY_ENFORCEMENT_PROTOCOL}"
+        "{base}\n\n{UNIVERSAL_NLU_PROTOCOL}\n\n{STRICT_JSON_ACTION_SCHEMA}\n\n{ERROR_RECOVERY_PROTOCOL}\n\n{SECURITY_GUARDRAILS_PROTOCOL}\n\n{DEPENDENCY_AWARENESS_PROTOCOL}\n\n{SELF_HEALING_PROTOCOL}\n\n{VISUAL_QA_PROTOCOL}\n\n{WEB_SYNTHESIS_PROTOCOL}\n\n{MCP_PROTOCOL}\n\n{DIRECTORY_ENFORCEMENT_PROTOCOL}"
     )
 }
 
@@ -235,6 +252,10 @@ RULES:
 {ERROR_RECOVERY_PROTOCOL}
 
 {SECURITY_GUARDRAILS_PROTOCOL}
+
+{DEPENDENCY_AWARENESS_PROTOCOL}
+
+{SELF_HEALING_PROTOCOL}
 
 {VISUAL_QA_PROTOCOL}
 

@@ -19,6 +19,7 @@ use crate::{
 };
 
 const EMPTY_COMMAND_SUCCESS_MSG: &str = "[System: Command executed successfully with no output]";
+pub const MAX_SELF_HEAL_RETRY_LIMIT: usize = 3;
 const SUPPORTED_DOCUMENT_FORMATS: [&str; 2] = ["pdf", "docx"];
 const TERMINAL_ACTION_TIMEOUT_SECS: u64 = 90;
 const FILE_ACTION_TIMEOUT_SECS: u64 = 15;
