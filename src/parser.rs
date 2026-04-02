@@ -41,6 +41,11 @@ pub enum ActionKind {
     RunCmd,
     SearchWeb,
     ReadUrl,
+    CaptureScreen,
+    McpConnect,
+    McpListTools,
+    McpCallTool,
+    McpDisconnect,
 }
 
 /// Unified parameter bag for all supported actions with strict unknown-field handling.
@@ -56,6 +61,12 @@ pub struct CommandParams {
     pub command: Option<String>,
     pub query: Option<String>,
     pub url: Option<String>,
+    pub target: Option<String>,
+    pub server_id: Option<String>,
+    pub mcp_command: Option<String>,
+    pub mcp_args: Option<Vec<String>>,
+    pub tool: Option<String>,
+    pub arguments: Option<serde_json::Value>,
 }
 
 /// Parses a model response that may contain MESSAGE, PLAN, and fenced JSON actions.
@@ -90,7 +101,7 @@ pub fn parse_response(raw: &str) -> ParsedResponse {
 }
 
 pub fn parser_self_correction_feedback() -> &'static str {
-    "[System Error]: Action parser failed. You outputted an invalid key. Remember, you must strictly use valid action keys like 'create_file', 'edit_file', 'generate_document', 'run_cmd', 'search_web', or 'read_url'. Please correct your JSON and try again."
+    "[System Error]: Action parser failed. You outputted an invalid key. Remember, you must strictly use valid action keys like 'create_file', 'edit_file', 'generate_document', 'run_cmd', 'search_web', 'read_url', 'capture_screen', 'mcp_connect', 'mcp_list_tools', 'mcp_call_tool', or 'mcp_disconnect'. Please correct your JSON and try again."
 }
 
 fn extract_message_and_plan(text: &str) -> (Option<String>, Vec<String>) {

@@ -34,3 +34,7 @@ directories = "5"
 arboard = "3"
 notify = "8"
 tokio-stream = "0.1"
+rust-mcp-sdk = { version = "0.9.0", default-features = false, features = ["client", "stdio"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+screenshots = "0.8.10"

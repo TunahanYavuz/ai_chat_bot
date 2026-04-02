@@ -133,6 +133,14 @@ pub struct Settings {
     pub dark_mode: bool,
     #[serde(default)]
     pub autonomous_schedules: Vec<ScheduledJobConfig>,
+    #[serde(default)]
+    pub screen_awareness_enabled: bool,
+    #[serde(default)]
+    pub mcp_enabled: bool,
+    #[serde(default)]
+    pub mcp_launch_command: String,
+    #[serde(default)]
+    pub mcp_launch_args: Vec<String>,
 }
 
 fn default_dark_mode() -> bool {
@@ -256,6 +264,10 @@ impl Default for Settings {
             setup_complete: false,
             dark_mode: true,
             autonomous_schedules: vec![],
+            screen_awareness_enabled: false,
+            mcp_enabled: false,
+            mcp_launch_command: "npx".to_string(),
+            mcp_launch_args: vec!["-y".to_string(), "@modelcontextprotocol/server-everything".to_string()],
         }
     }
 }

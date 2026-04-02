@@ -12,6 +12,12 @@ const WEB_SYNTHESIS_PROTOCOL: &str = r#"WEB SYNTHESIS PROTOCOL:
 When WebResearcher is needed, the Router MUST schedule WebResearcher first and then schedule CodeArchitect to apply local code patches based on web findings.
 The orchestrator must treat WebResearcher output as dependency context for the subsequent CodeArchitect task."#;
 
+const MCP_PROTOCOL: &str = r#"MCP PROTOCOL:
+- MCP operations must use one of: mcp_connect, mcp_list_tools, mcp_call_tool, mcp_disconnect.
+- Prefer mcp_list_tools before first mcp_call_tool on a new server_id.
+- Keep server_id stable within a workflow for reusable context.
+- Do not emit MCP actions when MCP is disabled in runtime settings."#;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRole {
     Router,
@@ -110,9 +116,7 @@ PLAN:
 ```"#
             .to_string(),
     };
-    format!(
-        "{base}\n\n{UNIVERSAL_NLU_PROTOCOL}\n\n{VISUAL_QA_PROTOCOL}\n\n{WEB_SYNTHESIS_PROTOCOL}"
-    )
+    format!("{base}\n\n{UNIVERSAL_NLU_PROTOCOL}\n\n{VISUAL_QA_PROTOCOL}\n\n{WEB_SYNTHESIS_PROTOCOL}\n\n{MCP_PROTOCOL}")
 }
 
 pub fn parse_router_plan(raw: &str) -> Vec<RoutedTask> {
