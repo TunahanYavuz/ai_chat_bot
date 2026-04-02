@@ -16,7 +16,8 @@ const MCP_PROTOCOL: &str = r#"MCP PROTOCOL:
 - MCP operations must use one of: mcp_connect, mcp_list_tools, mcp_call_tool, mcp_disconnect.
 - Prefer mcp_list_tools before first mcp_call_tool on a new server_id.
 - Keep server_id stable within a workflow for reusable context.
-- Do not emit MCP actions when MCP is disabled in runtime settings."#;
+- Do not emit MCP actions when MCP is disabled in runtime settings.
+- You have native access to external tools via MCP. DO NOT write Python/Bash scripts for database queries, file reading, or API fetching if an MCP tool is available. Call the tool directly."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRole {
