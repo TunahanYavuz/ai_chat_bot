@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use base64::{Engine as _, engine::general_purpose};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::mpsc;
@@ -12,12 +14,17 @@ use tokio::time::{timeout, Duration};
 
 use crate::parser::{ActionKind, AgentAction};
 use crate::web_engine::{format_search_results, WebEngine};
+use crate::{
+    mcp_client::{McpManager, McpServerConfig},
+    screen_awareness,
+};
 
 const EMPTY_COMMAND_SUCCESS_MSG: &str = "[System: Command executed successfully with no output]";
 const SUPPORTED_DOCUMENT_FORMATS: [&str; 2] = ["pdf", "docx"];
 const TERMINAL_ACTION_TIMEOUT_SECS: u64 = 90;
 const FILE_ACTION_TIMEOUT_SECS: u64 = 15;
 const TIMEOUT_EXIT_CODE: i32 = 124;
+const SCREEN_B64_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// Execution status emitted by the action pipeline.
 #[derive(Debug, Clone)]
@@ -108,10 +115,11 @@ pub struct ActionExecutor {
     workspace_root: PathBuf,
     web_engine: Option<WebEngine>,
     web_engine_init_error: Option<String>,
+    mcp_manager: Option<Arc<McpManager>>,
 }
 
 impl ActionExecutor {
-    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+    pub fn new(workspace_root: impl Into<PathBuf>, mcp_manager: Option<Arc<McpManager>>) -> Self {
         let (web_engine, web_engine_init_error) = match WebEngine::new() {
             Ok(engine) => (Some(engine), None),
             Err(e) => (None, Some(e.to_string())),
@@ -120,6 +128,7 @@ impl ActionExecutor {
             workspace_root: workspace_root.into(),
             web_engine,
             web_engine_init_error,
+            mcp_manager,
         }
     }
 
@@ -403,6 +412,135 @@ impl ActionExecutor {
                     action: "read_url".to_string(),
                     success: true,
                     stdout: format!("[Web] Read URL: {url}\n\n{content}"),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    timed_out: false,
+                })
+            }
+            ActionKind::CaptureScreen => {
+                let target = action
+                    .parameters
+                    .target
+                    .clone()
+                    .unwrap_or_else(|| "focused_window".to_string());
+                let captured = tokio::task::spawn_blocking(move || {
+                    screen_awareness::capture_from_target(Some(&target))
+                })
+                .await
+                .map_err(|e| anyhow!("screen capture task join error: {e}"))??;
+                let filename = screen_awareness::default_filename();
+                let full_path = self.resolve_path(&filename);
+                ensure_parent_dir(&full_path).await?;
+                timeout(
+                    Duration::from_secs(FILE_ACTION_TIMEOUT_SECS),
+                    tokio::fs::write(&full_path, &captured.png_bytes),
+                )
+                .await
+                .map_err(|_| anyhow!("capture_screen timed out after {}s", FILE_ACTION_TIMEOUT_SECS))?
+                .with_context(|| format!("failed to save screenshot {}", full_path.display()))?;
+
+                let image_b64 = if captured.png_bytes.len() <= SCREEN_B64_MAX_BYTES {
+                    general_purpose::STANDARD.encode(&captured.png_bytes)
+                } else {
+                    format!(
+                        "[omitted: screenshot too large for inline base64 ({} bytes)]",
+                        captured.png_bytes.len()
+                    )
+                };
+                Ok(ExecutionReport {
+                    action: "capture_screen".to_string(),
+                    success: true,
+                    stdout: format!(
+                        "[Screen] source={}\n[Screen] size={}x{}\n[Screen] saved={}\n[Screen] png_base64={}",
+                        captured.source,
+                        captured.width,
+                        captured.height,
+                        full_path.display(),
+                        image_b64
+                    ),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    timed_out: false,
+                })
+            }
+            ActionKind::McpConnect => {
+                let server_id = required_non_empty(action.parameters.server_id.as_deref(), "server_id")?;
+                let command = required_non_empty(action.parameters.mcp_command.as_deref(), "mcp_command")?;
+                let args = action.parameters.mcp_args.unwrap_or_default();
+                let manager = self
+                    .mcp_manager
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("mcp client manager is unavailable"))?;
+                let connected = manager
+                    .connect(McpServerConfig {
+                        id: server_id,
+                        command,
+                        args,
+                    })
+                    .await?;
+                Ok(ExecutionReport {
+                    action: "mcp_connect".to_string(),
+                    success: true,
+                    stdout: format!("[MCP] connected server_id={connected}"),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    timed_out: false,
+                })
+            }
+            ActionKind::McpListTools => {
+                let server_id = required_non_empty(action.parameters.server_id.as_deref(), "server_id")?;
+                let manager = self
+                    .mcp_manager
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("mcp client manager is unavailable"))?;
+                let tools = manager.list_tools(&server_id).await?;
+                let mut out = format!("[MCP] tools for {server_id}:\n");
+                if tools.is_empty() {
+                    out.push_str("- (none)\n");
+                } else {
+                    for t in tools {
+                        out.push_str(&format!("- {}: {}\n", t.name, t.description));
+                    }
+                }
+                Ok(ExecutionReport {
+                    action: "mcp_list_tools".to_string(),
+                    success: true,
+                    stdout: out.trim_end().to_string(),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    timed_out: false,
+                })
+            }
+            ActionKind::McpCallTool => {
+                let server_id = required_non_empty(action.parameters.server_id.as_deref(), "server_id")?;
+                let tool = required_non_empty(action.parameters.tool.as_deref(), "tool")?;
+                let manager = self
+                    .mcp_manager
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("mcp client manager is unavailable"))?;
+                let output = manager
+                    .call_tool(&server_id, &tool, action.parameters.arguments)
+                    .await?;
+                Ok(ExecutionReport {
+                    action: "mcp_call_tool".to_string(),
+                    success: true,
+                    stdout: format!("[MCP] call_tool {server_id}/{tool}\n{output}"),
+                    stderr: String::new(),
+                    exit_code: 0,
+                    timed_out: false,
+                })
+            }
+            ActionKind::McpDisconnect => {
+                let server_id = required_non_empty(action.parameters.server_id.as_deref(), "server_id")?;
+                let manager = self
+                    .mcp_manager
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("mcp client manager is unavailable"))?;
+                manager.disconnect(&server_id).await?;
+                Ok(ExecutionReport {
+                    action: "mcp_disconnect".to_string(),
+                    success: true,
+                    stdout: format!("[MCP] disconnected server_id={server_id}"),
                     stderr: String::new(),
                     exit_code: 0,
                     timed_out: false,

@@ -17,6 +17,7 @@ use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
 use crate::executor::{
     ActionExecutor, ApprovalDecision, ApprovalRequest, ExecutionPolicy, ExecutionStatus,
 };
+use crate::mcp_client::McpManager;
 use crate::models::{
     get_model_capability, reasoning_config_for_model, ModelReasoningConfig, ReasoningCapability,
     ThinkingMode,
@@ -96,6 +97,11 @@ You can output the following actions inside the JSON array:
 - "create_pdf": Generates a PDF file. (Requires: 'path', 'title', 'content')
 - "generate_document": Generates a PDF or DOCX from markdown. (Requires: 'format' [pdf/docx], 'path', 'markdown_content')
 - "run_cmd": Executes a terminal command. (Requires: 'command')
+- "capture_screen": Captures focused window or monitor screenshot for visual debugging. (Optional: 'target' like 'focused_window', 'primary_monitor', 'window:Terminal')
+- "mcp_connect": Connects to an MCP server process over stdio. (Requires: 'server_id', 'mcp_command', Optional: 'mcp_args')
+- "mcp_list_tools": Lists tools exposed by a connected MCP server. (Requires: 'server_id')
+- "mcp_call_tool": Calls a tool exposed by a connected MCP server. (Requires: 'server_id', 'tool', Optional JSON object: 'arguments')
+- "mcp_disconnect": Disconnects a connected MCP server. (Requires: 'server_id')
 
 JSON SCHEMA OBLIGATION:
 Your JSON must strictly follow this format:
@@ -437,6 +443,7 @@ pub struct ChatApp {
     db_path: String,
     storage: Option<Storage>,
     rag_client: Option<Arc<Qdrant>>,
+    mcp_manager: Arc<McpManager>,
     pending_action: Option<PendingAction>,
     pending_actions_queue: VecDeque<PendingAction>,
     pending_action_session_idx: Option<usize>,
@@ -1291,7 +1298,13 @@ impl ChatApp {
                 }
                 // Web actions execute via the internal web engine and do not require pending
                 // file/command approval UI prompts in this flow.
-                crate::parser::ActionKind::SearchWeb | crate::parser::ActionKind::ReadUrl => None,
+                crate::parser::ActionKind::SearchWeb
+                | crate::parser::ActionKind::ReadUrl
+                | crate::parser::ActionKind::CaptureScreen
+                | crate::parser::ActionKind::McpConnect
+                | crate::parser::ActionKind::McpListTools
+                | crate::parser::ActionKind::McpCallTool
+                | crate::parser::ActionKind::McpDisconnect => None,
             })
             .collect()
     }
@@ -1487,10 +1500,11 @@ impl ChatApp {
             .push_str(&format!("$ {}\n", command));
         self.terminals[idx].output.push_str(TERMINAL_RUNNING_MARKER);
         let wd = self.settings.working_directory.clone();
+        let mcp_manager = self.mcp_manager.clone();
         let tx = self.event_tx.clone();
         let tid = terminal_id.to_string();
         self.tokio_rt.spawn(async move {
-            let executor = ActionExecutor::new(wd);
+            let executor = ActionExecutor::new(wd, Some(mcp_manager));
             let tx_chunks = tx.clone();
             let tid_chunks = tid.clone();
             let outcome = executor
@@ -1810,6 +1824,7 @@ impl ChatApp {
             db_path,
             storage,
             rag_client: crate::rag_engine::RagEngine::<OpenAIEmbeddingProvider>::init_shared_qdrant_client(QDRANT_URL).ok(),
+            mcp_manager: Arc::new(McpManager::new()),
             pending_action: None,
             pending_actions_queue: VecDeque::new(),
             pending_action_session_idx: None,
@@ -2046,6 +2061,10 @@ impl ChatApp {
             .unwrap_or_default();
         let working_dir = self.settings.working_directory.clone();
         let shell_enabled = self.settings.shell_execution_enabled;
+        let screen_awareness_enabled = self.settings.screen_awareness_enabled;
+        let mcp_enabled = self.settings.mcp_enabled;
+        let mcp_launch_command = self.settings.mcp_launch_command.clone();
+        let mcp_launch_args = self.settings.mcp_launch_args.clone();
 
         if let Some(session) = self.sessions.get(session_idx) {
             for msg in &session.messages {
@@ -2090,16 +2109,45 @@ impl ChatApp {
         let model_id = model_id.clone();
         let shared_rag_client = self.rag_client.clone();
         let approval_waiters = self.approval_waiters.clone();
+        let mcp_manager = self.mcp_manager.clone();
 
         self.tokio_rt.spawn(async move {
             let mut rag_context = "LOCAL REPOSITORY CONTEXT:\n- No relevant snippets found.".to_string();
+            let mcp_args_redacted = if mcp_launch_args.is_empty() {
+                "(none)".to_string()
+            } else {
+                mcp_launch_args
+                    .iter()
+                    .map(|arg| {
+                        let lower = arg.to_ascii_lowercase();
+                        if lower.contains("key")
+                            || lower.contains("token")
+                            || lower.contains("secret")
+                            || lower.starts_with("sk-")
+                            || lower.starts_with("ghp_")
+                        {
+                            "[REDACTED]".to_string()
+                        } else {
+                            arg.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let runtime_feature_context = format!(
+                "RUNTIME FEATURE FLAGS:\n- screen_awareness_enabled={}\n- mcp_enabled={}\n- mcp_launch_command={}\n- mcp_launch_args={}",
+                screen_awareness_enabled,
+                mcp_enabled,
+                mcp_launch_command,
+                mcp_args_redacted
+            );
             let _ = event_tx
                 .send(AppEvent::SwarmWorkflowStep {
                     request_id: req_id.clone(),
                     title: "Setting up environment".to_string(),
                     details: format!(
-                        "provider_base_url={}\nworkspace={}\nmodel={}",
-                        base_url, working_dir, model_id
+                        "provider_base_url={}\nworkspace={}\nmodel={}\n{}",
+                        base_url, working_dir, model_id, runtime_feature_context
                     ),
                 })
                 .await;
@@ -2130,7 +2178,7 @@ impl ChatApp {
             let mut router_messages = api_messages.clone();
             let router_prompt = get_system_prompt(&AgentRole::Router);
             let router_system_prompt = format!(
-                "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{rag_context}\n\n{router_prompt}\n\nUser request:\n{query}"
+                "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{rag_context}\n\n{router_prompt}\n\nUser request:\n{query}"
             );
             let _ = event_tx
                 .send(AppEvent::SwarmWorkflowStep {
@@ -2177,7 +2225,14 @@ impl ChatApp {
 
             let mut swarm_memory = String::new();
             let mut final_parts: Vec<String> = Vec::new();
-            let executor = ActionExecutor::new(working_dir);
+            let executor = ActionExecutor::new(
+                working_dir,
+                if mcp_enabled {
+                    Some(mcp_manager.clone())
+                } else {
+                    None
+                },
+            );
 
             let mut auto_approve_enabled = false;
 
@@ -2214,7 +2269,7 @@ impl ChatApp {
                     swarm_memory.clone()
                 };
                 let role_system_prompt = format!(
-                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{rag_context}\n\n{role_prompt}\n\nAssigned task:\n{}\n\nSwarm memory:\n{}",
+                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{rag_context}\n\n{role_prompt}\n\nAssigned task:\n{}\n\nSwarm memory:\n{}",
                     step.task, memory_block
                 );
                 role_messages.insert(0, ChatMessage::with_cache_control("system", &role_system_prompt));
@@ -2309,11 +2364,24 @@ impl ChatApp {
                     .actions
                     .into_iter()
                     .filter(|a| match role {
-                        AgentRole::CodeArchitect => !matches!(a.action, ActionKind::RunCmd),
+                        AgentRole::CodeArchitect => !matches!(
+                            a.action,
+                            ActionKind::RunCmd
+                                | ActionKind::McpConnect
+                                | ActionKind::McpListTools
+                                | ActionKind::McpCallTool
+                                | ActionKind::McpDisconnect
+                        ),
                         AgentRole::SystemAdmin => !matches!(a.action, ActionKind::RunCmd) || shell_enabled,
                         AgentRole::WebResearcher => matches!(
                             a.action,
-                            ActionKind::SearchWeb | ActionKind::ReadUrl
+                            ActionKind::SearchWeb
+                                | ActionKind::ReadUrl
+                                | ActionKind::CaptureScreen
+                                | ActionKind::McpConnect
+                                | ActionKind::McpListTools
+                                | ActionKind::McpCallTool
+                                | ActionKind::McpDisconnect
                         ),
                         AgentRole::Router => {
                             swarm_memory.push_str(
@@ -2321,6 +2389,52 @@ impl ChatApp {
                             );
                             false
                         }
+                    })
+                    .collect();
+
+                let filtered_actions: Vec<crate::parser::AgentAction> = filtered_actions
+                    .into_iter()
+                    .filter_map(|mut action| match action.action {
+                        ActionKind::CaptureScreen if !screen_awareness_enabled => {
+                            swarm_memory.push_str(
+                                "\n[Screen Awareness blocked]\ncapture_screen ignored because Screen Awareness is disabled in settings.\n",
+                            );
+                            None
+                        }
+                        ActionKind::McpConnect
+                        | ActionKind::McpListTools
+                        | ActionKind::McpCallTool
+                        | ActionKind::McpDisconnect
+                            if !mcp_enabled =>
+                        {
+                            swarm_memory.push_str(
+                                "\n[MCP blocked]\nMCP action ignored because MCP integration is disabled in settings.\n",
+                            );
+                            None
+                        }
+                        ActionKind::McpConnect => {
+                            if action
+                                .parameters
+                                .mcp_command
+                                .as_deref()
+                                .unwrap_or("")
+                                .trim()
+                                .is_empty()
+                            {
+                                action.parameters.mcp_command = Some(mcp_launch_command.clone());
+                            }
+                            if action
+                                .parameters
+                                .mcp_args
+                                .as_ref()
+                                .map(|v| v.is_empty())
+                                .unwrap_or(true)
+                            {
+                                action.parameters.mcp_args = Some(mcp_launch_args.clone());
+                            }
+                            Some(action)
+                        }
+                        _ => Some(action),
                     })
                     .collect();
 
@@ -2475,7 +2589,7 @@ impl ChatApp {
                     .await;
 
                 let synth_system_prompt = format!(
-                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{rag_context}\n\n{SWARM_SYNTH_ROLE_PROMPT}\n\nUser request:\n{query}\n\nSwarm memory:\n{swarm_memory}",
+                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{rag_context}\n\n{SWARM_SYNTH_ROLE_PROMPT}\n\nUser request:\n{query}\n\nSwarm memory:\n{swarm_memory}",
                     swarm_memory = swarm_memory
                 );
                 let mut synth_messages = api_messages.clone();
@@ -4471,6 +4585,28 @@ impl eframe::App for ChatApp {
                             ui.label("Dark mode:");
                             ui.checkbox(&mut self.settings.dark_mode, "Enabled");
                             ui.end_row();
+
+                            ui.label("Screen Awareness:");
+                            ui.checkbox(&mut self.settings.screen_awareness_enabled, "Enabled");
+                            ui.end_row();
+
+                            ui.label("MCP integration:");
+                            ui.checkbox(&mut self.settings.mcp_enabled, "Enabled");
+                            ui.end_row();
+
+                            ui.label("MCP command:");
+                            ui.add(TextEdit::singleline(&mut self.settings.mcp_launch_command));
+                            ui.end_row();
+
+                            ui.label("MCP args:");
+                            let mut mcp_args_text = self.settings.mcp_launch_args.join(" ");
+                            if ui.add(TextEdit::singleline(&mut mcp_args_text)).changed() {
+                                self.settings.mcp_launch_args = mcp_args_text
+                                    .split_whitespace()
+                                    .map(|s| s.to_string())
+                                    .collect();
+                            }
+                            ui.end_row();
                         });
 
                     ui.separator();
@@ -4810,7 +4946,29 @@ impl eframe::App for ChatApp {
                             &mut self.settings.shell_execution_enabled,
                             "Shell execution",
                         );
+                        ui.checkbox(
+                            &mut self.settings.screen_awareness_enabled,
+                            "Screen Awareness (capture_screen)",
+                        );
+                        ui.checkbox(&mut self.settings.mcp_enabled, "MCP integration");
                         ui.checkbox(&mut self.settings.dark_mode, "Dark mode");
+                        ui.label(RichText::new("MCP launch command").small().color(TEXT_MUTED));
+                        ui.add(TextEdit::singleline(&mut self.settings.mcp_launch_command));
+                        ui.label(
+                            RichText::new("MCP launch args (space-separated)")
+                                .small()
+                                .color(TEXT_MUTED),
+                        );
+                        let mut launch_args_text = self.settings.mcp_launch_args.join(" ");
+                        if ui
+                            .add(TextEdit::singleline(&mut launch_args_text))
+                            .changed()
+                        {
+                            self.settings.mcp_launch_args = launch_args_text
+                                .split_whitespace()
+                                .map(|s| s.to_string())
+                                .collect();
+                        }
                         if ui.button("Apply theme").clicked() {
                             Self::apply_theme(ctx, self.settings.dark_mode);
                             let _ = save_settings(&self.settings);

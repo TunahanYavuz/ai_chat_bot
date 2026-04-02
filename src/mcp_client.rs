@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use rust_mcp_sdk::mcp_client::{ClientHandler, ClientRuntime, McpClientOptions, client_runtime};
 use rust_mcp_sdk::schema::{
-    CallToolRequestParams, ClientCapabilities, Implementation, InitializeRequestParams,
+    CallToolRequestParams, ClientCapabilities, ContentBlock, Implementation, InitializeRequestParams,
     LATEST_PROTOCOL_VERSION,
 };
 use rust_mcp_sdk::{McpClient, StdioTransport, ToMcpClientHandler, TransportOptions};
@@ -50,7 +50,7 @@ impl McpManager {
             None,
             TransportOptions::default(),
         )
-        .context("failed to create MCP stdio transport")?;
+        .map_err(|e| anyhow!("failed to create MCP stdio transport: {e:?}"))?;
 
         let client_details = InitializeRequestParams {
             capabilities: ClientCapabilities::default(),
@@ -79,7 +79,7 @@ impl McpManager {
             .clone()
             .start()
             .await
-            .context("failed to start MCP client runtime")?;
+            .map_err(|e| anyhow!("failed to start MCP client runtime: {e:?}"))?;
 
         let mut sessions = self.sessions.lock().await;
         sessions.insert(config.id.clone(), client);
@@ -95,7 +95,7 @@ impl McpManager {
             client
                 .shut_down()
                 .await
-                .context("failed while shutting down MCP client")?;
+                .map_err(|e| anyhow!("failed while shutting down MCP client: {e:?}"))?;
             Ok(())
         } else {
             Err(anyhow!("mcp server '{server_id}' is not connected"))
@@ -107,7 +107,7 @@ impl McpManager {
         let tools = client
             .request_tool_list(None)
             .await
-            .with_context(|| format!("failed to list tools for '{server_id}'"))?;
+            .map_err(|e| anyhow!("failed to list tools for '{server_id}': {e:?}"))?;
         Ok(tools
             .tools
             .into_iter()
@@ -134,15 +134,11 @@ impl McpManager {
                 task: None,
             })
             .await
-            .with_context(|| format!("failed to call tool '{tool}' on '{server_id}'"))?;
+            .map_err(|e| anyhow!("failed to call tool '{tool}' on '{server_id}': {e:?}"))?;
 
         let mut lines: Vec<String> = Vec::new();
         for block in result.content {
-            if let Ok(text) = block.as_text_content() {
-                lines.push(text.text);
-            } else {
-                lines.push(serde_json::to_string(&block).unwrap_or_default());
-            }
+            lines.push(format_content_block(&block));
         }
         if lines.is_empty() {
             lines.push("[MCP] tool returned no content blocks".to_string());
@@ -159,6 +155,33 @@ impl McpManager {
             .get(server_id)
             .cloned()
             .ok_or_else(|| anyhow!("mcp server '{server_id}' is not connected"))
+    }
+}
+
+fn format_content_block(block: &ContentBlock) -> String {
+    match block {
+        ContentBlock::TextContent(text) => text.text.clone(),
+        ContentBlock::ImageContent(image) => {
+            format!("[image content mime={}]", image.mime_type)
+        }
+        ContentBlock::AudioContent(audio) => {
+            format!("[audio content mime={}]", audio.mime_type)
+        }
+        ContentBlock::ResourceLink(resource) => {
+            format!("[resource link uri={} name={}]", resource.uri, resource.name)
+        }
+        ContentBlock::EmbeddedResource(resource) => match &resource.resource {
+            rust_mcp_sdk::schema::EmbeddedResourceResource::TextResourceContents(text) => format!(
+                "[embedded text resource uri={} mime={}]",
+                text.uri,
+                text.mime_type.as_deref().unwrap_or("unknown")
+            ),
+            rust_mcp_sdk::schema::EmbeddedResourceResource::BlobResourceContents(blob) => format!(
+                "[embedded blob resource uri={} mime={}]",
+                blob.uri,
+                blob.mime_type.as_deref().unwrap_or("unknown")
+            ),
+        },
     }
 }
 
