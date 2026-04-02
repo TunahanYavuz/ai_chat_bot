@@ -23,6 +23,18 @@ const SUPPORTED_DOCUMENT_FORMATS: [&str; 2] = ["pdf", "docx"];
 const TERMINAL_ACTION_TIMEOUT_SECS: u64 = 90;
 const FILE_ACTION_TIMEOUT_SECS: u64 = 15;
 const TIMEOUT_EXIT_CODE: i32 = 124;
+const SCRIPTS_DIR: &str = "scripts";
+const EXPORTS_DIR: &str = "exports";
+const LOGS_DIR: &str = "logs";
+const SCREENSHOTS_DIR: &str = "assets/screenshots";
+const CORE_ROOT_FILENAMES: &[&str] = &[
+    "cargo.toml",
+    "cargo.lock",
+    "readme.md",
+    "main.rs",
+    "lib.rs",
+    "build.rs",
+];
 
 /// Execution status emitted by the action pipeline.
 #[derive(Debug, Clone)]
@@ -232,7 +244,7 @@ impl ActionExecutor {
             }
             ActionKind::CreateFolder => {
                 let path = required_non_empty(action.parameters.path.as_deref(), "path")?;
-                let full_path = self.resolve_path(&path);
+                let full_path = self.resolve_folder_path(&path);
                 timeout(
                     Duration::from_secs(FILE_ACTION_TIMEOUT_SECS),
                     tokio::fs::create_dir_all(&full_path),
@@ -257,7 +269,7 @@ impl ActionExecutor {
             ActionKind::CreateFile => {
                 let path = required_non_empty(action.parameters.path.as_deref(), "path")?;
                 let content = action.parameters.content.unwrap_or_default();
-                let full_path = self.resolve_path(&path);
+                let full_path = self.resolve_auxiliary_file_path(&path);
 
                 ensure_parent_dir(&full_path).await?;
                 timeout(
@@ -285,7 +297,7 @@ impl ActionExecutor {
                 let path = required_non_empty(action.parameters.path.as_deref(), "path")?;
                 let mode = required_non_empty(action.parameters.mode.as_deref(), "mode")?;
                 let content = action.parameters.content.unwrap_or_default();
-                let full_path = self.resolve_path(&path);
+                let full_path = self.resolve_auxiliary_file_path(&path);
 
                 ensure_parent_dir(&full_path).await?;
 
@@ -346,7 +358,7 @@ impl ActionExecutor {
                     .title
                     .unwrap_or_else(|| "Untitled".to_string());
                 let content = action.parameters.content.unwrap_or_default();
-                let full_path = self.resolve_path(&path);
+                let full_path = self.resolve_export_path(&path);
 
                 ensure_parent_dir(&full_path).await?;
 
@@ -383,7 +395,7 @@ impl ActionExecutor {
                     action.parameters.markdown_content.as_deref(),
                     "markdown_content",
                 )?;
-                let mut full_path = self.resolve_path(&path);
+                let mut full_path = self.resolve_export_path(&path);
                 if full_path.extension().and_then(|e| e.to_str()).is_none() {
                     full_path.set_extension(&format);
                 }
@@ -625,7 +637,7 @@ impl ActionExecutor {
                 .await
                 .map_err(|e| anyhow!("screen capture task join error: {e}"))??;
         let filename = screen_awareness::default_filename();
-        let full_path = self.resolve_path(&filename);
+        let full_path = self.resolve_screenshot_path(&filename);
         ensure_parent_dir(&full_path).await?;
         timeout(
             Duration::from_secs(FILE_ACTION_TIMEOUT_SECS),
@@ -656,13 +668,14 @@ impl ActionExecutor {
     }
 
     async fn execute_command(&self, cmd: &str) -> Result<ExecutionReport> {
+        let normalized_cmd = self.normalize_generated_script_command(cmd);
         let mut command = if cfg!(target_os = "windows") {
             let mut c = Command::new("cmd");
-            c.args(["/C", cmd]);
+            c.args(["/C", &normalized_cmd]);
             c
         } else {
             let mut c = Command::new("sh");
-            c.args(["-c", cmd]);
+            c.args(["-c", &normalized_cmd]);
             c
         };
 
@@ -679,7 +692,8 @@ impl ActionExecutor {
             )
             .await
             {
-                Ok(result) => result.with_context(|| format!("failed to execute command: {cmd}"))?,
+                Ok(result) => result
+                    .with_context(|| format!("failed to execute command: {normalized_cmd}"))?,
                 Err(_) => {
                     return Ok(ExecutionReport {
                         action: "run_cmd".to_string(),
@@ -687,7 +701,7 @@ impl ActionExecutor {
                         stdout: String::new(),
                         stderr: format!(
                             "[timeout] command exceeded {}s: {}",
-                            TERMINAL_ACTION_TIMEOUT_SECS, cmd
+                            TERMINAL_ACTION_TIMEOUT_SECS, normalized_cmd
                         ),
                         exit_code: TIMEOUT_EXIT_CODE,
                         timed_out: true,
@@ -702,7 +716,7 @@ impl ActionExecutor {
             command
                 .output()
                 .await
-                .with_context(|| format!("failed to execute command: {cmd}"))?
+                .with_context(|| format!("failed to execute command: {normalized_cmd}"))?
         };
 
         let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -735,13 +749,14 @@ impl ActionExecutor {
     where
         F: FnMut(bool, String) + Send + 'static,
     {
+        let normalized_cmd = self.normalize_generated_script_command(cmd);
         let mut command = if cfg!(target_os = "windows") {
             let mut c = Command::new("cmd");
-            c.args(["/C", cmd]);
+            c.args(["/C", &normalized_cmd]);
             c
         } else {
             let mut c = Command::new("sh");
-            c.args(["-c", cmd]);
+            c.args(["-c", &normalized_cmd]);
             c
         };
 
@@ -752,7 +767,7 @@ impl ActionExecutor {
 
         let mut child = command
             .spawn()
-            .with_context(|| format!("failed to start command: {cmd}"))?;
+            .with_context(|| format!("failed to start command: {normalized_cmd}"))?;
         let stdout_pipe = child.stdout.take();
         let stderr_pipe = child.stderr.take();
         let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<(bool, String)>();
@@ -818,7 +833,7 @@ impl ActionExecutor {
         });
         drop(chunk_tx);
 
-        let timeout_enabled = !should_skip_timeout_for_ui_app(cmd);
+        let timeout_enabled = !should_skip_timeout_for_ui_app(&normalized_cmd);
         let status_task = tokio::spawn(async move {
             wait_for_child_with_optional_timeout(&mut child, timeout_enabled).await
         });
@@ -844,7 +859,7 @@ impl ActionExecutor {
         let stderr = if timed_out {
             format!(
                 "{}\n[timeout] command exceeded {}s: {}",
-                stderr, TERMINAL_ACTION_TIMEOUT_SECS, cmd
+                stderr, TERMINAL_ACTION_TIMEOUT_SECS, normalized_cmd
             )
             .trim()
             .to_string()
@@ -866,13 +881,103 @@ impl ActionExecutor {
         })
     }
 
-    fn resolve_path(&self, raw: &str) -> PathBuf {
-        let path = Path::new(raw);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.workspace_root.join(path)
+    fn resolve_folder_path(&self, raw: &str) -> PathBuf {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return self.workspace_root.clone();
         }
+        if Path::new(trimmed).is_absolute() {
+            return PathBuf::from(trimmed);
+        }
+        let normalized = normalize_rel_path(trimmed);
+        if is_top_level_workspace_dir(&normalized) {
+            return self.workspace_root.join(normalized);
+        }
+        self.workspace_root.join(SCRIPTS_DIR).join(normalized)
+    }
+
+    fn resolve_export_path(&self, raw: &str) -> PathBuf {
+        self.resolve_into_named_bucket(raw, EXPORTS_DIR)
+    }
+
+    fn resolve_screenshot_path(&self, raw: &str) -> PathBuf {
+        self.resolve_into_named_bucket(raw, SCREENSHOTS_DIR)
+    }
+
+    fn resolve_auxiliary_file_path(&self, raw: &str) -> PathBuf {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return self.workspace_root.join(SCRIPTS_DIR);
+        }
+        if Path::new(trimmed).is_absolute() {
+            return PathBuf::from(trimmed);
+        }
+        let normalized = normalize_rel_path(trimmed);
+        if is_allowed_bucketed_path(&normalized) {
+            return self.workspace_root.join(normalized);
+        }
+        if is_core_root_file(&normalized) {
+            return self.workspace_root.join(normalized);
+        }
+        match classify_auxiliary_path(&normalized) {
+            BucketKind::Scripts => self.workspace_root.join(SCRIPTS_DIR).join(normalized),
+            BucketKind::Exports => self.workspace_root.join(EXPORTS_DIR).join(normalized),
+            BucketKind::Screenshots => self.workspace_root.join(SCREENSHOTS_DIR).join(normalized),
+            BucketKind::Logs => self.workspace_root.join(LOGS_DIR).join(normalized),
+        }
+    }
+
+    fn resolve_into_named_bucket(&self, raw: &str, bucket: &str) -> PathBuf {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return self.workspace_root.join(bucket);
+        }
+        if Path::new(trimmed).is_absolute() {
+            return PathBuf::from(trimmed);
+        }
+        let normalized = normalize_rel_path(trimmed);
+        if is_allowed_bucketed_path(&normalized) || is_core_root_file(&normalized) {
+            return self.workspace_root.join(normalized);
+        }
+        self.workspace_root.join(bucket).join(normalized)
+    }
+
+    fn normalize_generated_script_command(&self, cmd: &str) -> String {
+        let trimmed = cmd.trim();
+        if trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+        let mut parts = trimmed.split_whitespace();
+        let Some(first) = parts.next() else {
+            return trimmed.to_string();
+        };
+        let first_l = first.to_ascii_lowercase();
+        let rest: Vec<&str> = parts.collect();
+        let script_runtimes = [
+            "python", "python3", "bash", "sh", "node", "ruby", "perl", "php",
+        ];
+        if script_runtimes.contains(&first_l.as_str()) && !rest.is_empty() {
+            let script = rest[0];
+            if should_rewrite_to_scripts(script) {
+                let mut rebuilt = vec![
+                    first.to_string(),
+                    format!("{SCRIPTS_DIR}/{}", script.trim_start_matches("./")),
+                ];
+                for arg in rest.iter().skip(1) {
+                    rebuilt.push((*arg).to_string());
+                }
+                return rebuilt.join(" ");
+            }
+            return trimmed.to_string();
+        }
+        if should_rewrite_to_scripts(first) {
+            let mut rebuilt = vec![format!("{SCRIPTS_DIR}/{}", first.trim_start_matches("./"))];
+            for arg in rest {
+                rebuilt.push(arg.to_string());
+            }
+            return rebuilt.join(" ");
+        }
+        trimmed.to_string()
     }
 
     async fn generate_document_with_pandoc(
@@ -982,6 +1087,103 @@ fn should_skip_timeout_for_ui_app(cmd: &str) -> bool {
         "npm run dev",
     ];
     ui_indicators.iter().any(|pat| normalized.contains(pat))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BucketKind {
+    Scripts,
+    Exports,
+    Screenshots,
+    Logs,
+}
+
+fn normalize_rel_path(raw: &str) -> String {
+    raw.replace('\\', "/").trim_start_matches("./").to_string()
+}
+
+fn is_top_level_workspace_dir(path: &str) -> bool {
+    matches!(
+        path,
+        "src" | "tests" | "benches" | "examples" | "docs" | "assets" | "scripts" | "exports" | "logs" | ".github"
+    ) || path.starts_with("src/")
+        || path.starts_with("tests/")
+        || path.starts_with("benches/")
+        || path.starts_with("examples/")
+        || path.starts_with("docs/")
+        || path.starts_with(".github/")
+}
+
+fn is_allowed_bucketed_path(path: &str) -> bool {
+    path.starts_with("scripts/")
+        || path.starts_with("exports/")
+        || path.starts_with("assets/screenshots/")
+        || path.starts_with("logs/")
+}
+
+fn is_core_root_file(path: &str) -> bool {
+    if path.contains('/') {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    CORE_ROOT_FILENAMES.contains(&lower.as_str())
+}
+
+fn classify_auxiliary_path(path: &str) -> BucketKind {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".png")
+        || lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".bmp")
+    {
+        return BucketKind::Screenshots;
+    }
+    if lower.ends_with(".log") || lower.ends_with(".trace") || lower.ends_with(".out") {
+        return BucketKind::Logs;
+    }
+    if lower.ends_with(".pdf")
+        || lower.ends_with(".docx")
+        || lower.ends_with(".md")
+        || lower.ends_with(".txt")
+        || lower.ends_with(".csv")
+        || lower.ends_with(".json")
+    {
+        return BucketKind::Exports;
+    }
+    if lower.ends_with(".py")
+        || lower.ends_with(".sh")
+        || lower.ends_with(".bash")
+        || lower.ends_with(".zsh")
+        || lower.ends_with(".js")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".sql")
+    {
+        return BucketKind::Scripts;
+    }
+    BucketKind::Scripts
+}
+
+fn should_rewrite_to_scripts(script_arg: &str) -> bool {
+    let normalized = normalize_rel_path(script_arg);
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.starts_with("scripts/")
+        || normalized.starts_with("src/")
+        || normalized.starts_with("tests/")
+        || normalized.starts_with("examples/")
+        || normalized.starts_with("benches/")
+        || normalized.contains('/')
+    {
+        return false;
+    }
+    let lower = normalized.to_ascii_lowercase();
+    lower.ends_with(".py")
+        || lower.ends_with(".sh")
+        || lower.ends_with(".bash")
+        || lower.ends_with(".zsh")
+        || lower.ends_with(".js")
+        || lower.ends_with(".ts")
+        || lower.ends_with(".sql")
 }
 
 async fn wait_for_child_with_optional_timeout(
