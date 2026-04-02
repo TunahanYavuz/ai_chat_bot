@@ -1855,7 +1855,7 @@ impl ChatApp {
                     #[cfg(unix)]
                     {
                         let _ = tokio::process::Command::new("kill")
-                            .args(["-TERM", &pid_s])
+                            .args(["-s", "TERM", &pid_s])
                             .status()
                             .await;
                     }
