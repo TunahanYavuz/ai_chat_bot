@@ -166,6 +166,12 @@ pub enum AppEvent {
         line: String,
         is_stdout: bool,
     },
+    OpenAiTerminal {
+        terminal_id: String,
+        name: String,
+        command: String,
+        linked_session_idx: Option<usize>,
+    },
     InitialSessionsLoaded {
         sessions: Vec<Session>,
         error: Option<String>,
@@ -714,6 +720,15 @@ pub struct ChatApp {
 }
 
 impl ChatApp {
+    fn ai_task_terminal_name(command: &str) -> String {
+        let command_name = command
+            .split_whitespace()
+            .next()
+            .unwrap_or("command")
+            .trim_matches(|c| c == '"' || c == '\'');
+        format!("AI-Task: {}", command_name)
+    }
+
     fn init_emoji_support(ctx: &egui::Context) {
         egui_extras::install_image_loaders(ctx);
 
@@ -2634,16 +2649,6 @@ impl ChatApp {
 
             let mut swarm_memory = String::new();
             let mut final_parts: Vec<String> = Vec::new();
-            let executor_working_dir = working_dir.clone();
-            let executor = ActionExecutor::new(
-                executor_working_dir,
-                if mcp_enabled {
-                    Some(mcp_manager.clone())
-                } else {
-                    None
-                },
-            );
-
             let mut auto_approve_enabled = false;
 
             for step in queue {
@@ -2902,10 +2907,50 @@ impl ChatApp {
                     } else {
                         None
                     };
+                    let command_for_terminal = action.parameters.command.clone();
+                    let command_action =
+                        matches!(action.action, ActionKind::RunCmd | ActionKind::RunAndObserve);
+                    let ai_terminal_id = if command_action {
+                        Some(Uuid::new_v4().to_string())
+                    } else {
+                        None
+                    };
+                    if let (Some(terminal_id), Some(command)) =
+                        (ai_terminal_id.clone(), command_for_terminal.clone())
+                    {
+                        let _ = event_tx
+                            .send(AppEvent::OpenAiTerminal {
+                                terminal_id,
+                                name: ChatApp::ai_task_terminal_name(&command),
+                                command,
+                                linked_session_idx: Some(session_idx),
+                            })
+                            .await;
+                    }
+                    let mut action_executor = ActionExecutor::new(
+                        working_dir.clone(),
+                        if mcp_enabled {
+                            Some(mcp_manager.clone())
+                        } else {
+                            None
+                        },
+                    );
+                    if let Some(terminal_id) = ai_terminal_id.clone() {
+                        let tx_chunks = event_tx.clone();
+                        action_executor = action_executor.with_terminal_output_sink(Arc::new(
+                            move |is_stdout, line| {
+                                let _ = tx_chunks.blocking_send(AppEvent::TerminalChunk {
+                                    terminal_id: terminal_id.clone(),
+                                    line,
+                                    is_stdout,
+                                });
+                            },
+                        ));
+                    }
                     let request_id_for_approval = req_id.clone();
                     let approval_event_tx = event_tx.clone();
                     let approval_waiters = approval_waiters.clone();
-                    match executor
+                    match action_executor
                         .execute_action_with_permission(
                             action,
                             execution_policy,
@@ -2964,6 +3009,17 @@ impl ChatApp {
                             auto_approve_enabled = next_auto_approve_state;
                             match status {
                                 ExecutionStatus::Executed(report) => {
+                                    if let Some(terminal_id) = ai_terminal_id.clone() {
+                                        let _ = event_tx
+                                            .send(AppEvent::TerminalFinished {
+                                                terminal_id,
+                                                stdout: report.stdout.clone(),
+                                                stderr: report.stderr.clone(),
+                                                exit_code: report.exit_code,
+                                                streamed: true,
+                                            })
+                                            .await;
+                                    }
                                     if let Some(png_bytes) = report.screenshot_png_bytes.clone() {
                                         let image = ImageData {
                                             id: Uuid::new_v4().to_string(),
@@ -3003,11 +3059,29 @@ impl ChatApp {
                                             "[synthesizer_timeout_hint]\nA command timed out. Analyze partial output, identify root cause, and propose an autonomous retry/fix strategy.\n",
                                         );
                                     }
+                                    let combined_terminal_output =
+                                        format!("{}\n{}", report.stderr, report.stdout)
+                                            .to_ascii_lowercase();
+                                    let stall_signature_detected = combined_terminal_output.contains("permission denied")
+                                        || combined_terminal_output.contains("command not found")
+                                        || combined_terminal_output.contains("is not recognized as an internal or external command");
+                                    if stall_signature_detected {
+                                        let _ = event_tx
+                                            .send(AppEvent::SwarmWorkflowStep {
+                                                request_id: req_id.clone(),
+                                                title: format!("{}: stall guard detected terminal error", role.as_str()),
+                                                details: "Detected permission/tool-not-found error signature. Triggering self-healing protocol (research + retry planning).".to_string(),
+                                            })
+                                            .await;
+                                        swarm_memory.push_str(
+                                            "[stall_guard]\nDetected Permission Denied / Command Not Found signature in terminal output. Self-healing protocol must run.\n",
+                                        );
+                                    }
                                     let should_self_heal = matches!(role, AgentRole::SystemAdmin | AgentRole::CodeArchitect)
                                         && report.action == "run_cmd"
                                         && !report.success
                                         && report.exit_code != 0
-                                        && !report.stderr.trim().is_empty();
+                                        && (!report.stderr.trim().is_empty() || stall_signature_detected);
                                     if should_self_heal {
                                         for retry_idx in 1..=MAX_SELF_HEAL_RETRY_LIMIT {
                                             let Some(original_cmd) = original_command.clone() else {
@@ -3015,12 +3089,12 @@ impl ChatApp {
                                             };
                                             let heal_query = truncate_for_search(
                                                 &format!(
-                                                    "Role: {} | Command: {} | Host OS: {} | Arch: {} | Stderr: {} | Task: find updated syntax and official docs.",
+                                                    "Role: {} | Command: {} | Host OS: {} | Arch: {} | Terminal output: {} | Task: find updated syntax and official docs.",
                                                     role.as_str(),
                                                     original_cmd,
                                                     std::env::consts::OS,
                                                     std::env::consts::ARCH,
-                                                    report.stderr
+                                                    combined_terminal_output
                                                 ),
                                                 SELF_HEALING_QUERY_MAX_CHARS,
                                             );
@@ -4082,6 +4156,32 @@ impl ChatApp {
                         }
                     }
                 }
+                AppEvent::OpenAiTerminal {
+                    terminal_id,
+                    name,
+                    command,
+                    linked_session_idx,
+                } => {
+                    let mut term = TerminalSession {
+                        id: terminal_id.clone(),
+                        name,
+                        owner: TerminalOwner::AI,
+                        command: command.clone(),
+                        working_dir: self.settings.working_directory.clone(),
+                        output: String::new(),
+                        running: true,
+                        terminated: false,
+                        exit_code: None,
+                        pid: None,
+                        linked_session_idx,
+                        auto_continue_agent: false,
+                        input_buffer: String::new(),
+                    };
+                    term.output.push_str(&format!("$ {}\n", command));
+                    term.output.push_str(TERMINAL_RUNNING_MARKER);
+                    self.terminals.push(term);
+                    self.active_terminal_id = Some(terminal_id);
+                }
                 AppEvent::InitialSessionsLoaded { sessions, error } => {
                     if let Some(err) = error {
                         self.notify(format!("DB load error: {err}"), NotificationKind::Error);
@@ -4496,17 +4596,16 @@ impl ChatApp {
                 ui.horizontal_wrapped(|ui| {
                     for term in self.terminals.clone() {
                         let selected = self.active_terminal_id.as_deref() == Some(term.id.as_str());
-                        let label = format!(
-                            "{} {}",
-                            if term.owner == TerminalOwner::AI {
-                                "🤖"
-                            } else {
-                                "👤"
-                            },
-                            term.name
-                        );
+                        let icon = if term.owner == TerminalOwner::AI {
+                            "🤖"
+                        } else {
+                            "👤"
+                        };
+                        with_emoji_context(ui, |ui| {
+                            EmojiLabel::new(icon).show(ui);
+                        });
                         let button =
-                            egui::Button::new(RichText::new(label).small().color(if selected {
+                            egui::Button::new(RichText::new(&term.name).small().color(if selected {
                                 DARK_TEXT
                             } else {
                                 LIGHT_TEXT
@@ -4986,12 +5085,7 @@ impl eframe::App for ChatApp {
                                 self.dispatch_agent_requests(idx);
                             }
                         } else {
-                            let terminal_name = if command.chars().count() > 32 {
-                                let shortened: String = command.chars().take(32).collect();
-                                format!("AI: {}…", shortened)
-                            } else {
-                                format!("AI: {}", command)
-                            };
+                            let terminal_name = Self::ai_task_terminal_name(&command);
                             let tid = self.create_terminal(
                                 terminal_name,
                                 TerminalOwner::AI,
