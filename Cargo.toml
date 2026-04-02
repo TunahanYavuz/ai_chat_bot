@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 eframe = { version = "0.31", features = ["default_fonts", "persistence"] }
 egui = "0.31"
+egui-twemoji = { version = "0.7.0", default-features = false, features = ["png"] }
 egui_extras = { version = "0.31", features = ["image", "file"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }

@@ -1,10 +1,9 @@
-use std::path::{Path, PathBuf};
 use std::future::Future;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use base64::{Engine as _, engine::general_purpose};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::mpsc;
@@ -24,7 +23,6 @@ const SUPPORTED_DOCUMENT_FORMATS: [&str; 2] = ["pdf", "docx"];
 const TERMINAL_ACTION_TIMEOUT_SECS: u64 = 90;
 const FILE_ACTION_TIMEOUT_SECS: u64 = 15;
 const TIMEOUT_EXIT_CODE: i32 = 124;
-const SCREEN_B64_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 /// Execution status emitted by the action pipeline.
 #[derive(Debug, Clone)]
@@ -69,7 +67,9 @@ impl ExecutionPolicy {
         }
         match self {
             ExecutionPolicy::Manual => true,
-            ExecutionPolicy::ReadEdit => matches!(action.action, ActionKind::RunCmd),
+            ExecutionPolicy::ReadEdit => {
+                matches!(action.action, ActionKind::RunCmd | ActionKind::RunAndObserve)
+            }
             ExecutionPolicy::Execute => false,
             ExecutionPolicy::FullAccess => false,
         }
@@ -103,6 +103,10 @@ pub struct ExecutionReport {
     pub stderr: String,
     pub exit_code: i32,
     pub timed_out: bool,
+    pub screenshot_png_bytes: Option<Vec<u8>>,
+    pub screenshot_source: Option<String>,
+    pub screenshot_width: Option<u32>,
+    pub screenshot_height: Option<u32>,
 }
 
 /// Enterprise-grade async action executor.
@@ -244,6 +248,10 @@ impl ActionExecutor {
                     stderr: String::new(),
                     exit_code: 0,
                     timed_out: false,
+                    screenshot_png_bytes: None,
+                    screenshot_source: None,
+                    screenshot_width: None,
+                    screenshot_height: None,
                 })
             }
             ActionKind::CreateFile => {
@@ -267,6 +275,10 @@ impl ActionExecutor {
                     stderr: String::new(),
                     exit_code: 0,
                     timed_out: false,
+                    screenshot_png_bytes: None,
+                    screenshot_source: None,
+                    screenshot_width: None,
+                    screenshot_height: None,
                 })
             }
             ActionKind::EditFile => {
@@ -321,6 +333,10 @@ impl ActionExecutor {
                     stderr: String::new(),
                     exit_code: 0,
                     timed_out: false,
+                    screenshot_png_bytes: None,
+                    screenshot_source: None,
+                    screenshot_width: None,
+                    screenshot_height: None,
                 })
             }
             ActionKind::CreatePdf => {
@@ -347,6 +363,10 @@ impl ActionExecutor {
                     stderr: String::new(),
                     exit_code: 0,
                     timed_out: false,
+                    screenshot_png_bytes: None,
+                    screenshot_source: None,
+                    screenshot_width: None,
+                    screenshot_height: None,
                 })
             }
             ActionKind::GenerateDocument => {
@@ -392,6 +412,10 @@ impl ActionExecutor {
                     stderr: String::new(),
                     exit_code: 0,
                     timed_out: false,
+                    screenshot_png_bytes: None,
+                    screenshot_source: None,
+                    screenshot_width: None,
+                    screenshot_height: None,
                 })
             }
             ActionKind::ReadUrl => {
@@ -415,53 +439,24 @@ impl ActionExecutor {
                     stderr: String::new(),
                     exit_code: 0,
                     timed_out: false,
+                    screenshot_png_bytes: None,
+                    screenshot_source: None,
+                    screenshot_width: None,
+                    screenshot_height: None,
                 })
             }
             ActionKind::CaptureScreen => {
+                self.capture_screen_now(action.parameters.target.as_deref()).await
+            }
+            ActionKind::RunAndObserve => {
+                let command = required_non_empty(action.parameters.command.as_deref(), "command")?;
+                let delay_secs = action.parameters.delay_secs.unwrap_or(3).max(1);
                 let target = action
                     .parameters
                     .target
                     .clone()
                     .unwrap_or_else(|| "focused_window".to_string());
-                let captured = tokio::task::spawn_blocking(move || {
-                    screen_awareness::capture_from_target(Some(&target))
-                })
-                .await
-                .map_err(|e| anyhow!("screen capture task join error: {e}"))??;
-                let filename = screen_awareness::default_filename();
-                let full_path = self.resolve_path(&filename);
-                ensure_parent_dir(&full_path).await?;
-                timeout(
-                    Duration::from_secs(FILE_ACTION_TIMEOUT_SECS),
-                    tokio::fs::write(&full_path, &captured.png_bytes),
-                )
-                .await
-                .map_err(|_| anyhow!("capture_screen timed out after {}s", FILE_ACTION_TIMEOUT_SECS))?
-                .with_context(|| format!("failed to save screenshot {}", full_path.display()))?;
-
-                let image_b64 = if captured.png_bytes.len() <= SCREEN_B64_MAX_BYTES {
-                    general_purpose::STANDARD.encode(&captured.png_bytes)
-                } else {
-                    format!(
-                        "[omitted: screenshot too large for inline base64 ({} bytes)]",
-                        captured.png_bytes.len()
-                    )
-                };
-                Ok(ExecutionReport {
-                    action: "capture_screen".to_string(),
-                    success: true,
-                    stdout: format!(
-                        "[Screen] source={}\n[Screen] size={}x{}\n[Screen] saved={}\n[Screen] png_base64={}",
-                        captured.source,
-                        captured.width,
-                        captured.height,
-                        full_path.display(),
-                        image_b64
-                    ),
-                    stderr: String::new(),
-                    exit_code: 0,
-                    timed_out: false,
-                })
+                self.run_and_observe(&command, delay_secs, &target).await
             }
             ActionKind::McpConnect => {
                 let server_id = required_non_empty(action.parameters.server_id.as_deref(), "server_id")?;
@@ -485,6 +480,10 @@ impl ActionExecutor {
                     stderr: String::new(),
                     exit_code: 0,
                     timed_out: false,
+                    screenshot_png_bytes: None,
+                    screenshot_source: None,
+                    screenshot_width: None,
+                    screenshot_height: None,
                 })
             }
             ActionKind::McpListTools => {
@@ -509,6 +508,10 @@ impl ActionExecutor {
                     stderr: String::new(),
                     exit_code: 0,
                     timed_out: false,
+                    screenshot_png_bytes: None,
+                    screenshot_source: None,
+                    screenshot_width: None,
+                    screenshot_height: None,
                 })
             }
             ActionKind::McpCallTool => {
@@ -528,6 +531,10 @@ impl ActionExecutor {
                     stderr: String::new(),
                     exit_code: 0,
                     timed_out: false,
+                    screenshot_png_bytes: None,
+                    screenshot_source: None,
+                    screenshot_width: None,
+                    screenshot_height: None,
                 })
             }
             ActionKind::McpDisconnect => {
@@ -544,9 +551,108 @@ impl ActionExecutor {
                     stderr: String::new(),
                     exit_code: 0,
                     timed_out: false,
+                    screenshot_png_bytes: None,
+                    screenshot_source: None,
+                    screenshot_width: None,
+                    screenshot_height: None,
                 })
             }
         }
+    }
+
+    async fn run_and_observe(
+        &self,
+        cmd: &str,
+        delay_secs: u64,
+        target: &str,
+    ) -> Result<ExecutionReport> {
+        let command_for_spawn = cmd.to_string();
+        let workspace = self.workspace_root.clone();
+        let spawn_join = tokio::spawn(async move {
+            let mut command = if cfg!(target_os = "windows") {
+                let mut c = Command::new("cmd");
+                c.args(["/C", &command_for_spawn]);
+                c
+            } else {
+                let mut c = Command::new("sh");
+                c.args(["-c", &command_for_spawn]);
+                c
+            };
+            command
+                .current_dir(workspace)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+        match spawn_join.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(anyhow!("failed to spawn background command: {err}")),
+            Err(err) => return Err(anyhow!("background task join error: {err}")),
+        }
+
+        tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+        let capture = self.capture_screen_now(Some(target)).await?;
+
+        Ok(ExecutionReport {
+            action: "run_and_observe".to_string(),
+            success: true,
+            stdout: format!(
+                "[run_and_observe] spawned command in background\n[run_and_observe] waited={}s\n[Screen] source={}\n[Screen] size={}x{}",
+                delay_secs,
+                capture
+                    .screenshot_source
+                    .as_deref()
+                    .unwrap_or("focused_window"),
+                capture.screenshot_width.unwrap_or(0),
+                capture.screenshot_height.unwrap_or(0),
+            ),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+            screenshot_png_bytes: capture.screenshot_png_bytes,
+            screenshot_source: capture.screenshot_source,
+            screenshot_width: capture.screenshot_width,
+            screenshot_height: capture.screenshot_height,
+        })
+    }
+
+    async fn capture_screen_now(&self, target: Option<&str>) -> Result<ExecutionReport> {
+        let target = target.unwrap_or("focused_window").to_string();
+        let captured =
+            tokio::task::spawn_blocking(move || screen_awareness::capture_from_target(Some(&target)))
+                .await
+                .map_err(|e| anyhow!("screen capture task join error: {e}"))??;
+        let filename = screen_awareness::default_filename();
+        let full_path = self.resolve_path(&filename);
+        ensure_parent_dir(&full_path).await?;
+        timeout(
+            Duration::from_secs(FILE_ACTION_TIMEOUT_SECS),
+            tokio::fs::write(&full_path, &captured.png_bytes),
+        )
+        .await
+        .map_err(|_| anyhow!("capture_screen timed out after {}s", FILE_ACTION_TIMEOUT_SECS))?
+        .with_context(|| format!("failed to save screenshot {}", full_path.display()))?;
+
+        Ok(ExecutionReport {
+            action: "capture_screen".to_string(),
+            success: true,
+            stdout: format!(
+                "[Screen] source={}\n[Screen] size={}x{}\n[Screen] saved={}\n[Screen] staged=true",
+                captured.source,
+                captured.width,
+                captured.height,
+                full_path.display(),
+            ),
+            stderr: String::new(),
+            exit_code: 0,
+            timed_out: false,
+            screenshot_png_bytes: Some(captured.png_bytes),
+            screenshot_source: Some(captured.source),
+            screenshot_width: Some(captured.width),
+            screenshot_height: Some(captured.height),
+        })
     }
 
     async fn execute_command(&self, cmd: &str) -> Result<ExecutionReport> {
@@ -585,6 +691,10 @@ impl ActionExecutor {
                         ),
                         exit_code: TIMEOUT_EXIT_CODE,
                         timed_out: true,
+                        screenshot_png_bytes: None,
+                        screenshot_source: None,
+                        screenshot_width: None,
+                        screenshot_height: None,
                     });
                 }
             }
@@ -610,6 +720,10 @@ impl ActionExecutor {
             stderr,
             exit_code,
             timed_out: false,
+            screenshot_png_bytes: None,
+            screenshot_source: None,
+            screenshot_width: None,
+            screenshot_height: None,
         })
     }
 
@@ -745,6 +859,10 @@ impl ActionExecutor {
             stderr,
             exit_code,
             timed_out,
+            screenshot_png_bytes: None,
+            screenshot_source: None,
+            screenshot_width: None,
+            screenshot_height: None,
         })
     }
 
@@ -808,6 +926,10 @@ impl ActionExecutor {
                         stderr,
                         exit_code,
                         timed_out: false,
+                        screenshot_png_bytes: None,
+                        screenshot_source: None,
+                        screenshot_width: None,
+                        screenshot_height: None,
                     })
                 } else {
                     Ok(ExecutionReport {
@@ -817,6 +939,10 @@ impl ActionExecutor {
                         stderr: format!("pandoc failed (exit={exit_code}): {stderr}"),
                         exit_code,
                         timed_out: false,
+                        screenshot_png_bytes: None,
+                        screenshot_source: None,
+                        screenshot_width: None,
+                        screenshot_height: None,
                     })
                 }
             }
@@ -828,6 +954,10 @@ impl ActionExecutor {
                     .to_string(),
                 exit_code: 127,
                 timed_out: false,
+                screenshot_png_bytes: None,
+                screenshot_source: None,
+                screenshot_width: None,
+                screenshot_height: None,
             }),
             Err(e) => Err(anyhow!(e)).with_context(|| {
                 format!(
@@ -965,7 +1095,7 @@ fn escape_pdf_text(input: &str) -> String {
 }
 
 fn action_requires_delete_safety(action: &AgentAction) -> bool {
-    if let ActionKind::RunCmd = action.action {
+    if matches!(action.action, ActionKind::RunCmd | ActionKind::RunAndObserve) {
         let cmd = action
             .parameters
             .command

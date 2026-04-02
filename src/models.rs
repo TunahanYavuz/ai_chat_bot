@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 /// Reasoning level used by models that support tiered thinking controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,4 +148,191 @@ pub fn reasoning_config_for_model(model_name: &str) -> ModelReasoningConfig {
 
 pub fn get_model_capability(model_name: &str) -> ReasoningCapability {
     reasoning_config_for_model(model_name).capability
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProviderRequestOptions {
+    pub reasoning_effort: Option<String>,
+    pub include_reasoning: Option<bool>,
+    pub stream: bool,
+    pub max_tokens: Option<u32>,
+}
+
+pub trait ProviderAdapter: Send + Sync {
+    fn chat_endpoint(&self, base_url: &str) -> String;
+    fn models_endpoint(&self, base_url: &str) -> String;
+    fn auth_headers(&self, api_key: &str) -> Vec<(&'static str, String)>;
+    fn build_chat_payload(
+        &self,
+        model: &str,
+        messages: &[serde_json::Value],
+        options: &ProviderRequestOptions,
+    ) -> serde_json::Value;
+    fn stream_done(&self, data: &str) -> bool;
+    fn stream_delta_text(&self, data: &str) -> Option<String>;
+    fn parse_non_stream_text(&self, body: &serde_json::Value) -> Option<String>;
+}
+
+#[derive(Debug, Default)]
+pub struct OpenAiCompatibleAdapter;
+
+impl ProviderAdapter for OpenAiCompatibleAdapter {
+    fn chat_endpoint(&self, base_url: &str) -> String {
+        format!("{}/chat/completions", base_url.trim_end_matches('/'))
+    }
+
+    fn models_endpoint(&self, base_url: &str) -> String {
+        format!("{}/models", base_url.trim_end_matches('/'))
+    }
+
+    fn auth_headers(&self, api_key: &str) -> Vec<(&'static str, String)> {
+        vec![("Authorization", format!("Bearer {api_key}"))]
+    }
+
+    fn build_chat_payload(
+        &self,
+        model: &str,
+        messages: &[serde_json::Value],
+        options: &ProviderRequestOptions,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "reasoning_effort": options.reasoning_effort,
+            "include_reasoning": options.include_reasoning,
+            "stream": options.stream,
+            "max_tokens": options.max_tokens
+        })
+    }
+
+    fn stream_done(&self, data: &str) -> bool {
+        if data.trim() == "[DONE]" {
+            return true;
+        }
+        serde_json::from_str::<serde_json::Value>(data)
+            .ok()
+            .and_then(|v| {
+                v.get("choices")
+                    .and_then(|c| c.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|c| c.get("finish_reason"))
+                    .and_then(|f| f.as_str())
+                    .map(|s| !s.is_empty())
+            })
+            .unwrap_or(false)
+    }
+
+    fn stream_delta_text(&self, data: &str) -> Option<String> {
+        let parsed = serde_json::from_str::<serde_json::Value>(data).ok()?;
+        parsed
+            .get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|c| c.get("delta"))
+            .and_then(|d| d.get("content"))
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string())
+    }
+
+    fn parse_non_stream_text(&self, body: &serde_json::Value) -> Option<String> {
+        body.get("choices")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|choice| choice.get("message"))
+            .and_then(|msg| msg.get("content"))
+            .and_then(|content| content.as_str())
+            .map(|s| s.to_string())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct AnthropicAdapter;
+
+impl ProviderAdapter for AnthropicAdapter {
+    fn chat_endpoint(&self, base_url: &str) -> String {
+        format!("{}/messages", base_url.trim_end_matches('/'))
+    }
+
+    fn models_endpoint(&self, base_url: &str) -> String {
+        format!("{}/models", base_url.trim_end_matches('/'))
+    }
+
+    fn auth_headers(&self, api_key: &str) -> Vec<(&'static str, String)> {
+        vec![
+            ("x-api-key", api_key.to_string()),
+            ("anthropic-version", "2023-06-01".to_string()),
+        ]
+    }
+
+    fn build_chat_payload(
+        &self,
+        model: &str,
+        messages: &[serde_json::Value],
+        options: &ProviderRequestOptions,
+    ) -> serde_json::Value {
+        let mut system: Vec<String> = Vec::new();
+        let mut non_system: Vec<serde_json::Value> = Vec::new();
+        for msg in messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or_default();
+            if role == "system" {
+                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                    if !content.trim().is_empty() {
+                        system.push(content.to_string());
+                    }
+                }
+            } else {
+                non_system.push(msg.clone());
+            }
+        }
+        serde_json::json!({
+            "model": model,
+            "system": if system.is_empty() { None } else { Some(system.join("\n\n")) },
+            "messages": non_system,
+            "stream": options.stream,
+            "max_tokens": options.max_tokens.unwrap_or(1024)
+        })
+    }
+
+    fn stream_done(&self, data: &str) -> bool {
+        serde_json::from_str::<serde_json::Value>(data)
+            .ok()
+            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s == "message_stop"))
+            .unwrap_or(false)
+    }
+
+    fn stream_delta_text(&self, data: &str) -> Option<String> {
+        let parsed = serde_json::from_str::<serde_json::Value>(data).ok()?;
+        let is_delta = parsed
+            .get("type")
+            .and_then(|t| t.as_str())
+            .map(|t| t == "content_block_delta")
+            .unwrap_or(false);
+        if !is_delta {
+            return None;
+        }
+        parsed
+            .get("delta")
+            .and_then(|d| d.get("text"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string())
+    }
+
+    fn parse_non_stream_text(&self, body: &serde_json::Value) -> Option<String> {
+        body.get("content")
+            .and_then(|c| c.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|part| part.get("text"))
+            .and_then(|t| t.as_str())
+            .map(|s| s.to_string())
+    }
+}
+
+pub fn provider_adapter_for(provider_key: &str) -> Arc<dyn ProviderAdapter> {
+    match provider_key {
+        "anthropic" => Arc::new(AnthropicAdapter),
+        "deepseek" | "huggingface" | "openai" | "openrouter" | "nvidia" | "custom" => {
+            Arc::new(OpenAiCompatibleAdapter)
+        }
+        _ => Arc::new(OpenAiCompatibleAdapter),
+    }
 }

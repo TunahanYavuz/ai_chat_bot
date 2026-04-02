@@ -1,8 +1,9 @@
 use base64::{engine::general_purpose, Engine as _};
 use chrono::Utc;
 use egui::text::LayoutJob;
-use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, TextFormat, Vec2};
+use egui::{Color32, FontDefinitions, FontFamily, FontId, RichText, ScrollArea, TextEdit, TextFormat, Vec2};
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use egui_twemoji::EmojiLabel;
 use serde::Deserialize;
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -31,6 +32,10 @@ use crate::telemetry::collect_telemetry_cached;
 use crate::watcher::run_workspace_watcher;
 use qdrant_client::Qdrant;
 
+fn with_emoji_context<R>(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    add_contents(ui)
+}
+
 const BG_PRIMARY: Color32 = Color32::from_rgb(0x1E, 0x1E, 0x1E);
 const BG_SURFACE: Color32 = Color32::from_rgb(0x2D, 0x2D, 0x2D);
 const BG_SURFACE_ALT: Color32 = Color32::from_rgb(0x36, 0x36, 0x36);
@@ -48,8 +53,6 @@ const GOLD_DARK: Color32 = Color32::from_rgb(0x7A, 0x7A, 0x7A);
 const WHITE: Color32 = TEXT_PRIMARY;
 const DARK_TEXT: Color32 = TEXT_DARK;
 const LIGHT_TEXT: Color32 = TEXT_PRIMARY;
-const STATUS_SUCCESS: Color32 = Color32::from_rgb(0x66, 0xBB, 0x6A);
-const STATUS_ERROR: Color32 = Color32::from_rgb(0xEF, 0x53, 0x50);
 const CUSTOM_MODEL_INPUT_RESERVED_WIDTH: f32 = 132.0;
 const DELETE_CHAT_BUTTON_WIDTH: f32 = 36.0;
 const MIN_CHAT_BUTTON_WIDTH: f32 = 80.0;
@@ -63,6 +66,8 @@ const QDRANT_URL: &str = "http://127.0.0.1:6334";
 const AUTONOMOUS_SCHEDULER_TICK_INTERVAL_SECS: u64 = 30;
 const AUTONOMOUS_WORKFLOW_PREFIX: &str = "[AUTONOMOUS CRON-SWARM]";
 const AUTONOMOUS_SESSION_NAME: &str = "Autonomous Briefing";
+const QUOTA_EXHAUSTED_TEXT_COLOR: Color32 = Color32::from_rgb(220, 75, 75);
+const TOKEN_ESTIMATE_CHARS_PER_TOKEN: f64 = 4.0;
 const AUTONOMOUS_TRIGGER_KEYWORDS: [&str; 6] = [
     "every day",
     "every morning",
@@ -97,6 +102,7 @@ You can output the following actions inside the JSON array:
 - "create_pdf": Generates a PDF file. (Requires: 'path', 'title', 'content')
 - "generate_document": Generates a PDF or DOCX from markdown. (Requires: 'format' [pdf/docx], 'path', 'markdown_content')
 - "run_cmd": Executes a terminal command. (Requires: 'command')
+- "run_and_observe": Starts app/server in background, waits, then captures screen. (Requires: 'command', Optional: 'delay_secs', 'target')
 - "capture_screen": Captures focused window or monitor screenshot for visual debugging. (Optional: 'target' like 'focused_window', 'primary_monitor', 'window:Terminal')
 - "mcp_connect": Connects to an MCP server process over stdio. (Requires: 'server_id', 'mcp_command', Optional: 'mcp_args')
 - "mcp_list_tools": Lists tools exposed by a connected MCP server. (Requires: 'server_id')
@@ -167,6 +173,10 @@ pub enum AppEvent {
         file_path: String,
         error: Option<String>,
     },
+    VisionStaged {
+        request_id: String,
+        image: ImageData,
+    },
     DbError(String),
     SwarmStatus {
         request_id: String,
@@ -218,6 +228,158 @@ pub struct Attachment {
     pub image_base64: Option<String>,
     pub mime_type: String,
     pub raw_bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ImageData {
+    id: String,
+    filename: String,
+    png_bytes: Vec<u8>,
+    mime_type: String,
+    source: String,
+    width: u32,
+    height: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VisionStaging {
+    images: Vec<ImageData>,
+    undo_stack: Vec<ImageData>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct QuotaMetrics {
+    tokens_used: u64,
+    request_count: u64,
+    max_tokens: u64,
+    max_requests: u64,
+}
+
+#[derive(Debug, Clone)]
+struct QuotaManager {
+    per_provider: HashMap<String, QuotaMetrics>,
+}
+
+impl Default for QuotaManager {
+    fn default() -> Self {
+        let mut per_provider = HashMap::new();
+        per_provider.insert(
+            "openai".to_string(),
+            QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            },
+        );
+        per_provider.insert(
+            "anthropic".to_string(),
+            QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            },
+        );
+        per_provider.insert(
+            "deepseek".to_string(),
+            QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            },
+        );
+        per_provider.insert(
+            "huggingface".to_string(),
+            QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            },
+        );
+        per_provider.insert(
+            "openrouter".to_string(),
+            QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            },
+        );
+        per_provider.insert(
+            "nvidia".to_string(),
+            QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            },
+        );
+        per_provider.insert(
+            "custom".to_string(),
+            QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            },
+        );
+        Self { per_provider }
+    }
+}
+
+impl QuotaManager {
+    fn ensure_provider(&mut self, provider_key: &str) {
+        self.per_provider
+            .entry(provider_key.to_string())
+            .or_insert_with(|| QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            });
+    }
+
+    fn record_usage(&mut self, provider_key: &str, estimated_tokens: u64) {
+        self.ensure_provider(provider_key);
+        if let Some(m) = self.per_provider.get_mut(provider_key) {
+            m.request_count = m.request_count.saturating_add(1);
+            m.tokens_used = m.tokens_used.saturating_add(estimated_tokens);
+        }
+    }
+
+    fn metrics(&self, provider_key: &str) -> QuotaMetrics {
+        self.per_provider
+            .get(provider_key)
+            .cloned()
+            .unwrap_or_else(|| QuotaMetrics {
+                tokens_used: 0,
+                request_count: 0,
+                max_tokens: 1_000_000,
+                max_requests: 10_000,
+            })
+    }
+
+    fn usage_ratio(&self, provider_key: &str) -> f32 {
+        let m = self.metrics(provider_key);
+        let token_ratio = if m.max_tokens == 0 {
+            1.0
+        } else {
+            (m.tokens_used as f32 / m.max_tokens as f32).clamp(0.0, 1.0)
+        };
+        let request_ratio = if m.max_requests == 0 {
+            1.0
+        } else {
+            (m.request_count as f32 / m.max_requests as f32).clamp(0.0, 1.0)
+        };
+        token_ratio.max(request_ratio)
+    }
+
+    fn exhausted(&self, provider_key: &str) -> bool {
+        self.usage_ratio(provider_key) >= 1.0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -434,6 +596,9 @@ pub struct ChatApp {
 
     input_text: String,
     pending_attachments: Vec<Attachment>,
+    vision_staging: VisionStaging,
+    vision_thumbnail_cache: HashMap<String, egui::TextureHandle>,
+    quota_manager: QuotaManager,
 
     event_tx: tokio::sync::mpsc::Sender<AppEvent>,
     event_rx: tokio::sync::mpsc::Receiver<AppEvent>,
@@ -484,6 +649,25 @@ pub struct ChatApp {
 }
 
 impl ChatApp {
+    fn init_emoji_support(ctx: &egui::Context) {
+        egui_extras::install_image_loaders(ctx);
+
+        let mut fonts = FontDefinitions::default();
+        for family in [FontFamily::Proportional, FontFamily::Monospace] {
+            if let Some(chain) = fonts.families.get_mut(&family) {
+                if let Some(emoji_idx) = chain.iter().position(|name| name == "emoji-icon-font") {
+                    let emoji = chain.remove(emoji_idx);
+                    chain.push(emoji);
+                }
+                if let Some(noto_idx) = chain.iter().position(|name| name == "NotoEmoji-Regular") {
+                    let noto = chain.remove(noto_idx);
+                    chain.push(noto);
+                }
+            }
+        }
+        ctx.set_fonts(fonts);
+    }
+
     fn ingest_dropped_files(&mut self, ctx: &egui::Context) {
         let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
         if dropped_files.is_empty() {
@@ -688,8 +872,6 @@ impl ChatApp {
         request_refresh: &mut bool,
     ) {
         let is_dir = node.is_dir;
-        let node_marker = if is_dir { "[D]" } else { "[F]" };
-        let label = format!("{node_marker} {}", node.name);
 
         if is_dir {
             let expanded_now = self
@@ -699,19 +881,23 @@ impl ChatApp {
                 .unwrap_or(false);
             let chevron = if expanded_now { "▾" } else { "▸" };
             let mut toggle = false;
-            ui.horizontal(|ui| {
-                if ui
-                    .add(egui::Button::new(chevron).frame(false))
-                    .clicked()
-                {
-                    toggle = true;
-                }
-                let resp = ui.selectable_label(false, RichText::new(label).color(TEXT_PRIMARY));
-                resp.context_menu(|ui| {
-                    if ui.button("Refresh").clicked() {
-                        *request_refresh = true;
-                        ui.close_menu();
+            with_emoji_context(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(egui::Button::new(chevron).frame(false))
+                        .clicked()
+                    {
+                        toggle = true;
                     }
+                    EmojiLabel::new("📁").show(ui);
+                    let resp =
+                        ui.selectable_label(false, RichText::new(&node.name).color(TEXT_PRIMARY));
+                    resp.context_menu(|ui| {
+                        if ui.button("Refresh").clicked() {
+                            *request_refresh = true;
+                            ui.close_menu();
+                        }
+                    });
                 });
             });
             if toggle {
@@ -737,10 +923,16 @@ impl ChatApp {
         }
 
         let selected = self.active_open_file.as_deref() == Some(node.path.as_str());
-        let resp = ui.selectable_label(
-            selected,
-            RichText::new(label).color(if selected { GOLD } else { TEXT_PRIMARY }),
-        );
+        let resp = with_emoji_context(ui, |ui| {
+            ui.horizontal(|ui| {
+                EmojiLabel::new("📄").show(ui);
+                ui.selectable_label(
+                    selected,
+                    RichText::new(&node.name).color(if selected { GOLD } else { TEXT_PRIMARY }),
+                )
+            })
+            .inner
+        });
         if resp.double_clicked() {
             self.spawn_workspace_file_open(node.path.clone());
         }
@@ -849,12 +1041,13 @@ impl ChatApp {
     }
 
     fn render_workflow_visualizer(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::new()
-            .fill(Color32::from_rgba_unmultiplied(0x22, 0x24, 0x2A, 0xB8))
-            .corner_radius(8.0)
-            .stroke(egui::Stroke::new(1.0, BG_SURFACE_ALT))
-            .inner_margin(egui::Margin::same(10))
-            .show(ui, |ui| {
+        with_emoji_context(ui, |ui| {
+            egui::Frame::new()
+                .fill(Color32::from_rgba_unmultiplied(0x22, 0x24, 0x2A, 0xB8))
+                .corner_radius(8.0)
+                .stroke(egui::Stroke::new(1.0, BG_SURFACE_ALT))
+                .inner_margin(egui::Margin::same(10))
+                .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(
                         RichText::new("Swarm Workflow")
@@ -866,7 +1059,7 @@ impl ChatApp {
                     if !self.active_requests.is_empty() {
                         ui.spinner();
                     }
-                    ui.label(RichText::new(&self.swarm_status).small().color(TEXT_MUTED));
+                    EmojiLabel::new(&self.swarm_status).show(ui);
                 });
                 ui.add_space(8.0);
 
@@ -909,10 +1102,10 @@ impl ChatApp {
                             match step_status {
                                 WorkflowStepStatus::Running => ui.spinner(),
                                 WorkflowStepStatus::Success => {
-                                    ui.label(RichText::new("✅").color(STATUS_SUCCESS))
+                                    EmojiLabel::new("✅").show(ui)
                                 }
                                 WorkflowStepStatus::Failed => {
-                                    ui.label(RichText::new("❌").color(STATUS_ERROR))
+                                    EmojiLabel::new("❌").show(ui)
                                 }
                             };
 
@@ -936,7 +1129,8 @@ impl ChatApp {
                         ui.add_space(4.0);
                     }
                 });
-            });
+                });
+        });
     }
 
     fn clean_copy_text(content: &str) -> String {
@@ -1301,6 +1495,7 @@ impl ChatApp {
                 crate::parser::ActionKind::SearchWeb
                 | crate::parser::ActionKind::ReadUrl
                 | crate::parser::ActionKind::CaptureScreen
+                | crate::parser::ActionKind::RunAndObserve
                 | crate::parser::ActionKind::McpConnect
                 | crate::parser::ActionKind::McpListTools
                 | crate::parser::ActionKind::McpCallTool
@@ -1317,6 +1512,64 @@ impl ChatApp {
         } else {
             self.custom_model_id.trim().to_string()
         }
+    }
+
+    fn active_provider_key(&self) -> String {
+        self.settings.selected_provider.key().to_string()
+    }
+
+    fn provider_key_for_model(&self, model_id: &str) -> String {
+        let m = model_id.to_ascii_lowercase();
+        if m.contains("claude") || m.contains("anthropic") {
+            return "anthropic".to_string();
+        }
+        if m.contains("deepseek") {
+            return "deepseek".to_string();
+        }
+        if m.contains("huggingface") || m.contains("hf.co") {
+            return "huggingface".to_string();
+        }
+        self.active_provider_key()
+    }
+
+    fn estimate_tokens_from_messages(messages: &[ChatMessage]) -> u64 {
+        let mut total_chars = 0usize;
+        for m in messages {
+            total_chars = total_chars.saturating_add(m.role.len());
+            if let Some(text) = m.content.as_str() {
+                total_chars = total_chars.saturating_add(text.len());
+            } else if let Some(arr) = m.content.as_array() {
+                for item in arr {
+                    if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                        total_chars = total_chars.saturating_add(t.len());
+                    }
+                }
+            }
+        }
+        ((total_chars as f64 / TOKEN_ESTIMATE_CHARS_PER_TOKEN).ceil() as u64).max(1)
+    }
+
+    fn quota_usage_color(usage: f32) -> Color32 {
+        let u = usage.clamp(0.0, 1.0);
+        if u <= 0.60 {
+            let t = u / 0.60;
+            let r = (70.0 + (40.0 * t)) as u8;
+            let g = (170.0 + (60.0 * t)) as u8;
+            let b = (95.0 - (35.0 * t)) as u8;
+            return Color32::from_rgb(r, g, b);
+        }
+        if u <= 0.85 {
+            let t = (u - 0.60) / 0.25;
+            let r = (110.0 + (125.0 * t)) as u8;
+            let g = (230.0 - (80.0 * t)) as u8;
+            let b = (60.0 - (20.0 * t)) as u8;
+            return Color32::from_rgb(r, g, b);
+        }
+        let t = (u - 0.85) / 0.15;
+        let r = (235.0 - (25.0 * t)) as u8;
+        let g = (150.0 - (110.0 * t)) as u8;
+        let b = (40.0 - (20.0 * t)) as u8;
+        Color32::from_rgb(r, g, b)
     }
 
     fn current_reasoning_capability(&self) -> ReasoningCapability {
@@ -1779,6 +2032,7 @@ impl ChatApp {
 
     pub fn new(cc: &eframe::CreationContext, rt: Arc<tokio::runtime::Runtime>) -> Self {
         let (event_tx, event_rx) = tokio::sync::mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        Self::init_emoji_support(&cc.egui_ctx);
         let settings = load_settings();
         let db_path = settings.db_path.clone();
         Self::apply_theme(&cc.egui_ctx, settings.dark_mode);
@@ -1817,6 +2071,9 @@ impl ChatApp {
             execution_policy: ExecutionPolicy::Manual,
             input_text: String::new(),
             pending_attachments: vec![],
+            vision_staging: VisionStaging::default(),
+            vision_thumbnail_cache: HashMap::new(),
+            quota_manager: QuotaManager::default(),
             event_tx,
             event_rx,
             tokio_rt: rt,
@@ -1986,9 +2243,10 @@ impl ChatApp {
 
         let api_key = self.settings.active_api_key();
         let base_url = self.settings.active_base_url();
+        let provider_key = self.active_provider_key();
         let tx = self.event_tx.clone();
         self.tokio_rt.spawn(async move {
-            let client = crate::api::OpenAIClient::new(&api_key, &base_url);
+            let client = crate::api::OpenAIClient::with_provider(&provider_key, &api_key, &base_url);
             let model_ids: Vec<crate::api::openai::RemoteModelInfo> =
                 client.list_models().await.unwrap_or_default();
             let _ = tx.send(AppEvent::ModelsLoaded(model_ids)).await;
@@ -2107,6 +2365,11 @@ impl ChatApp {
         let event_tx = self.event_tx.clone();
         let req_id = request_id.clone();
         let model_id = model_id.clone();
+        let provider_key = self.provider_key_for_model(&model_id);
+        self.quota_manager.record_usage(
+            &provider_key,
+            Self::estimate_tokens_from_messages(&api_messages).saturating_add(64),
+        );
         let shared_rag_client = self.rag_client.clone();
         let approval_waiters = self.approval_waiters.clone();
         let mcp_manager = self.mcp_manager.clone();
@@ -2167,7 +2430,7 @@ impl ChatApp {
                 }
             }
 
-            let client = crate::api::OpenAIClient::new(&api_key, &base_url);
+            let client = crate::api::OpenAIClient::with_provider(&provider_key, &api_key, &base_url);
             let _ = event_tx
                 .send(AppEvent::SwarmStatus {
                     request_id: req_id.clone(),
@@ -2367,17 +2630,22 @@ impl ChatApp {
                         AgentRole::CodeArchitect => !matches!(
                             a.action,
                             ActionKind::RunCmd
+                                | ActionKind::RunAndObserve
                                 | ActionKind::McpConnect
                                 | ActionKind::McpListTools
                                 | ActionKind::McpCallTool
                                 | ActionKind::McpDisconnect
                         ),
-                        AgentRole::SystemAdmin => !matches!(a.action, ActionKind::RunCmd) || shell_enabled,
+                        AgentRole::SystemAdmin => {
+                            !matches!(a.action, ActionKind::RunCmd | ActionKind::RunAndObserve)
+                                || shell_enabled
+                        }
                         AgentRole::WebResearcher => matches!(
                             a.action,
                             ActionKind::SearchWeb
                                 | ActionKind::ReadUrl
                                 | ActionKind::CaptureScreen
+                                | ActionKind::RunAndObserve
                                 | ActionKind::McpConnect
                                 | ActionKind::McpListTools
                                 | ActionKind::McpCallTool
@@ -2398,6 +2666,12 @@ impl ChatApp {
                         ActionKind::CaptureScreen if !screen_awareness_enabled => {
                             swarm_memory.push_str(
                                 "\n[Screen Awareness blocked]\ncapture_screen ignored because Screen Awareness is disabled in settings.\n",
+                            );
+                            None
+                        }
+                        ActionKind::RunAndObserve if !screen_awareness_enabled => {
+                            swarm_memory.push_str(
+                                "\n[Screen Awareness blocked]\nrun_and_observe ignored because Screen Awareness is disabled in settings.\n",
                             );
                             None
                         }
@@ -2510,6 +2784,26 @@ impl ChatApp {
                             auto_approve_enabled = next_auto_approve_state;
                             match status {
                                 ExecutionStatus::Executed(report) => {
+                                    if let Some(png_bytes) = report.screenshot_png_bytes.clone() {
+                                        let image = ImageData {
+                                            id: Uuid::new_v4().to_string(),
+                                            filename: crate::screen_awareness::default_filename(),
+                                            png_bytes,
+                                            mime_type: "image/png".to_string(),
+                                            source: report
+                                                .screenshot_source
+                                                .clone()
+                                                .unwrap_or_else(|| "focused_window".to_string()),
+                                            width: report.screenshot_width.unwrap_or(0),
+                                            height: report.screenshot_height.unwrap_or(0),
+                                        };
+                                        let _ = event_tx
+                                            .send(AppEvent::VisionStaged {
+                                                request_id: req_id.clone(),
+                                                image,
+                                            })
+                                            .await;
+                                    }
                                     let _ = event_tx
                                         .send(AppEvent::SwarmWorkflowStep {
                                             request_id: req_id.clone(),
@@ -3123,6 +3417,11 @@ impl ChatApp {
 
     fn send_message(&mut self) {
         let text = self.input_text.trim().to_string();
+        let provider_key = self.active_provider_key();
+        if self.quota_manager.exhausted(&provider_key) {
+            self.notify("Quota exhausted for active provider", NotificationKind::Error);
+            return;
+        }
         if text.is_empty() && self.pending_attachments.is_empty() {
             return;
         };
@@ -3171,6 +3470,72 @@ impl ChatApp {
         }
 
         self.dispatch_agent_requests(session_idx);
+    }
+
+    fn stage_image(&mut self, image: ImageData) {
+        self.vision_staging.images.push(image);
+    }
+
+    fn delete_staged_image(&mut self, index: usize) {
+        if index < self.vision_staging.images.len() {
+            let removed = self.vision_staging.images.remove(index);
+            self.vision_thumbnail_cache.remove(&removed.id);
+            self.vision_staging.undo_stack.push(removed);
+        }
+    }
+
+    fn undo_staged_delete(&mut self) {
+        if let Some(image) = self.vision_staging.undo_stack.pop() {
+            self.vision_staging.images.push(image);
+        }
+    }
+
+    fn send_staged_images_to_swarm(&mut self) {
+        if self.vision_staging.images.is_empty() {
+            self.notify("Vision staging is empty", NotificationKind::Info);
+            return;
+        }
+        if self.input_text.trim().is_empty() {
+            self.notify(
+                "Add a message before sending staged screenshots to Swarm",
+                NotificationKind::Error,
+            );
+            return;
+        }
+
+        let staged = std::mem::take(&mut self.vision_staging.images);
+        self.vision_staging.undo_stack.clear();
+        self.vision_thumbnail_cache.clear();
+        for img in staged {
+            self.pending_attachments.push(Attachment {
+                filename: img.filename,
+                text: None,
+                image_base64: Some(general_purpose::STANDARD.encode(&img.png_bytes)),
+                mime_type: img.mime_type,
+                raw_bytes: img.png_bytes,
+            });
+        }
+        self.send_message();
+    }
+
+    fn staging_texture<'a>(
+        &'a mut self,
+        ctx: &egui::Context,
+        image: &ImageData,
+    ) -> Option<&'a egui::TextureHandle> {
+        if !self.vision_thumbnail_cache.contains_key(&image.id) {
+            let rgba = image::load_from_memory(&image.png_bytes).ok()?.to_rgba8();
+            let size = [rgba.width() as usize, rgba.height() as usize];
+            let pixels = rgba.into_raw();
+            let color_image = egui::ColorImage::from_rgba_unmultiplied(size, &pixels);
+            let tex = ctx.load_texture(
+                format!("vision_thumb_{}", image.id),
+                color_image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.vision_thumbnail_cache.insert(image.id.clone(), tex);
+        }
+        self.vision_thumbnail_cache.get(&image.id)
     }
 
     fn process_events(&mut self) {
@@ -3295,6 +3660,11 @@ impl ChatApp {
                 } => {
                     if self.active_requests.contains_key(&request_id) {
                         self.begin_workflow_step(&request_id, title, details);
+                    }
+                }
+                AppEvent::VisionStaged { request_id, image } => {
+                    if self.active_requests.contains_key(&request_id) {
+                        self.stage_image(image);
                     }
                 }
                 AppEvent::ExecutionApprovalRequested {
@@ -3931,13 +4301,14 @@ impl ChatApp {
         let width = ui.available_width();
         let max_bubble = (width * 0.75).min(700.0);
 
-        ui.with_layout(
-            if is_user {
-                egui::Layout::right_to_left(egui::Align::TOP)
-            } else {
-                egui::Layout::left_to_right(egui::Align::TOP)
-            },
-            |ui| {
+        with_emoji_context(ui, |ui| {
+            ui.with_layout(
+                if is_user {
+                    egui::Layout::right_to_left(egui::Align::TOP)
+                } else {
+                    egui::Layout::left_to_right(egui::Align::TOP)
+                },
+                |ui| {
                 ui.set_max_width(max_bubble);
 
                 let (bg_color, text_color) = if is_user {
@@ -3996,25 +4367,27 @@ impl ChatApp {
                             for att in &msg.attachments {
                                 ui.separator();
                                 if att.image_base64.is_some() {
-                                    if ui
-                                        .button(
-                                            RichText::new(format!(
-                                                "🖼 {} (click to download)",
-                                                att.filename
-                                            ))
-                                            .color(SKY_BLUE)
-                                            .small(),
-                                        )
-                                        .clicked()
-                                    {
-                                        self.download_image(att);
-                                    }
+                                    ui.horizontal(|ui| {
+                                        EmojiLabel::new("🖼").show(ui);
+                                        if ui
+                                            .button(
+                                                RichText::new(format!(
+                                                    "{} (click to download)",
+                                                    att.filename
+                                                ))
+                                                .color(SKY_BLUE)
+                                                .small(),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.download_image(att);
+                                        }
+                                    });
                                 } else {
-                                    ui.label(
-                                        RichText::new(format!("📄 {}", att.filename))
-                                            .color(SKY_BLUE)
-                                            .small(),
-                                    );
+                                    ui.horizontal(|ui| {
+                                        EmojiLabel::new("📄").show(ui);
+                                        ui.label(RichText::new(&att.filename).color(SKY_BLUE).small());
+                                    });
                                 }
                             }
 
@@ -4029,8 +4402,9 @@ impl ChatApp {
                             });
                         });
                     });
-            },
-        );
+                },
+            );
+        });
     }
 }
 
@@ -4088,6 +4462,27 @@ impl eframe::App for ChatApp {
                                     .as_deref()
                                     .unwrap_or(""),
                             );
+                        }
+                        ActionKind::RunAndObserve => {
+                            ui.label("Run and observe command:");
+                            ui.monospace(
+                                pending
+                                    .request
+                                    .action
+                                    .parameters
+                                    .command
+                                    .as_deref()
+                                    .unwrap_or(""),
+                            );
+                            ui.label(format!(
+                                "delay_secs={}",
+                                pending
+                                    .request
+                                    .action
+                                    .parameters
+                                    .delay_secs
+                                    .unwrap_or(3)
+                            ));
                         }
                         ActionKind::EditFile => {
                             let path = pending
@@ -4684,27 +5079,30 @@ impl eframe::App for ChatApp {
                         .inner_margin(egui::Margin::same(8)),
                 )
                 .show(ctx, |ui| {
-                    ui.label(
-                        RichText::new("AI Chat Bot")
-                            .font(FontId::proportional(18.0))
-                            .color(TEXT_PRIMARY)
-                            .strong(),
-                    );
-                    ui.separator();
+                    ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("AI Chat Bot")
+                                    .font(FontId::proportional(18.0))
+                                    .color(TEXT_PRIMARY)
+                                    .strong(),
+                            );
+                            ui.separator();
 
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 32.0],
-                            egui::Button::new(RichText::new("＋ New Chat").color(TEXT_DARK))
-                                .fill(GOLD),
-                        )
-                        .clicked()
-                    {
-                        self.new_session();
-                    }
+                            if ui
+                                .add_sized(
+                                    [ui.available_width(), 32.0],
+                                    egui::Button::new(RichText::new("＋ New Chat").color(TEXT_DARK))
+                                        .fill(GOLD),
+                                )
+                                .clicked()
+                            {
+                                self.new_session();
+                            }
 
-                    ui.separator();
-                    ui.collapsing("Conversations", |ui| {
+                            ui.separator();
+                            ui.collapsing("Conversations", |ui| {
                         let list_max_height =
                             (ui.available_height() * CONVERSATIONS_LIST_MAX_HEIGHT_RATIO)
                                 .max(200.0);
@@ -4870,6 +5268,38 @@ impl eframe::App for ChatApp {
                             self.ensure_thinking_mode_valid_for_model();
                         }
                     });
+                    ui.separator();
+                    ui.collapsing("API Health", |ui| {
+                        let provider_key = self.active_provider_key();
+                        self.quota_manager.ensure_provider(&provider_key);
+                        let metrics = self.quota_manager.metrics(&provider_key);
+                        let usage = self.quota_manager.usage_ratio(&provider_key);
+                        let color = Self::quota_usage_color(usage);
+                        let bar = egui::ProgressBar::new(usage)
+                            .show_percentage()
+                            .fill(color)
+                            .desired_width(ui.available_width())
+                            .text(format!("{:.1}% used", usage * 100.0));
+                        ui.add(bar);
+                        ui.label(
+                            RichText::new(format!(
+                                "tokens: {}/{} | requests: {}/{}",
+                                metrics.tokens_used,
+                                metrics.max_tokens,
+                                metrics.request_count,
+                                metrics.max_requests
+                            ))
+                            .small()
+                            .color(TEXT_MUTED),
+                        );
+                        if self.quota_manager.exhausted(&provider_key) {
+                            ui.label(
+                                RichText::new("Quota Exhausted")
+                                    .small()
+                                    .color(QUOTA_EXHAUSTED_TEXT_COLOR),
+                            );
+                        }
+                    });
 
                     ui.horizontal(|ui| {
                         ui.label("Execution policy:");
@@ -4948,7 +5378,7 @@ impl eframe::App for ChatApp {
                         );
                         ui.checkbox(
                             &mut self.settings.screen_awareness_enabled,
-                            "Screen Awareness (capture_screen)",
+                            "Screen Awareness (capture_screen, run_and_observe)",
                         );
                         ui.checkbox(&mut self.settings.mcp_enabled, "MCP integration");
                         ui.checkbox(&mut self.settings.dark_mode, "Dark mode");
@@ -5043,6 +5473,7 @@ impl eframe::App for ChatApp {
                             self.notify("Schedules saved.", NotificationKind::Info);
                         }
                     });
+                        });
                 });
         }
 
@@ -5175,6 +5606,98 @@ impl eframe::App for ChatApp {
                     .fill(BURGUNDY_DARK)
                     .inner_margin(egui::Margin::same(8))
                     .show(ui, |ui| {
+                        ui.group(|ui| {
+                            ui.horizontal(|ui| {
+                                EmojiLabel::new("🧠").show(ui);
+                                ui.label(RichText::new("Vision Staging").color(GOLD).strong());
+                                if ui
+                                    .add_enabled(
+                                        !self.vision_staging.undo_stack.is_empty(),
+                                        egui::Button::new("Undo (Ctrl+Z)"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.undo_staged_delete();
+                                }
+                                EmojiLabel::new("↩️").show(ui);
+                                if ui
+                                    .add_enabled(
+                                        !self.vision_staging.images.is_empty(),
+                                        egui::Button::new("Send to Swarm"),
+                                    )
+                                    .clicked()
+                                {
+                                    self.send_staged_images_to_swarm();
+                                }
+                                EmojiLabel::new("🚀").show(ui);
+                            });
+                            if self.vision_staging.images.is_empty() {
+                                ui.label(
+                                    RichText::new("No staged screenshots yet.").small().color(TEXT_MUTED),
+                                );
+                            } else {
+                                let mut pending_delete_idx: Option<usize> = None;
+                                ScrollArea::horizontal()
+                                    .auto_shrink([false, false])
+                                    .id_salt("vision_staging_filmstrip")
+                                    .max_height(130.0)
+                                    .show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            for idx in 0..self.vision_staging.images.len() {
+                                                let staged = self.vision_staging.images[idx].clone();
+                                                ui.group(|ui| {
+                                                    if let Some(tex) =
+                                                        self.staging_texture(ctx, &staged)
+                                                    {
+                                                        ui.add(
+                                                            egui::Image::new(tex)
+                                                                .fit_to_exact_size(Vec2::new(96.0, 72.0)),
+                                                        );
+                                                    } else {
+                                                        ui.label(
+                                                            RichText::new("Preview unavailable")
+                                                                .small()
+                                                                .color(TEXT_MUTED),
+                                                        );
+                                                    }
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "{}×{}",
+                                                            staged.width, staged.height
+                                                        ))
+                                                        .small()
+                                                        .color(TEXT_MUTED),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(&staged.source)
+                                                            .small()
+                                                            .color(TEXT_MUTED),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(&staged.filename)
+                                                            .small()
+                                                            .color(SKY_BLUE),
+                                                    );
+                                                    ui.horizontal(|ui| {
+                                                        EmojiLabel::new("🗑️").show(ui);
+                                                        if ui.small_button("Delete").clicked() {
+                                                            pending_delete_idx = Some(idx);
+                                                        }
+                                                    });
+                                                });
+                                            }
+                                        });
+                                    });
+                                if let Some(idx) = pending_delete_idx {
+                                    self.delete_staged_image(idx);
+                                }
+                            }
+                        });
+
+                        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
+                            self.undo_staged_delete();
+                        }
+
                         if !self.pending_attachments.is_empty() {
                             ui.horizontal_wrapped(|ui| {
                                 ui.label(RichText::new("📎 Attachments:").color(GOLD).small());
@@ -5194,6 +5717,8 @@ impl eframe::App for ChatApp {
                                 .hint_text("Type a message…")
                                 .frame(true);
                             let response = ui.add(text_edit);
+                            let provider_key = self.active_provider_key();
+                            let quota_exhausted = self.quota_manager.exhausted(&provider_key);
                             if response.has_focus()
                                 && ctx.input(|i| {
                                     i.key_pressed(egui::Key::Enter)
@@ -5202,22 +5727,23 @@ impl eframe::App for ChatApp {
                                         && !i.modifiers.ctrl
                                         && !i.modifiers.alt
                                 })
+                                && !quota_exhausted
                             {
                                 self.send_message();
                             }
 
                             ui.vertical(|ui| {
-                                if ui
-                                    .add_sized(
-                                        [110.0, 36.0],
-                                        egui::Button::new(
-                                            RichText::new("📤 Send").color(DARK_TEXT),
-                                        )
-                                        .fill(GOLD),
-                                    )
-                                    .clicked()
-                                {
+                                let send_resp = ui.add_enabled(
+                                    !quota_exhausted,
+                                    egui::Button::new(RichText::new("📤 Send").color(DARK_TEXT))
+                                        .fill(GOLD)
+                                        .min_size(Vec2::new(110.0, 36.0)),
+                                );
+                                if send_resp.clicked() {
                                     self.send_message();
+                                }
+                                if quota_exhausted {
+                                    send_resp.on_hover_text("Quota Exhausted");
                                 }
                                 if ui
                                     .add_sized(
