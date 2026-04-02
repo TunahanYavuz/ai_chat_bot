@@ -22,7 +22,6 @@ pub struct McpServerConfig {
 pub struct McpToolInfo {
     pub name: String,
     pub description: String,
-    pub input_schema: Value,
     pub llm_tool_schema: Value,
 }
 
@@ -184,7 +183,6 @@ impl McpManager {
                     }),
                     name: tool.name,
                     description,
-                    input_schema: schema,
                 }
             })
             .collect();
@@ -237,15 +235,22 @@ impl McpManager {
 
 fn sanitize_identifier(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
+    let mut prev_is_underscore = false;
     for ch in input.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' {
-            out.push(ch.to_ascii_lowercase());
+        let normalized = if ch.is_ascii_alphanumeric() || ch == '_' {
+            ch.to_ascii_lowercase()
         } else {
-            out.push('_');
+            '_'
+        };
+        if normalized == '_' {
+            if !prev_is_underscore {
+                out.push('_');
+            }
+            prev_is_underscore = true;
+        } else {
+            out.push(normalized);
+            prev_is_underscore = false;
         }
-    }
-    while out.contains("__") {
-        out = out.replace("__", "_");
     }
     out.trim_matches('_').to_string()
 }
