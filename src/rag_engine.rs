@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use ignore::WalkBuilder;
-use std::sync::Arc;
 use qdrant_client::qdrant::{
     vectors_config::Config, CreateCollection, Distance, PointStruct, SearchPoints, UpsertPoints,
     Value, VectorParams, VectorsConfig,
 };
 use qdrant_client::Qdrant;
+use std::sync::Arc;
 use tokio::task::JoinSet;
 
 /// Configuration for the repository-aware retrieval engine.
@@ -320,7 +320,10 @@ where
             .await
             .context("failed to embed learning snippet")?;
         let mut payload = std::collections::HashMap::new();
-        payload.insert("file_path".to_string(), Value::from(format!("[learned] {title}")));
+        payload.insert(
+            "file_path".to_string(),
+            Value::from(format!("[learned] {title}")),
+        );
         payload.insert("snippet".to_string(), Value::from(content.to_string()));
         self.client
             .upsert_points(UpsertPoints {

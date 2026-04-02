@@ -1,6 +1,6 @@
+use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use reqwest::header::HeaderMap;
 
 /// Reasoning level used by models that support tiered thinking controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,7 +99,10 @@ pub fn reasoning_config_for_model(model_name: &str) -> ModelReasoningConfig {
         ("qwen-long", REASONING_BINARY),
     ];
 
-    if let Some((_, cfg)) = known_mappings.iter().find(|(prefix, _)| m.starts_with(prefix)) {
+    if let Some((_, cfg)) = known_mappings
+        .iter()
+        .find(|(prefix, _)| m.starts_with(prefix))
+    {
         return *cfg;
     }
 
@@ -288,10 +291,8 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
         let limit_tokens = u64_header(headers, "x-ratelimit-limit-tokens")
             .or_else(|| u64_header(headers, "x-ratelimit-limit-token"))
             .or_else(|| u64_header(headers, "x-ratelimit-limit"));
-        let remaining_requests =
-            u64_header(headers, "x-ratelimit-remaining-requests").or_else(|| {
-                u64_header(headers, "x-ratelimit-remaining-request")
-            });
+        let remaining_requests = u64_header(headers, "x-ratelimit-remaining-requests")
+            .or_else(|| u64_header(headers, "x-ratelimit-remaining-request"));
         let limit_requests = u64_header(headers, "x-ratelimit-limit-requests")
             .or_else(|| u64_header(headers, "x-ratelimit-limit-request"));
         if remaining_tokens.is_none()
@@ -313,13 +314,19 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
         let usage = body.get("usage");
         let rate = body.get("rate_limit").or_else(|| body.get("rateLimit"));
         let remaining_tokens = rate
-            .and_then(|r| r.get("remaining_tokens").or_else(|| r.get("remainingTokens")))
+            .and_then(|r| {
+                r.get("remaining_tokens")
+                    .or_else(|| r.get("remainingTokens"))
+            })
             .and_then(|v| v.as_u64());
         let limit_tokens = rate
             .and_then(|r| r.get("limit_tokens").or_else(|| r.get("limitTokens")))
             .and_then(|v| v.as_u64());
         let remaining_requests = rate
-            .and_then(|r| r.get("remaining_requests").or_else(|| r.get("remainingRequests")))
+            .and_then(|r| {
+                r.get("remaining_requests")
+                    .or_else(|| r.get("remainingRequests"))
+            })
             .and_then(|v| v.as_u64());
         let limit_requests = rate
             .and_then(|r| r.get("limit_requests").or_else(|| r.get("limitRequests")))
@@ -345,7 +352,8 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
         client: &reqwest::Client,
         api_key: &str,
         base_url: &str,
-    ) -> futures_util::future::BoxFuture<'static, anyhow::Result<Option<ProviderQuotaSnapshot>>> {
+    ) -> futures_util::future::BoxFuture<'static, anyhow::Result<Option<ProviderQuotaSnapshot>>>
+    {
         let api_key = api_key.to_string();
         let base_url = base_url.to_string();
         let client = client.clone();
@@ -416,7 +424,11 @@ impl ProviderAdapter for AnthropicAdapter {
     fn stream_done(&self, data: &str) -> bool {
         serde_json::from_str::<serde_json::Value>(data)
             .ok()
-            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s == "message_stop"))
+            .and_then(|v| {
+                v.get("type")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s == "message_stop")
+            })
             .unwrap_or(false)
     }
 
@@ -476,13 +488,19 @@ impl ProviderAdapter for AnthropicAdapter {
         let usage = body.get("usage");
         let rate = body.get("rate_limit").or_else(|| body.get("rateLimit"));
         let remaining_tokens = rate
-            .and_then(|r| r.get("tokens_remaining").or_else(|| r.get("remaining_tokens")))
+            .and_then(|r| {
+                r.get("tokens_remaining")
+                    .or_else(|| r.get("remaining_tokens"))
+            })
             .and_then(|v| v.as_u64());
         let limit_tokens = rate
             .and_then(|r| r.get("tokens_limit").or_else(|| r.get("limit_tokens")))
             .and_then(|v| v.as_u64());
         let remaining_requests = rate
-            .and_then(|r| r.get("requests_remaining").or_else(|| r.get("remaining_requests")))
+            .and_then(|r| {
+                r.get("requests_remaining")
+                    .or_else(|| r.get("remaining_requests"))
+            })
             .and_then(|v| v.as_u64());
         let limit_requests = rate
             .and_then(|r| r.get("requests_limit").or_else(|| r.get("limit_requests")))
@@ -508,7 +526,8 @@ impl ProviderAdapter for AnthropicAdapter {
         client: &reqwest::Client,
         api_key: &str,
         base_url: &str,
-    ) -> futures_util::future::BoxFuture<'static, anyhow::Result<Option<ProviderQuotaSnapshot>>> {
+    ) -> futures_util::future::BoxFuture<'static, anyhow::Result<Option<ProviderQuotaSnapshot>>>
+    {
         let api_key = api_key.to_string();
         let base_url = base_url.to_string();
         let client = client.clone();

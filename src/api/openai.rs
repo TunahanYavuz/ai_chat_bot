@@ -1,11 +1,11 @@
-use anyhow::{anyhow, Result};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use crate::models::{
     provider_adapter_for, ProviderAdapter, ProviderQuotaSnapshot, ProviderRequestOptions,
     ReasoningCapability, ThinkingMode,
 };
+use anyhow::{anyhow, Result};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
@@ -176,7 +176,9 @@ impl OpenAIClient {
             .collect();
         let mut opts = options.clone();
         opts.stream = false;
-        let payload = self.adapter.build_chat_payload(model, &payload_messages, &opts);
+        let payload = self
+            .adapter
+            .build_chat_payload(model, &payload_messages, &opts);
 
         let url = self.adapter.chat_endpoint(&self.base_url);
         let mut request = self.client.post(&url);
@@ -220,20 +222,19 @@ impl OpenAIClient {
                 .base_url
                 .trim_end_matches('/')
                 .starts_with("https://api.openai.com/v1");
-        let include_reasoning =
-            if matches!(reasoning_capability, ReasoningCapability::Binary) && binary_reasoning_enabled
-            {
-                Some(true)
-            } else {
-                None
-            };
+        let include_reasoning = if matches!(reasoning_capability, ReasoningCapability::Binary)
+            && binary_reasoning_enabled
+        {
+            Some(true)
+        } else {
+            None
+        };
 
         let request = ChatRequest {
             model: model.to_string(),
             messages: normalized_messages,
             reasoning_effort: if supports_reasoning_effort {
-                tiered_reasoning_level
-                    .map(|m| m.as_reasoning_effort().to_string())
+                tiered_reasoning_level.map(|m| m.as_reasoning_effort().to_string())
             } else {
                 None
             },
@@ -362,9 +363,8 @@ impl OpenAIClient {
         let body: serde_json::Value = response.json().await.unwrap_or_default();
         let body_quota = self.adapter.parse_quota_from_body(&body);
         let quota = self.adapter.merge_quota(header_quota, body_quota);
-        let models: ModelsResponse = serde_json::from_value(body).unwrap_or(ModelsResponse {
-            data: vec![],
-        });
+        let models: ModelsResponse =
+            serde_json::from_value(body).unwrap_or(ModelsResponse { data: vec![] });
         let mut items: Vec<RemoteModelInfo> = models
             .data
             .into_iter()

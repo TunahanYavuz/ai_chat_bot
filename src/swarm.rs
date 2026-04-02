@@ -1,6 +1,12 @@
 use serde::Deserialize;
 
 const UNIVERSAL_NLU_PROTOCOL: &str = r#"GLOBAL NLU PROTOCOL: The user may command you in ANY language (Turkish, Spanish, etc.). You must understand their intent and reply in their language in the 'MESSAGE:' block. HOWEVER, your internal reasoning and the JSON `EXECUTION_BLOCK` MUST remain strictly in English. Never translate OS commands (e.g., use `mkdir`, not `klasör_aç`) or JSON keys."#;
+const TRANSLATION_INTERCEPTOR_PROTOCOL: &str = r#"TRANSLATION INTERCEPTOR PROTOCOL:
+- Router must detect if the latest user request is non-English.
+- If non-English, Router must first perform a technical translation into precise English intent before routing tasks.
+- Router task payloads for internal agents (SystemAdmin, CodeArchitect, WebResearcher) must use this English technical intent.
+- Do not translate command names, JSON keys, table names, schema identifiers, or log fields.
+- If request is already English, route directly without translation."#;
 
 const VISUAL_QA_PROTOCOL: &str = r#"VISUAL QA PROTOCOL:
 If the user provides image/screenshot context, perform visual QA triage before proposing actions:
@@ -20,6 +26,14 @@ const MCP_PROTOCOL: &str = r#"MCP PROTOCOL:
 - You have native access to external tools via MCP. DO NOT write Python/Bash scripts for database queries, file reading, or API fetching if an MCP tool is available. Call the tool directly.
 - For database tasks, always prefer registered MCP database tools over custom scripts.
 - If MCP package/launch fails with 404/Not Found, autonomously research the correct package name and retry MCP launch with the corrected package."#;
+const SQLITE_MCP_PROTOCOL: &str = r#"SQLITE MCP ENFORCEMENT:
+- For SQLite tasks, default launch command must be: `npx -y mcp-server-sqlite --db <path_to_db>`.
+- For "read database" requests, follow this sequence:
+  1) locate the `.db` file path from repository context / file explorer / RAG evidence,
+  2) connect MCP using the SQLite launch command above,
+  3) call `mcp_list_tools`,
+  4) execute the query using discovered MCP tools.
+- Never replace SQLite MCP querying with custom shell/sqlite scripts when MCP is available."#;
 
 const DIRECTORY_ENFORCEMENT_PROTOCOL: &str = r#"DIRECTORY ENFORCEMENT PROTOCOL:
 - Keep the workspace root clean. Do NOT place auxiliary/generated artifacts in root.
@@ -142,6 +156,7 @@ ROUTING RULES:
 ROBUSTNESS:
 - If user intent is ambiguous, split into minimal safe sequential tasks.
 - Do not emit unknown keys.
+- Every routed task text must be in English technical intent form for execution reliability.
 - Do not include MESSAGE/PLAN sections for Router. JSON array only."#
             .to_string(),
         AgentRole::SystemAdmin => r#"You are SystemAdmin in a multi-agent swarm.
@@ -229,7 +244,7 @@ FAILURE HANDLING:
             .to_string(),
     };
     format!(
-        "{base}\n\n{UNIVERSAL_NLU_PROTOCOL}\n\n{STRICT_JSON_ACTION_SCHEMA}\n\n{ERROR_RECOVERY_PROTOCOL}\n\n{SECURITY_GUARDRAILS_PROTOCOL}\n\n{DEPENDENCY_AWARENESS_PROTOCOL}\n\n{SELF_HEALING_PROTOCOL}\n\n{VISUAL_QA_PROTOCOL}\n\n{WEB_SYNTHESIS_PROTOCOL}\n\n{MCP_PROTOCOL}\n\n{DIRECTORY_ENFORCEMENT_PROTOCOL}"
+        "{base}\n\n{UNIVERSAL_NLU_PROTOCOL}\n\n{TRANSLATION_INTERCEPTOR_PROTOCOL}\n\n{STRICT_JSON_ACTION_SCHEMA}\n\n{ERROR_RECOVERY_PROTOCOL}\n\n{SECURITY_GUARDRAILS_PROTOCOL}\n\n{DEPENDENCY_AWARENESS_PROTOCOL}\n\n{SELF_HEALING_PROTOCOL}\n\n{VISUAL_QA_PROTOCOL}\n\n{WEB_SYNTHESIS_PROTOCOL}\n\n{MCP_PROTOCOL}\n\n{SQLITE_MCP_PROTOCOL}\n\n{DIRECTORY_ENFORCEMENT_PROTOCOL}"
     )
 }
 
@@ -253,10 +268,14 @@ RULES:
 - If commands/actions failed, analyze stderr context and provide the most likely root cause and safest next action.
 - If evidence is incomplete, state what is missing explicitly.
 - Never include runnable actions in Synthesizer output; actions must remain empty.
+- Always respond in the user's original language.
+- Keep technical artifacts intact (table names, schema names, SQL/code blocks, logs, and identifiers must not be translated).
 - DIRECTIVE: If execution output contains structured/tabular data (SQL results, CSV rows, JSON lists, or log tables), you MUST render that data as a clean Markdown table in MESSAGE. Do not only summarize.
 - FORMATTING: Use standard Markdown table syntax (| Col 1 | Col 2 |), preserve raw values faithfully, and keep headers/columns readable and aligned.
 
 {UNIVERSAL_NLU_PROTOCOL}
+
+{TRANSLATION_INTERCEPTOR_PROTOCOL}
 
 {STRICT_JSON_ACTION_SCHEMA}
 
@@ -273,6 +292,8 @@ RULES:
 {WEB_SYNTHESIS_PROTOCOL}
 
 {MCP_PROTOCOL}
+
+{SQLITE_MCP_PROTOCOL}
 
 {DIRECTORY_ENFORCEMENT_PROTOCOL}"#
     )
