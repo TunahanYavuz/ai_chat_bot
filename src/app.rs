@@ -27,7 +27,7 @@ use crate::parser::ActionKind;
 use crate::rag_engine::{EmbeddingProvider, RagConfig, RagEngine};
 use crate::setup::SetupWizard;
 use crate::storage::{ChatSession, Storage, StoredMessage, StoredQuotaMetrics, StoredRole};
-use crate::swarm::{get_system_prompt, parse_router_plan, AgentRole, RoutedTask};
+use crate::swarm::{get_synthesizer_system_prompt, get_system_prompt, parse_router_plan, AgentRole, RoutedTask};
 use crate::telemetry::collect_telemetry_cached;
 use crate::watcher::run_workspace_watcher;
 use qdrant_client::Qdrant;
@@ -76,15 +76,6 @@ const AUTONOMOUS_TRIGGER_KEYWORDS: [&str; 6] = [
     "her gün",
     "zamanla",
 ];
-const SWARM_SYNTH_ROLE_PROMPT: &str = r#"You are Synthesizer in a multi-agent swarm.
-Output format:
-MESSAGE: ...
-PLAN: ```json ... ```
-Rules:
-- Produce a final user-facing summary in MESSAGE using only gathered execution data.
-- Include key findings, errors, and blocked steps when relevant.
-- If no reliable result is available, clearly state what is missing.
-- Keep PLAN as an empty JSON object."#;
 /// Prepended as the first system prompt for API requests so responses include
 /// a user-facing message plus a machine-readable ```json ... ``` execution block.
 const CORE_OS_SYSTEM_PROMPT: &str = r#"You are 'CoreOS', an advanced local File System and Command Line Interface (CLI) Agent. Your purpose is to assist the user by generating precise, executable commands while maintaining a helpful, conversational tone.
@@ -3041,8 +3032,9 @@ impl ChatApp {
                     })
                     .await;
 
+                let synth_role_prompt = get_synthesizer_system_prompt();
                 let synth_system_prompt = format!(
-                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{rag_context}\n\n{SWARM_SYNTH_ROLE_PROMPT}\n\nUser request:\n{query}\n\nSwarm memory:\n{swarm_memory}",
+                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{rag_context}\n\n{synth_role_prompt}\n\nUser request:\n{query}\n\nSwarm memory:\n{swarm_memory}",
                     swarm_memory = swarm_memory
                 );
                 let mut synth_messages = api_messages.clone();

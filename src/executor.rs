@@ -668,7 +668,7 @@ impl ActionExecutor {
     }
 
     async fn execute_command(&self, cmd: &str) -> Result<ExecutionReport> {
-        let normalized_cmd = self.normalize_generated_script_command(cmd);
+        let normalized_cmd = self.normalize_command_for_safe_execution(cmd);
         let mut command = if cfg!(target_os = "windows") {
             let mut c = Command::new("cmd");
             c.args(["/C", &normalized_cmd]);
@@ -749,7 +749,7 @@ impl ActionExecutor {
     where
         F: FnMut(bool, String) + Send + 'static,
     {
-        let normalized_cmd = self.normalize_generated_script_command(cmd);
+        let normalized_cmd = self.normalize_command_for_safe_execution(cmd);
         let mut command = if cfg!(target_os = "windows") {
             let mut c = Command::new("cmd");
             c.args(["/C", &normalized_cmd]);
@@ -942,6 +942,11 @@ impl ActionExecutor {
         self.workspace_root.join(bucket).join(normalized)
     }
 
+    fn normalize_command_for_safe_execution(&self, cmd: &str) -> String {
+        let maybe_non_interactive = make_install_command_non_interactive(cmd);
+        self.normalize_generated_script_command(&maybe_non_interactive)
+    }
+
     fn normalize_generated_script_command(&self, cmd: &str) -> String {
         let trimmed = cmd.trim();
         if trimmed.is_empty() {
@@ -1087,6 +1092,47 @@ fn should_skip_timeout_for_ui_app(cmd: &str) -> bool {
         "npm run dev",
     ];
     ui_indicators.iter().any(|pat| normalized.contains(pat))
+}
+
+fn make_install_command_non_interactive(cmd: &str) -> String {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return trimmed.to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+
+    if lower.contains("pacman -s") {
+        let mut rebuilt = trimmed.to_string();
+        if !contains_flag(trimmed, "--noconfirm") {
+            rebuilt.push_str(" --noconfirm");
+        }
+        if !contains_flag(trimmed, "--needed") {
+            rebuilt.push_str(" --needed");
+        }
+        return rebuilt;
+    }
+
+    if (lower.contains("apt-get install")
+        || lower.contains("apt install")
+        || lower.contains("dnf install")
+        || lower.contains("yum install")
+        || lower.contains("zypper install"))
+        && !contains_flag(trimmed, "-y")
+        && !contains_flag(trimmed, "--yes")
+    {
+        return format!("{trimmed} -y");
+    }
+
+    if lower.starts_with("npx ") && !contains_flag(trimmed, "-y") && !contains_flag(trimmed, "--yes")
+    {
+        return format!("{trimmed} -y");
+    }
+
+    trimmed.to_string()
+}
+
+fn contains_flag(cmd: &str, flag: &str) -> bool {
+    cmd.split_whitespace().any(|part| part == flag)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
