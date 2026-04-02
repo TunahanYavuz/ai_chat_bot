@@ -14,6 +14,7 @@ use tokio::time::{timeout, Duration};
 use crate::parser::{ActionKind, AgentAction};
 use crate::web_engine::{format_search_results, WebEngine};
 use crate::{
+    db_discovery,
     mcp_client::{McpManager, McpServerConfig},
     screen_awareness,
 };
@@ -1003,7 +1004,7 @@ impl ActionExecutor {
     }
 
     fn find_workspace_db_path(&self) -> PathBuf {
-        if let Some(found) = find_first_db_file(&self.workspace_root) {
+        if let Some(found) = db_discovery::find_first_db_file(&self.workspace_root) {
             return found;
         }
         self.workspace_root.join("chat.db")
@@ -1465,29 +1466,6 @@ fn required_non_empty(value: Option<&str>, field: &str) -> Result<String> {
         return Err(anyhow!("field '{field}' cannot be empty"));
     }
     Ok(trimmed.to_string())
-}
-
-fn find_first_db_file(root: &Path) -> Option<PathBuf> {
-    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let read_dir = std::fs::read_dir(&dir).ok()?;
-        for entry in read_dir.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("db"))
-                .unwrap_or(false)
-            {
-                return Some(path);
-            }
-        }
-    }
-    None
 }
 
 async fn ensure_parent_dir(path: &Path) -> Result<()> {

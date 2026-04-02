@@ -1,6 +1,7 @@
 mod api;
 mod app;
 mod config;
+mod db_discovery;
 mod db;
 mod executor;
 mod files;

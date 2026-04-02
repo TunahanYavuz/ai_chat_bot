@@ -15,6 +15,7 @@ use uuid::Uuid;
 use crate::api::{builtin_models, provider_models, ChatMessage, ModelInfo, RemoteModelInfo};
 use crate::config::{load_settings, save_settings, ApiProvider, Settings, DEFAULT_MODEL_ID};
 use crate::db::{Database, DbFileSnapshot, DbMessage, DbSession};
+use crate::db_discovery;
 use crate::executor::{
     ActionExecutor, ApprovalDecision, ApprovalRequest, ExecutionPolicy, ExecutionStatus,
     MAX_SELF_HEAL_RETRY_LIMIT,
@@ -67,31 +68,6 @@ fn parse_technical_intent_payload(raw: &str) -> Option<TechnicalIntentPayload> {
     serde_json::from_str::<TechnicalIntentPayload>(tail[..end].trim()).ok()
 }
 
-fn find_first_db_file_in_workspace(workspace_root: &str) -> Option<String> {
-    fn walk(dir: &std::path::Path) -> Option<std::path::PathBuf> {
-        let entries = std::fs::read_dir(dir).ok()?;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(found) = walk(&path) {
-                    return Some(found);
-                }
-                continue;
-            }
-            if path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("db"))
-                .unwrap_or(false)
-            {
-                return Some(path);
-            }
-        }
-        None
-    }
-    walk(std::path::Path::new(workspace_root)).map(|p| p.to_string_lossy().to_string())
-}
-
 fn enforce_sqlite_mcp_launch_args(
     mut args: Vec<String>,
     workspace_root: &str,
@@ -106,7 +82,8 @@ fn enforce_sqlite_mcp_launch_args(
     if !args.iter().any(|arg| arg.eq_ignore_ascii_case("-y")) {
         args.insert(0, "-y".to_string());
     }
-    let db_value = find_first_db_file_in_workspace(workspace_root)
+    let db_value = db_discovery::find_first_db_file(std::path::Path::new(workspace_root))
+        .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| fallback_db_path.to_string());
     if let Some(idx) = args.iter().position(|arg| arg.eq_ignore_ascii_case("--db")) {
         let missing_value = idx + 1 >= args.len()
@@ -164,6 +141,7 @@ const AUTONOMOUS_TRIGGER_KEYWORDS: [&str; 6] = [
 ];
 const SELF_HEALING_QUERY_MAX_CHARS: usize = 320;
 const SELF_HEALING_DOC_EXCERPT_MAX_CHARS: usize = 1600;
+const VISION_STAGING_PANEL_MAX_HEIGHT: f32 = 140.0;
 const STALL_SIGNATURE_PERMISSION_DENIED: &str = "permission denied";
 const STALL_SIGNATURE_COMMAND_NOT_FOUND: &str = "command not found";
 const STALL_SIGNATURE_WINDOWS_NOT_RECOGNIZED: &str =
@@ -6238,7 +6216,7 @@ impl eframe::App for ChatApp {
                             .inner_margin(egui::Margin::same(8))
                             .show(ui, |ui| {
                                 ui.group(|ui| {
-                                    ui.set_max_height(140.0);
+                                    ui.set_max_height(VISION_STAGING_PANEL_MAX_HEIGHT);
                                     ui.horizontal(|ui| {
                                         EmojiLabel::new("🧠").show(ui);
                                         ui.label(
