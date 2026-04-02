@@ -16,7 +16,18 @@ const MCP_PROTOCOL: &str = r#"MCP PROTOCOL:
 - MCP operations must use one of: mcp_connect, mcp_list_tools, mcp_call_tool, mcp_disconnect.
 - Prefer mcp_list_tools before first mcp_call_tool on a new server_id.
 - Keep server_id stable within a workflow for reusable context.
-- Do not emit MCP actions when MCP is disabled in runtime settings."#;
+- Do not emit MCP actions when MCP is disabled in runtime settings.
+- You have native access to external tools via MCP. DO NOT write Python/Bash scripts for database queries, file reading, or API fetching if an MCP tool is available. Call the tool directly."#;
+
+const DIRECTORY_ENFORCEMENT_PROTOCOL: &str = r#"DIRECTORY ENFORCEMENT PROTOCOL:
+- Keep the workspace root clean. Do NOT place auxiliary/generated artifacts in root.
+- Allowed auxiliary folders (auto-managed by orchestrator):
+  - scripts/                for utility scripts (python/bash/sql/js/etc.)
+  - exports/                for generated documents/reports (pdf/docx/md/txt/csv/etc.)
+  - assets/screenshots/     for Vision/Screen Awareness captures
+  - logs/                   for telemetry/debug/crash logs
+- Root-level files are allowed only for core project files (for example: Cargo.toml, Cargo.lock, README.md, main.rs, lib.rs, build.rs).
+- When generating + executing scripts, always use the routed path (example: python3 scripts/fetch_first10.py)."#;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentRole {
@@ -116,7 +127,7 @@ PLAN:
 ```"#
             .to_string(),
     };
-    format!("{base}\n\n{UNIVERSAL_NLU_PROTOCOL}\n\n{VISUAL_QA_PROTOCOL}\n\n{WEB_SYNTHESIS_PROTOCOL}\n\n{MCP_PROTOCOL}")
+    format!("{base}\n\n{UNIVERSAL_NLU_PROTOCOL}\n\n{VISUAL_QA_PROTOCOL}\n\n{WEB_SYNTHESIS_PROTOCOL}\n\n{MCP_PROTOCOL}\n\n{DIRECTORY_ENFORCEMENT_PROTOCOL}")
 }
 
 pub fn parse_router_plan(raw: &str) -> Vec<RoutedTask> {

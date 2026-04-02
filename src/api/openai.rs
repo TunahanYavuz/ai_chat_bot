@@ -3,7 +3,8 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use crate::models::{
-    provider_adapter_for, ProviderAdapter, ProviderRequestOptions, ReasoningCapability, ThinkingMode,
+    provider_adapter_for, ProviderAdapter, ProviderQuotaSnapshot, ProviderRequestOptions,
+    ReasoningCapability, ThinkingMode,
 };
 
 #[derive(Debug, Clone)]
@@ -101,6 +102,7 @@ pub struct OpenAIClient {
     client: Client,
     api_key: String,
     base_url: String,
+    provider_key: String,
     adapter: Arc<dyn ProviderAdapter>,
 }
 
@@ -157,6 +159,7 @@ impl OpenAIClient {
             client: Client::new(),
             api_key: api_key.to_string(),
             base_url: base_url.trim_end_matches('/').to_string(),
+            provider_key: provider_key.to_string(),
             adapter: provider_adapter_for(provider_key),
         }
     }
@@ -166,7 +169,7 @@ impl OpenAIClient {
         model: &str,
         messages: &[ChatMessage],
         options: &ProviderRequestOptions,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<ProviderQuotaSnapshot>)> {
         let payload_messages: Vec<serde_json::Value> = messages
             .iter()
             .map(|m| serde_json::json!({"role": m.role, "content": m.content}))
@@ -181,6 +184,7 @@ impl OpenAIClient {
             request = request.header(k, v);
         }
         let response = request.json(&payload).send().await?;
+        let header_quota = self.adapter.parse_quota_from_headers(response.headers());
 
         if !response.status().is_success() {
             let status = response.status();
@@ -189,11 +193,13 @@ impl OpenAIClient {
         }
 
         let parsed: serde_json::Value = response.json().await?;
+        let body_quota = self.adapter.parse_quota_from_body(&parsed);
+        let merged_quota = self.adapter.merge_quota(header_quota, body_quota);
         let text = self
             .adapter
             .parse_non_stream_text(&parsed)
             .unwrap_or_default();
-        Ok(text)
+        Ok((text, merged_quota))
     }
 
     pub async fn chat_completion(
@@ -203,6 +209,7 @@ impl OpenAIClient {
         reasoning_capability: ReasoningCapability,
         tiered_reasoning_level: Option<&ThinkingMode>,
         binary_reasoning_enabled: bool,
+        on_quota: impl Fn(String, ProviderQuotaSnapshot) + Send + 'static,
         on_chunk: impl Fn(String) + Send + 'static,
     ) -> Result<String> {
         use futures_util::StreamExt;
@@ -256,6 +263,10 @@ impl OpenAIClient {
             req = req.header(k, v);
         }
         let response = req.json(&payload).send().await?;
+        let header_quota = self.adapter.parse_quota_from_headers(response.headers());
+        if let Some(snapshot) = header_quota.clone() {
+            on_quota(self.provider_key.clone(), snapshot);
+        }
 
         if !response.status().is_success() {
             let status = response.status();
@@ -306,9 +317,12 @@ impl OpenAIClient {
 
         if full_content.trim().is_empty() && stream_finished {
             eprintln!("Streaming response completed empty; retrying once with non-stream request");
-            let fallback_text = self
+            let (fallback_text, fallback_quota) = self
                 .chat_completion_non_stream(model, &request.messages, &options)
                 .await?;
+            if let Some(snapshot) = fallback_quota {
+                on_quota(self.provider_key.clone(), snapshot);
+            }
             if !fallback_text.is_empty() {
                 on_chunk(fallback_text.clone());
             }
@@ -318,7 +332,9 @@ impl OpenAIClient {
         Ok(full_content)
     }
 
-    pub async fn list_models(&self) -> Result<Vec<RemoteModelInfo>> {
+    pub async fn list_models_with_quota(
+        &self,
+    ) -> Result<(Vec<RemoteModelInfo>, Option<ProviderQuotaSnapshot>)> {
         #[derive(Deserialize)]
         struct ModelItem {
             id: String,
@@ -333,19 +349,22 @@ impl OpenAIClient {
         struct ModelsResponse {
             data: Vec<ModelItem>,
         }
-
         let url = self.adapter.models_endpoint(&self.base_url);
         let mut request = self.client.get(&url);
         for (k, v) in self.adapter.auth_headers(&self.api_key) {
             request = request.header(k, v);
         }
         let response = request.send().await?;
-
+        let header_quota = self.adapter.parse_quota_from_headers(response.headers());
         if !response.status().is_success() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), header_quota));
         }
-
-        let models: ModelsResponse = response.json().await?;
+        let body: serde_json::Value = response.json().await.unwrap_or_default();
+        let body_quota = self.adapter.parse_quota_from_body(&body);
+        let quota = self.adapter.merge_quota(header_quota, body_quota);
+        let models: ModelsResponse = serde_json::from_value(body).unwrap_or(ModelsResponse {
+            data: vec![],
+        });
         let mut items: Vec<RemoteModelInfo> = models
             .data
             .into_iter()
@@ -356,6 +375,12 @@ impl OpenAIClient {
             })
             .collect();
         items.sort_by(|a, b| a.id.cmp(&b.id));
-        Ok(items)
+        Ok((items, quota))
+    }
+
+    pub async fn fetch_account_status(&self) -> Result<Option<ProviderQuotaSnapshot>> {
+        self.adapter
+            .fetch_account_status(&self.client, &self.api_key, &self.base_url)
+            .await
     }
 }

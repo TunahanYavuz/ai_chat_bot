@@ -22,6 +22,7 @@ pub struct McpServerConfig {
 pub struct McpToolInfo {
     pub name: String,
     pub description: String,
+    pub llm_tool_schema: Value,
 }
 
 #[derive(Default)]
@@ -33,6 +34,7 @@ impl ClientHandler for EmptyClientHandler {}
 #[derive(Default)]
 pub struct McpManager {
     sessions: Mutex<HashMap<String, Arc<ClientRuntime>>>,
+    cached_tools: Mutex<HashMap<String, Vec<McpToolInfo>>>,
 }
 
 impl McpManager {
@@ -83,6 +85,8 @@ impl McpManager {
 
         let mut sessions = self.sessions.lock().await;
         sessions.insert(config.id.clone(), client);
+        drop(sessions);
+        let _ = self.refresh_tools(&config.id).await;
         Ok(config.id)
     }
 
@@ -96,6 +100,7 @@ impl McpManager {
                 .shut_down()
                 .await
                 .map_err(|e| anyhow!("failed while shutting down MCP client: {e:?}"))?;
+            self.cached_tools.lock().await.remove(server_id);
             Ok(())
         } else {
             Err(anyhow!("mcp server '{server_id}' is not connected"))
@@ -103,19 +108,89 @@ impl McpManager {
     }
 
     pub async fn list_tools(&self, server_id: &str) -> Result<Vec<McpToolInfo>> {
+        self.refresh_tools(server_id).await?;
+        Ok(self
+            .cached_tools
+            .lock()
+            .await
+            .get(server_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    pub async fn mcp_tool_prompt_context(&self) -> String {
+        let cache = self.cached_tools.lock().await;
+        if cache.is_empty() {
+            return "MCP TOOL REGISTRY:\n- No connected MCP tools discovered yet.".to_string();
+        }
+        let mut server_ids: Vec<String> = cache.keys().cloned().collect();
+        server_ids.sort();
+        let mut out = String::from(
+            "MCP TOOL REGISTRY (dynamic):\nUse these native MCP tools instead of writing scripts.\n",
+        );
+        for server_id in server_ids {
+            let mut tools = cache.get(&server_id).cloned().unwrap_or_default();
+            tools.sort_by(|a, b| a.name.cmp(&b.name));
+            if tools.is_empty() {
+                out.push_str(&format!("- server_id={server_id}: no tools\n"));
+                continue;
+            }
+            out.push_str(&format!("- server_id={server_id}\n"));
+            for tool in tools {
+                out.push_str(&format!(
+                    "  - MCP tool '{}': {}\n    LLM tool schema: {}\n    Invocation JSON action: {{\"action\":\"mcp_call_tool\",\"parameters\":{{\"server_id\":\"{}\",\"tool\":\"{}\",\"arguments\":<JSON object following input schema>}}}}\n",
+                    tool.name,
+                    tool.description,
+                    tool.llm_tool_schema,
+                    server_id,
+                    tool.name
+                ));
+            }
+        }
+        out
+    }
+
+    async fn refresh_tools(&self, server_id: &str) -> Result<Vec<McpToolInfo>> {
         let client = self.client(server_id).await?;
-        let tools = client
+        let listed = client
             .request_tool_list(None)
             .await
             .map_err(|e| anyhow!("failed to list tools for '{server_id}': {e:?}"))?;
-        Ok(tools
+        let tools: Vec<McpToolInfo> = listed
             .tools
             .into_iter()
-            .map(|tool| McpToolInfo {
-                name: tool.name,
-                description: tool.description.unwrap_or_default(),
+            .map(|tool| {
+                let schema = serde_json::to_value(&tool.input_schema).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": true
+                    })
+                });
+                let description = tool.description.unwrap_or_default();
+                McpToolInfo {
+                    llm_tool_schema: serde_json::json!({
+                        "type": "function",
+                        "function": {
+                            "name": format!("mcp_{}__{}", sanitize_identifier(server_id), sanitize_identifier(&tool.name)),
+                            "description": if description.trim().is_empty() {
+                                format!("MCP tool '{}' on server '{}'", tool.name, server_id)
+                            } else {
+                                format!("MCP tool '{}' on server '{}': {}", tool.name, server_id, description)
+                            },
+                            "parameters": schema.clone()
+                        }
+                    }),
+                    name: tool.name,
+                    description,
+                }
             })
-            .collect())
+            .collect();
+        self.cached_tools
+            .lock()
+            .await
+            .insert(server_id.to_string(), tools.clone());
+        Ok(tools)
     }
 
     pub async fn call_tool(
@@ -156,6 +231,28 @@ impl McpManager {
             .cloned()
             .ok_or_else(|| anyhow!("mcp server '{server_id}' is not connected"))
     }
+}
+
+fn sanitize_identifier(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut prev_is_underscore = false;
+    for ch in input.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() || ch == '_' {
+            ch.to_ascii_lowercase()
+        } else {
+            '_'
+        };
+        if normalized == '_' {
+            if !prev_is_underscore {
+                out.push('_');
+            }
+            prev_is_underscore = true;
+        } else {
+            out.push(normalized);
+            prev_is_underscore = false;
+        }
+    }
+    out.trim_matches('_').to_string()
 }
 
 fn format_content_block(block: &ContentBlock) -> String {

@@ -20,13 +20,13 @@ use crate::executor::{
 };
 use crate::mcp_client::McpManager;
 use crate::models::{
-    get_model_capability, reasoning_config_for_model, ModelReasoningConfig, ReasoningCapability,
-    ThinkingMode,
+    get_model_capability, reasoning_config_for_model, ModelReasoningConfig, ProviderQuotaSnapshot,
+    ReasoningCapability, ThinkingMode,
 };
 use crate::parser::ActionKind;
 use crate::rag_engine::{EmbeddingProvider, RagConfig, RagEngine};
 use crate::setup::SetupWizard;
-use crate::storage::{ChatSession, Storage, StoredMessage, StoredRole};
+use crate::storage::{ChatSession, Storage, StoredMessage, StoredQuotaMetrics, StoredRole};
 use crate::swarm::{get_system_prompt, parse_router_plan, AgentRole, RoutedTask};
 use crate::telemetry::collect_telemetry_cached;
 use crate::watcher::run_workspace_watcher;
@@ -140,6 +140,14 @@ pub enum AppEvent {
     ResponseComplete(String),
     ResponseError(String, String),
     ModelsLoaded(Vec<RemoteModelInfo>),
+    QuotaTelemetryUpdated {
+        provider_key: String,
+        snapshot: ProviderQuotaSnapshot,
+    },
+    QuotaCacheLoaded {
+        cache: HashMap<String, StoredQuotaMetrics>,
+        error: Option<String>,
+    },
     TerminalFinished {
         terminal_id: String,
         stdout: String,
@@ -347,6 +355,56 @@ impl QuotaManager {
         if let Some(m) = self.per_provider.get_mut(provider_key) {
             m.request_count = m.request_count.saturating_add(1);
             m.tokens_used = m.tokens_used.saturating_add(estimated_tokens);
+        }
+    }
+
+    fn apply_remote_snapshot(&mut self, provider_key: &str, snapshot: &ProviderQuotaSnapshot) {
+        self.ensure_provider(provider_key);
+        if let Some(m) = self.per_provider.get_mut(provider_key) {
+            if let (Some(limit), Some(remaining)) = (snapshot.limit_tokens, snapshot.remaining_tokens)
+            {
+                let bounded_limit = limit.max(1);
+                m.max_tokens = bounded_limit;
+                m.tokens_used = bounded_limit.saturating_sub(remaining.min(bounded_limit));
+            }
+            if let (Some(limit), Some(remaining)) =
+                (snapshot.limit_requests, snapshot.remaining_requests)
+            {
+                let bounded_limit = limit.max(1);
+                m.max_requests = bounded_limit;
+                m.request_count = bounded_limit.saturating_sub(remaining.min(bounded_limit));
+            }
+        }
+    }
+
+    fn to_stored_map(&self) -> HashMap<String, StoredQuotaMetrics> {
+        self.per_provider
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    StoredQuotaMetrics {
+                        tokens_used: v.tokens_used,
+                        request_count: v.request_count,
+                        max_tokens: v.max_tokens,
+                        max_requests: v.max_requests,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn apply_cached_map(&mut self, cache: &HashMap<String, StoredQuotaMetrics>) {
+        for (provider_key, stored) in cache {
+            self.per_provider.insert(
+                provider_key.clone(),
+                QuotaMetrics {
+                    tokens_used: stored.tokens_used,
+                    request_count: stored.request_count,
+                    max_tokens: stored.max_tokens.max(1),
+                    max_requests: stored.max_requests.max(1),
+                },
+            );
         }
     }
 
@@ -1228,6 +1286,18 @@ impl ChatApp {
         });
     }
 
+    fn persist_quota_cache_async(&self) {
+        let Some(storage) = self.storage.clone() else {
+            return;
+        };
+        let snapshot = self.quota_manager.to_stored_map();
+        self.tokio_rt.spawn(async move {
+            if let Err(e) = storage.save_quota_cache(&snapshot).await {
+                eprintln!("Failed to persist quota cache: {e}");
+            }
+        });
+    }
+
     fn spawn_initial_data_load(&self) {
         let tx = self.event_tx.clone();
         let db_path = self.db_path.clone();
@@ -1317,6 +1387,33 @@ impl ChatApp {
                         let _ = tx
                             .send(AppEvent::StoredSessionLoaded {
                                 session: None,
+                                error: Some(e.to_string()),
+                            })
+                            .await;
+                    }
+                }
+            });
+        }
+
+        if let Some(storage) = self.storage.clone() {
+            let tx = self.event_tx.clone();
+            self.tokio_rt.spawn(async move {
+                match storage.load_quota_cache().await {
+                    Ok(Some(cache)) => {
+                        let _ = tx.send(AppEvent::QuotaCacheLoaded { cache, error: None }).await;
+                    }
+                    Ok(None) => {
+                        let _ = tx
+                            .send(AppEvent::QuotaCacheLoaded {
+                                cache: HashMap::new(),
+                                error: None,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(AppEvent::QuotaCacheLoaded {
+                                cache: HashMap::new(),
                                 error: Some(e.to_string()),
                             })
                             .await;
@@ -2247,8 +2344,23 @@ impl ChatApp {
         let tx = self.event_tx.clone();
         self.tokio_rt.spawn(async move {
             let client = crate::api::OpenAIClient::with_provider(&provider_key, &api_key, &base_url);
-            let model_ids: Vec<crate::api::openai::RemoteModelInfo> =
-                client.list_models().await.unwrap_or_default();
+            let (model_ids, list_quota): (Vec<crate::api::openai::RemoteModelInfo>, Option<ProviderQuotaSnapshot>) =
+                client.list_models_with_quota().await.unwrap_or((Vec::new(), None));
+            if let Some(snapshot) = list_quota {
+                let _ = tx
+                    .send(AppEvent::QuotaTelemetryUpdated {
+                        provider_key: provider_key.clone(),
+                        snapshot,
+                    })
+                    .await;
+            } else if let Ok(Some(snapshot)) = client.fetch_account_status().await {
+                let _ = tx
+                    .send(AppEvent::QuotaTelemetryUpdated {
+                        provider_key: provider_key.clone(),
+                        snapshot,
+                    })
+                    .await;
+            }
             let _ = tx.send(AppEvent::ModelsLoaded(model_ids)).await;
         });
     }
@@ -2404,6 +2516,11 @@ impl ChatApp {
                 mcp_launch_command,
                 mcp_args_redacted
             );
+            let mcp_tool_context = if mcp_enabled {
+                mcp_manager.mcp_tool_prompt_context().await
+            } else {
+                "MCP TOOL REGISTRY:\n- MCP integration is disabled in runtime settings.".to_string()
+            };
             let _ = event_tx
                 .send(AppEvent::SwarmWorkflowStep {
                     request_id: req_id.clone(),
@@ -2441,7 +2558,7 @@ impl ChatApp {
             let mut router_messages = api_messages.clone();
             let router_prompt = get_system_prompt(&AgentRole::Router);
             let router_system_prompt = format!(
-                "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{rag_context}\n\n{router_prompt}\n\nUser request:\n{query}"
+                "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{mcp_tool_context}\n\n{rag_context}\n\n{router_prompt}\n\nUser request:\n{query}"
             );
             let _ = event_tx
                 .send(AppEvent::SwarmWorkflowStep {
@@ -2462,6 +2579,20 @@ impl ChatApp {
                     reasoning_capability,
                     tiered_reasoning_level.as_ref(),
                     binary_reasoning_enabled,
+                    {
+                        let tx = event_tx.clone();
+                        move |provider_key, snapshot| {
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let _ = tx
+                                    .send(AppEvent::QuotaTelemetryUpdated {
+                                        provider_key,
+                                        snapshot,
+                                    })
+                                    .await;
+                            });
+                        }
+                    },
                     |_| {},
                 )
                 .await;
@@ -2532,7 +2663,7 @@ impl ChatApp {
                     swarm_memory.clone()
                 };
                 let role_system_prompt = format!(
-                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{rag_context}\n\n{role_prompt}\n\nAssigned task:\n{}\n\nSwarm memory:\n{}",
+                    "{CORE_OS_SYSTEM_PROMPT}\n\n{telemetry_context}\n\n{runtime_feature_context}\n\n{mcp_tool_context}\n\n{rag_context}\n\n{role_prompt}\n\nAssigned task:\n{}\n\nSwarm memory:\n{}",
                     step.task, memory_block
                 );
                 role_messages.insert(0, ChatMessage::with_cache_control("system", &role_system_prompt));
@@ -2544,6 +2675,20 @@ impl ChatApp {
                         reasoning_capability,
                         tiered_reasoning_level.as_ref(),
                         binary_reasoning_enabled,
+                        {
+                            let tx = event_tx.clone();
+                            move |provider_key, snapshot| {
+                                let tx = tx.clone();
+                                tokio::spawn(async move {
+                                    let _ = tx
+                                        .send(AppEvent::QuotaTelemetryUpdated {
+                                            provider_key,
+                                            snapshot,
+                                        })
+                                        .await;
+                                });
+                            }
+                        },
                         |_| {},
                     )
                     .await
@@ -2582,6 +2727,20 @@ impl ChatApp {
                             reasoning_capability,
                             tiered_reasoning_level.as_ref(),
                             binary_reasoning_enabled,
+                            {
+                                let tx = event_tx.clone();
+                                move |provider_key, snapshot| {
+                                    let tx = tx.clone();
+                                    tokio::spawn(async move {
+                                        let _ = tx
+                                            .send(AppEvent::QuotaTelemetryUpdated {
+                                                provider_key,
+                                                snapshot,
+                                            })
+                                            .await;
+                                    });
+                                }
+                            },
                             |_| {},
                         )
                         .await
@@ -2898,6 +3057,20 @@ impl ChatApp {
                         reasoning_capability,
                         tiered_reasoning_level.as_ref(),
                         binary_reasoning_enabled,
+                        {
+                            let tx = event_tx.clone();
+                            move |provider_key, snapshot| {
+                                let tx = tx.clone();
+                                tokio::spawn(async move {
+                                    let _ = tx
+                                        .send(AppEvent::QuotaTelemetryUpdated {
+                                            provider_key,
+                                            snapshot,
+                                        })
+                                        .await;
+                                });
+                            }
+                        },
                         |_stream_chunk| {},
                     )
                     .await
@@ -3711,6 +3884,22 @@ impl ChatApp {
                         }
                     }
                     self.refresh_model_access_outline();
+                }
+                AppEvent::QuotaTelemetryUpdated {
+                    provider_key,
+                    snapshot,
+                } => {
+                    self.quota_manager
+                        .apply_remote_snapshot(&provider_key, &snapshot);
+                    self.persist_quota_cache_async();
+                }
+                AppEvent::QuotaCacheLoaded { cache, error } => {
+                    if let Some(err) = error {
+                        self.activity_log
+                            .push(format!("Failed to load quota cache: {err}"));
+                    } else if !cache.is_empty() {
+                        self.quota_manager.apply_cached_map(&cache);
+                    }
                 }
                 AppEvent::TerminalFinished {
                     terminal_id,
@@ -5560,217 +5749,212 @@ impl eframe::App for ChatApp {
                         });
                     });
 
-                let input_height = 100.0;
-                let msg_height = ui.available_height() - input_height;
-
-                egui::Frame::new()
-                    .fill(BURGUNDY)
-                    .inner_margin(egui::Margin {
-                        left: 12,
-                        right: 12,
-                        top: 8,
-                        bottom: 4,
-                    })
-                    .show(ui, |ui| {
-                        ScrollArea::vertical()
-                            .id_salt("messages_scroll")
-                            .max_height(msg_height)
-                            .stick_to_bottom(true)
-                            .show(ui, |ui| {
-                                if let Some(idx) = self.current_session_idx {
-                                    let msg_count = self
-                                        .sessions
-                                        .get(idx)
-                                        .map(|s| s.messages.len())
-                                        .unwrap_or(0);
-                                    for msg_idx in 0..msg_count {
-                                        let msg = self.sessions[idx].messages[msg_idx].clone();
-                                        self.render_message(ui, &msg);
-                                        ui.add_space(6.0);
+                ui.with_layout(egui::Layout::top_down(egui::Align::LEFT), |ui| {
+                    egui::Frame::new()
+                        .fill(BURGUNDY)
+                        .inner_margin(egui::Margin {
+                            left: 12,
+                            right: 12,
+                            top: 8,
+                            bottom: 4,
+                        })
+                        .show(ui, |ui| {
+                            ScrollArea::vertical()
+                                .id_salt("messages_scroll")
+                                .stick_to_bottom(true)
+                                .show(ui, |ui| {
+                                    if let Some(idx) = self.current_session_idx {
+                                        let msg_count = self
+                                            .sessions
+                                            .get(idx)
+                                            .map(|s| s.messages.len())
+                                            .unwrap_or(0);
+                                        for msg_idx in 0..msg_count {
+                                            let msg = self.sessions[idx].messages[msg_idx].clone();
+                                            self.render_message(ui, &msg);
+                                            ui.add_space(6.0);
+                                        }
+                                    } else {
+                                        ui.centered_and_justified(|ui| {
+                                            ui.label(
+                                                RichText::new(
+                                                    "Select or create a conversation to begin",
+                                                )
+                                                .color(Color32::from_rgb(180, 130, 135))
+                                                .font(FontId::proportional(16.0)),
+                                            );
+                                        });
                                     }
-                                } else {
-                                    ui.centered_and_justified(|ui| {
-                                        ui.label(
-                                            RichText::new(
-                                                "Select or create a conversation to begin",
-                                            )
-                                            .color(Color32::from_rgb(180, 130, 135))
-                                            .font(FontId::proportional(16.0)),
-                                        );
-                                    });
-                                }
-                            });
-                    });
+                                });
+                        });
+                });
 
-                egui::Frame::new()
-                    .fill(BURGUNDY_DARK)
-                    .inner_margin(egui::Margin::same(8))
-                    .show(ui, |ui| {
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                EmojiLabel::new("🧠").show(ui);
-                                ui.label(RichText::new("Vision Staging").color(GOLD).strong());
-                                if ui
-                                    .add_enabled(
-                                        !self.vision_staging.undo_stack.is_empty(),
-                                        egui::Button::new("Undo (Ctrl+Z)"),
-                                    )
-                                    .clicked()
-                                {
+                egui::TopBottomPanel::bottom("chat_input_docked")
+                    .resizable(false)
+                    .show_inside(ui, |ui| {
+                        egui::Frame::new()
+                            .fill(BURGUNDY_DARK)
+                            .inner_margin(egui::Margin::same(8))
+                            .show(ui, |ui| {
+                                ui.group(|ui| {
+                                    ui.horizontal(|ui| {
+                                        EmojiLabel::new("🧠").show(ui);
+                                        ui.label(RichText::new("Vision Staging").color(GOLD).strong());
+                                        if ui
+                                            .add_enabled(
+                                                !self.vision_staging.undo_stack.is_empty(),
+                                                egui::Button::new("Undo (Ctrl+Z)"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.undo_staged_delete();
+                                        }
+                                        if ui
+                                            .add_enabled(
+                                                !self.vision_staging.images.is_empty(),
+                                                egui::Button::new("Send to Swarm"),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.send_staged_images_to_swarm();
+                                        }
+                                        EmojiLabel::new("🚀").show(ui);
+                                    });
+                                    if self.vision_staging.images.is_empty() {
+                                        ui.label(
+                                            RichText::new("No staged screenshots yet.").small().color(TEXT_MUTED),
+                                        );
+                                    } else {
+                                        let mut pending_delete_idx: Option<usize> = None;
+                                        ScrollArea::horizontal()
+                                            .auto_shrink([false, false])
+                                            .id_salt("vision_staging_filmstrip")
+                                            .max_height(80.0)
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    for idx in 0..self.vision_staging.images.len() {
+                                                        let staged = self.vision_staging.images[idx].clone();
+                                                        ui.group(|ui| {
+                                                            if let Some(tex) =
+                                                                self.staging_texture(ctx, &staged)
+                                                            {
+                                                                ui.add(
+                                                                    egui::Image::new(tex)
+                                                                        .fit_to_exact_size(Vec2::new(96.0, 72.0)),
+                                                                );
+                                                            } else {
+                                                                ui.label(
+                                                                    RichText::new("Preview unavailable")
+                                                                        .small()
+                                                                        .color(TEXT_MUTED),
+                                                                );
+                                                            }
+                                                            ui.horizontal(|ui| {
+                                                                ui.label(
+                                                                    RichText::new(format!(
+                                                                        "{}×{}",
+                                                                        staged.width, staged.height
+                                                                    ))
+                                                                    .small()
+                                                                    .color(TEXT_MUTED),
+                                                                );
+                                                                ui.label(
+                                                                    RichText::new(&staged.filename)
+                                                                        .small()
+                                                                        .color(SKY_BLUE),
+                                                                );
+                                                                if ui.small_button("Delete").clicked() {
+                                                                    pending_delete_idx = Some(idx);
+                                                                }
+                                                            });
+                                                        });
+                                                    }
+                                                });
+                                            });
+                                        if let Some(idx) = pending_delete_idx {
+                                            self.delete_staged_image(idx);
+                                        }
+                                    }
+                                });
+
+                                if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
                                     self.undo_staged_delete();
                                 }
-                                EmojiLabel::new("↩️").show(ui);
-                                if ui
-                                    .add_enabled(
-                                        !self.vision_staging.images.is_empty(),
-                                        egui::Button::new("Send to Swarm"),
-                                    )
-                                    .clicked()
-                                {
-                                    self.send_staged_images_to_swarm();
-                                }
-                                EmojiLabel::new("🚀").show(ui);
-                            });
-                            if self.vision_staging.images.is_empty() {
-                                ui.label(
-                                    RichText::new("No staged screenshots yet.").small().color(TEXT_MUTED),
-                                );
-                            } else {
-                                let mut pending_delete_idx: Option<usize> = None;
-                                ScrollArea::horizontal()
-                                    .auto_shrink([false, false])
-                                    .id_salt("vision_staging_filmstrip")
-                                    .max_height(130.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            for idx in 0..self.vision_staging.images.len() {
-                                                let staged = self.vision_staging.images[idx].clone();
-                                                ui.group(|ui| {
-                                                    if let Some(tex) =
-                                                        self.staging_texture(ctx, &staged)
-                                                    {
-                                                        ui.add(
-                                                            egui::Image::new(tex)
-                                                                .fit_to_exact_size(Vec2::new(96.0, 72.0)),
-                                                        );
-                                                    } else {
-                                                        ui.label(
-                                                            RichText::new("Preview unavailable")
-                                                                .small()
-                                                                .color(TEXT_MUTED),
-                                                        );
-                                                    }
-                                                    ui.label(
-                                                        RichText::new(format!(
-                                                            "{}×{}",
-                                                            staged.width, staged.height
-                                                        ))
-                                                        .small()
-                                                        .color(TEXT_MUTED),
-                                                    );
-                                                    ui.label(
-                                                        RichText::new(&staged.source)
-                                                            .small()
-                                                            .color(TEXT_MUTED),
-                                                    );
-                                                    ui.label(
-                                                        RichText::new(&staged.filename)
-                                                            .small()
-                                                            .color(SKY_BLUE),
-                                                    );
-                                                    ui.horizontal(|ui| {
-                                                        EmojiLabel::new("🗑️").show(ui);
-                                                        if ui.small_button("Delete").clicked() {
-                                                            pending_delete_idx = Some(idx);
-                                                        }
-                                                    });
-                                                });
-                                            }
-                                        });
+
+                                if !self.pending_attachments.is_empty() {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(RichText::new("📎 Attachments:").color(GOLD).small());
+                                        for att in &self.pending_attachments {
+                                            ui.label(RichText::new(&att.filename).color(SKY_BLUE).small());
+                                        }
+                                        if ui.small_button("✕ Clear").clicked() {
+                                            self.pending_attachments.clear();
+                                        }
                                     });
-                                if let Some(idx) = pending_delete_idx {
-                                    self.delete_staged_image(idx);
                                 }
-                            }
-                        });
 
-                        if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Z)) {
-                            self.undo_staged_delete();
-                        }
+                                ui.horizontal(|ui| {
+                                    let text_edit = TextEdit::multiline(&mut self.input_text)
+                                        .desired_rows(2)
+                                        .desired_width(ui.available_width() - 120.0)
+                                        .hint_text("Type a message…")
+                                        .frame(true);
+                                    let response = ui.add(text_edit);
+                                    let provider_key = self.active_provider_key();
+                                    let quota_exhausted = self.quota_manager.exhausted(&provider_key);
+                                    if response.has_focus()
+                                        && ctx.input(|i| {
+                                            i.key_pressed(egui::Key::Enter)
+                                                && !i.modifiers.shift
+                                                && !i.modifiers.command
+                                                && !i.modifiers.ctrl
+                                                && !i.modifiers.alt
+                                        })
+                                        && !quota_exhausted
+                                    {
+                                        self.send_message();
+                                    }
 
-                        if !self.pending_attachments.is_empty() {
-                            ui.horizontal_wrapped(|ui| {
-                                ui.label(RichText::new("📎 Attachments:").color(GOLD).small());
-                                for att in &self.pending_attachments {
-                                    ui.label(RichText::new(&att.filename).color(SKY_BLUE).small());
-                                }
-                                if ui.small_button("✕ Clear").clicked() {
-                                    self.pending_attachments.clear();
-                                }
+                                    ui.vertical(|ui| {
+                                        let send_resp = ui.add_enabled(
+                                            !quota_exhausted,
+                                            egui::Button::new(RichText::new("📤 Send").color(DARK_TEXT))
+                                                .fill(GOLD)
+                                                .min_size(Vec2::new(110.0, 36.0)),
+                                        );
+                                        if send_resp.clicked() {
+                                            self.send_message();
+                                        }
+                                        if quota_exhausted {
+                                            send_resp.on_hover_text("Quota Exhausted");
+                                        }
+                                        if ui
+                                            .add_sized(
+                                                [110.0, 28.0],
+                                                egui::Button::new(
+                                                    RichText::new("📎 Attach").color(LIGHT_TEXT),
+                                                )
+                                                .fill(SKY_BLUE_DARK),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.attach_file();
+                                        }
+                                        if ui
+                                            .add_sized(
+                                                [110.0, 26.0],
+                                                egui::Button::new(
+                                                    RichText::new("Paste Clip").color(LIGHT_TEXT),
+                                                )
+                                                .fill(BG_SURFACE_ALT),
+                                            )
+                                            .clicked()
+                                        {
+                                            self.attach_from_clipboard();
+                                        }
+                                    });
+                                });
                             });
-                        }
-
-                        ui.horizontal(|ui| {
-                            let text_edit = TextEdit::multiline(&mut self.input_text)
-                                .desired_rows(2)
-                                .desired_width(ui.available_width() - 120.0)
-                                .hint_text("Type a message…")
-                                .frame(true);
-                            let response = ui.add(text_edit);
-                            let provider_key = self.active_provider_key();
-                            let quota_exhausted = self.quota_manager.exhausted(&provider_key);
-                            if response.has_focus()
-                                && ctx.input(|i| {
-                                    i.key_pressed(egui::Key::Enter)
-                                        && !i.modifiers.shift
-                                        && !i.modifiers.command
-                                        && !i.modifiers.ctrl
-                                        && !i.modifiers.alt
-                                })
-                                && !quota_exhausted
-                            {
-                                self.send_message();
-                            }
-
-                            ui.vertical(|ui| {
-                                let send_resp = ui.add_enabled(
-                                    !quota_exhausted,
-                                    egui::Button::new(RichText::new("📤 Send").color(DARK_TEXT))
-                                        .fill(GOLD)
-                                        .min_size(Vec2::new(110.0, 36.0)),
-                                );
-                                if send_resp.clicked() {
-                                    self.send_message();
-                                }
-                                if quota_exhausted {
-                                    send_resp.on_hover_text("Quota Exhausted");
-                                }
-                                if ui
-                                    .add_sized(
-                                        [110.0, 28.0],
-                                        egui::Button::new(
-                                            RichText::new("📎 Attach").color(LIGHT_TEXT),
-                                        )
-                                        .fill(SKY_BLUE_DARK),
-                                    )
-                                    .clicked()
-                                {
-                                    self.attach_file();
-                                }
-                                if ui
-                                    .add_sized(
-                                        [110.0, 26.0],
-                                        egui::Button::new(
-                                            RichText::new("Paste Clip").color(LIGHT_TEXT),
-                                        )
-                                        .fill(BG_SURFACE_ALT),
-                                    )
-                                    .clicked()
-                                {
-                                    self.attach_from_clipboard();
-                                }
-                            });
-                        });
                     });
             });
 
