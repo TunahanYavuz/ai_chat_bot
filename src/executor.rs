@@ -609,32 +609,35 @@ impl ActionExecutor {
             let mut child = command.spawn().map_err(|e| e.to_string())?;
             let stdout_pipe = child.stdout.take();
             let stderr_pipe = child.stderr.take();
-            let stdout_sink = terminal_sink.clone();
-            let stderr_sink = terminal_sink.clone();
             tokio::spawn(async move {
-                if let Some(stdout) = stdout_pipe {
-                    let mut reader = BufReader::new(stdout).lines();
-                    while let Ok(Some(line)) = reader.next_line().await {
-                        if let Some(sink) = &stdout_sink {
-                            sink(true, line);
+                let stdout_sink = terminal_sink.clone();
+                let stderr_sink = terminal_sink.clone();
+                let stdout_reader = async move {
+                    if let Some(stdout) = stdout_pipe {
+                        let mut reader = BufReader::new(stdout).lines();
+                        while let Ok(Some(line)) = reader.next_line().await {
+                            if let Some(sink) = &stdout_sink {
+                                sink(true, line);
+                            }
                         }
                     }
-                }
-            });
-            tokio::spawn(async move {
-                if let Some(stderr) = stderr_pipe {
-                    let mut reader = BufReader::new(stderr).lines();
-                    while let Ok(Some(line)) = reader.next_line().await {
-                        if let Some(sink) = &stderr_sink {
-                            sink(false, line);
+                };
+                let stderr_reader = async move {
+                    if let Some(stderr) = stderr_pipe {
+                        let mut reader = BufReader::new(stderr).lines();
+                        while let Ok(Some(line)) = reader.next_line().await {
+                            if let Some(sink) = &stderr_sink {
+                                sink(false, line);
+                            }
                         }
                     }
-                }
+                };
+                let child_wait = async move {
+                    let _ = child.wait().await;
+                };
+                let _ = tokio::join!(stdout_reader, stderr_reader, child_wait);
             });
-            tokio::spawn(async move {
-                let _ = child.wait().await;
-            });
-            Ok(())
+            Ok::<(), String>(())
         });
         match spawn_join.await {
             Ok(Ok(())) => {}

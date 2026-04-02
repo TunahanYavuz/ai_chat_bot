@@ -91,6 +91,10 @@ const AUTONOMOUS_TRIGGER_KEYWORDS: [&str; 6] = [
 ];
 const SELF_HEALING_QUERY_MAX_CHARS: usize = 320;
 const SELF_HEALING_DOC_EXCERPT_MAX_CHARS: usize = 1600;
+const STALL_SIGNATURE_PERMISSION_DENIED: &str = "permission denied";
+const STALL_SIGNATURE_COMMAND_NOT_FOUND: &str = "command not found";
+const STALL_SIGNATURE_WINDOWS_NOT_RECOGNIZED: &str =
+    "is not recognized as an internal or external command";
 /// Prepended as the first system prompt for API requests so responses include
 /// a user-facing message plus a machine-readable ```json ... ``` execution block.
 const CORE_OS_SYSTEM_PROMPT: &str = r#"You are 'CoreOS', an advanced local File System and Command Line Interface (CLI) Agent. Your purpose is to assist the user by generating precise, executable commands while maintaining a helpful, conversational tone.
@@ -3060,11 +3064,16 @@ impl ChatApp {
                                         );
                                     }
                                     let combined_terminal_output =
-                                        format!("{}\n{}", report.stderr, report.stdout)
+                                        format!("{}\n{}", report.stdout, report.stderr)
                                             .to_ascii_lowercase();
-                                    let stall_signature_detected = combined_terminal_output.contains("permission denied")
-                                        || combined_terminal_output.contains("command not found")
-                                        || combined_terminal_output.contains("is not recognized as an internal or external command");
+                                    let stall_signature_detected =
+                                        combined_terminal_output
+                                            .contains(STALL_SIGNATURE_PERMISSION_DENIED)
+                                            || combined_terminal_output
+                                                .contains(STALL_SIGNATURE_COMMAND_NOT_FOUND)
+                                            || combined_terminal_output.contains(
+                                                STALL_SIGNATURE_WINDOWS_NOT_RECOGNIZED,
+                                            );
                                     if stall_signature_detected {
                                         let _ = event_tx
                                             .send(AppEvent::SwarmWorkflowStep {
@@ -3154,6 +3163,19 @@ impl ChatApp {
                                     }
                                 }
                                 ExecutionStatus::AuthorizationDenied { action, reason } => {
+                                    if let Some(terminal_id) = ai_terminal_id.clone() {
+                                        let _ = event_tx
+                                            .send(AppEvent::TerminalFinished {
+                                                terminal_id,
+                                                stdout: String::new(),
+                                                stderr: format!(
+                                                    "Execution not started due to authorization denial.\n{reason}"
+                                                ),
+                                                exit_code: -1,
+                                                streamed: false,
+                                            })
+                                            .await;
+                                    }
                                     let _ = event_tx
                                         .send(AppEvent::SwarmWorkflowStep {
                                             request_id: req_id.clone(),
@@ -3167,6 +3189,20 @@ impl ChatApp {
                                     ));
                                 }
                                 ExecutionStatus::AwaitingApproval(req) => {
+                                    if let Some(terminal_id) = ai_terminal_id.clone() {
+                                        let _ = event_tx
+                                            .send(AppEvent::TerminalFinished {
+                                                terminal_id,
+                                                stdout: String::new(),
+                                                stderr: format!(
+                                                    "Execution paused awaiting approval.\n{}",
+                                                    req.reason
+                                                ),
+                                                exit_code: -1,
+                                                streamed: false,
+                                            })
+                                            .await;
+                                    }
                                     let _ = event_tx
                                         .send(AppEvent::SwarmWorkflowStep {
                                             request_id: req_id.clone(),
