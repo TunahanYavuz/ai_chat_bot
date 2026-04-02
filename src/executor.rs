@@ -1149,8 +1149,7 @@ fn make_install_command_non_interactive(cmd: &str) -> String {
         return rebuilt;
     }
 
-    if host_os == "linux" && is_pamac_install_command(trimmed) && !contains_flag(trimmed, "--no-confirm")
-    {
+    if is_pamac_install_command(trimmed) && !contains_flag(trimmed, "--no-confirm") {
         return format!("{trimmed} --no-confirm");
     }
 
