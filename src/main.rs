@@ -1,20 +1,21 @@
 mod api;
 mod app;
 mod config;
+mod db_discovery;
 mod db;
 mod executor;
 mod files;
+mod mcp_client;
+mod models;
 mod parser;
 mod rag_engine;
+mod screen_awareness;
 mod setup;
 mod storage;
 mod swarm;
 mod telemetry;
-mod web_engine;
-mod models;
-mod mcp_client;
-mod screen_awareness;
 mod watcher;
+mod web_engine;
 
 use std::sync::Arc;
 

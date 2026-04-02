@@ -271,7 +271,7 @@ impl Default for Settings {
             provider_configs,
             openai_api_key: String::new(),
             openai_base_url: "https://api.openai.com/v1".to_string(),
-            db_path,
+            db_path: db_path.clone(),
             working_directory: dirs::home_dir()
                 .unwrap_or_else(|| PathBuf::from("."))
                 .to_string_lossy()
@@ -284,7 +284,12 @@ impl Default for Settings {
             screen_awareness_enabled: false,
             mcp_enabled: false,
             mcp_launch_command: "npx".to_string(),
-            mcp_launch_args: vec!["-y".to_string(), "mcp-server-sqlite".to_string()],
+            mcp_launch_args: vec![
+                "-y".to_string(),
+                "mcp-server-sqlite".to_string(),
+                "--db".to_string(),
+                db_path.clone(),
+            ],
             rag_top_k_limit: default_rag_top_k_limit(),
             rag_similarity_threshold: default_rag_similarity_threshold(),
         }
@@ -309,6 +314,51 @@ pub fn load_settings() -> Settings {
                 if let Some(cfg) = s.provider_configs.get_mut(ApiProvider::HuggingFace.key()) {
                     if cfg.base_url.trim_end_matches('/') == OLD_HUGGINGFACE_BASE_URL {
                         cfg.base_url = ApiProvider::HuggingFace.default_base_url().to_string();
+                    }
+                }
+                if s.mcp_launch_command.trim().is_empty() {
+                    s.mcp_launch_command = "npx".to_string();
+                }
+                let uses_sqlite_server = s
+                    .mcp_launch_args
+                    .iter()
+                    .any(|arg| arg.eq_ignore_ascii_case("mcp-server-sqlite"));
+                if s.mcp_launch_args.is_empty() || uses_sqlite_server {
+                    if !s
+                        .mcp_launch_args
+                        .iter()
+                        .any(|arg| arg.eq_ignore_ascii_case("-y"))
+                    {
+                        s.mcp_launch_args.insert(0, "-y".to_string());
+                    }
+                    if !s
+                        .mcp_launch_args
+                        .iter()
+                        .any(|arg| arg.eq_ignore_ascii_case("mcp-server-sqlite"))
+                    {
+                        s.mcp_launch_args.push("mcp-server-sqlite".to_string());
+                    }
+                    if !s
+                        .mcp_launch_args
+                        .iter()
+                        .any(|arg| arg.eq_ignore_ascii_case("--db"))
+                    {
+                        s.mcp_launch_args.push("--db".to_string());
+                        s.mcp_launch_args.push(s.db_path.clone());
+                    } else {
+                        let mut i = 0usize;
+                        while i < s.mcp_launch_args.len() {
+                            if s.mcp_launch_args[i].eq_ignore_ascii_case("--db") {
+                                let missing_value = i + 1 >= s.mcp_launch_args.len()
+                                    || s.mcp_launch_args[i + 1].trim().is_empty()
+                                    || s.mcp_launch_args[i + 1].starts_with('-');
+                                if missing_value {
+                                    s.mcp_launch_args.insert(i + 1, s.db_path.clone());
+                                }
+                                break;
+                            }
+                            i += 1;
+                        }
                     }
                 }
                 return s;

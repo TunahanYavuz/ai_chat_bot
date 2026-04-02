@@ -21,7 +21,10 @@ pub fn default_filename() -> String {
 fn capture_impl(target: Option<&str>) -> Result<CapturedFrame> {
     use screenshots::Screen;
 
-    let normalized = target.unwrap_or("focused_window").trim().to_ascii_lowercase();
+    let normalized = target
+        .unwrap_or("focused_window")
+        .trim()
+        .to_ascii_lowercase();
     if let Some(id) = normalized.strip_prefix("monitor:") {
         let monitor_id: u32 = id
             .trim()
@@ -45,7 +48,10 @@ fn capture_primary_monitor() -> Result<CapturedFrame> {
         .find(|m| m.display_info.is_primary)
         .or_else(|| Screen::all().ok().and_then(|mut all| all.pop()))
         .ok_or_else(|| anyhow!("no monitor available for capture"))?;
-    capture_screen_image(&monitor, format!("monitor:{}:primary", monitor.display_info.id))
+    capture_screen_image(
+        &monitor,
+        format!("monitor:{}:primary", monitor.display_info.id),
+    )
 }
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -67,9 +73,9 @@ fn capture_screen_image(monitor: &screenshots::Screen, source: String) -> Result
 
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn encode_frame(raw_rgba: &[u8], width: u32, height: u32, source: String) -> Result<CapturedFrame> {
+    use image::codecs::png::PngEncoder;
     use image::ColorType;
     use image::ImageEncoder;
-    use image::codecs::png::PngEncoder;
 
     let mut out = Vec::new();
     let encoder = PngEncoder::new(&mut out);

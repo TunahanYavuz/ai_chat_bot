@@ -4,16 +4,17 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
+use tokio::io::AsyncWriteExt;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Child;
-use tokio::sync::mpsc;
-use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration};
 
 use crate::parser::{ActionKind, AgentAction};
 use crate::web_engine::{format_search_results, WebEngine};
 use crate::{
+    db_discovery,
     mcp_client::{McpManager, McpServerConfig},
     screen_awareness,
 };
@@ -45,10 +46,7 @@ pub enum ExecutionStatus {
     /// Execution was intentionally paused because user confirmation is required.
     AwaitingApproval(ApprovalRequest),
     /// Execution was denied by user authorization decision.
-    AuthorizationDenied {
-        action: AgentAction,
-        reason: String,
-    },
+    AuthorizationDenied { action: AgentAction, reason: String },
 }
 
 /// Approval payload that the UI can render for approve/reject interactions.
@@ -81,7 +79,10 @@ impl ExecutionPolicy {
         match self {
             ExecutionPolicy::Manual => true,
             ExecutionPolicy::ReadEdit => {
-                matches!(action.action, ActionKind::RunCmd | ActionKind::RunAndObserve)
+                matches!(
+                    action.action,
+                    ActionKind::RunCmd | ActionKind::RunAndObserve
+                )
             }
             ExecutionPolicy::Execute => false,
             ExecutionPolicy::FullAccess => false,
@@ -102,7 +103,9 @@ impl ExecutionPolicy {
             ExecutionPolicy::Execute => {
                 "ExecutionPolicy::Execute auto-approves commands and file edits".to_string()
             }
-            ExecutionPolicy::FullAccess => "ExecutionPolicy::FullAccess auto-approves all actions".to_string(),
+            ExecutionPolicy::FullAccess => {
+                "ExecutionPolicy::FullAccess auto-approves all actions".to_string()
+            }
         }
     }
 }
@@ -194,7 +197,10 @@ impl ActionExecutor {
         if policy.requires_manual_approval(&action) {
             if current_auto_approve_state {
                 let report = self.execute_approved_action(action).await?;
-                return Ok((ExecutionStatus::Executed(report), current_auto_approve_state));
+                return Ok((
+                    ExecutionStatus::Executed(report),
+                    current_auto_approve_state,
+                ));
             }
 
             let request = ApprovalRequest {
@@ -204,7 +210,10 @@ impl ActionExecutor {
             match request_permission(request).await {
                 ApprovalDecision::ApproveOnce => {
                     let report = self.execute_approved_action(action).await?;
-                    Ok((ExecutionStatus::Executed(report), current_auto_approve_state))
+                    Ok((
+                        ExecutionStatus::Executed(report),
+                        current_auto_approve_state,
+                    ))
                 }
                 ApprovalDecision::GrantTemporaryAccess => {
                     let report = self.execute_approved_action(action).await?;
@@ -220,7 +229,10 @@ impl ActionExecutor {
             }
         } else {
             let report = self.execute_approved_action(action).await?;
-            Ok((ExecutionStatus::Executed(report), current_auto_approve_state))
+            Ok((
+                ExecutionStatus::Executed(report),
+                current_auto_approve_state,
+            ))
         }
     }
 
@@ -261,7 +273,12 @@ impl ActionExecutor {
                     tokio::fs::create_dir_all(&full_path),
                 )
                 .await
-                .map_err(|_| anyhow!("create_folder timed out after {}s", FILE_ACTION_TIMEOUT_SECS))?
+                .map_err(|_| {
+                    anyhow!(
+                        "create_folder timed out after {}s",
+                        FILE_ACTION_TIMEOUT_SECS
+                    )
+                })?
                 .with_context(|| format!("failed to create folder {}", full_path.display()))?;
 
                 Ok(ExecutionReport {
@@ -319,7 +336,9 @@ impl ActionExecutor {
                             tokio::fs::write(&full_path, content),
                         )
                         .await
-                        .map_err(|_| anyhow!("edit_file timed out after {}s", FILE_ACTION_TIMEOUT_SECS))?
+                        .map_err(|_| {
+                            anyhow!("edit_file timed out after {}s", FILE_ACTION_TIMEOUT_SECS)
+                        })?
                         .with_context(|| {
                             format!("failed to overwrite file {}", full_path.display())
                         })?;
@@ -333,7 +352,9 @@ impl ActionExecutor {
                                 .open(&full_path),
                         )
                         .await
-                        .map_err(|_| anyhow!("edit_file timed out after {}s", FILE_ACTION_TIMEOUT_SECS))?
+                        .map_err(|_| {
+                            anyhow!("edit_file timed out after {}s", FILE_ACTION_TIMEOUT_SECS)
+                        })?
                         .with_context(|| {
                             format!("failed to open file for append {}", full_path.display())
                         })?;
@@ -416,17 +437,14 @@ impl ActionExecutor {
             }
             ActionKind::SearchWeb => {
                 let query = required_non_empty(action.parameters.query.as_deref(), "query")?;
-                let web_engine = self
-                    .web_engine
-                    .as_ref()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "web engine initialization failed: {}",
-                            self.web_engine_init_error
-                                .as_deref()
-                                .unwrap_or("unknown initialization error")
-                        )
-                    })?;
+                let web_engine = self.web_engine.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "web engine initialization failed: {}",
+                        self.web_engine_init_error
+                            .as_deref()
+                            .unwrap_or("unknown initialization error")
+                    )
+                })?;
                 let results = web_engine.search_web(&query).await?;
                 Ok(ExecutionReport {
                     action: "search_web".to_string(),
@@ -443,17 +461,14 @@ impl ActionExecutor {
             }
             ActionKind::ReadUrl => {
                 let url = required_non_empty(action.parameters.url.as_deref(), "url")?;
-                let web_engine = self
-                    .web_engine
-                    .as_ref()
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "web engine initialization failed: {}",
-                            self.web_engine_init_error
-                                .as_deref()
-                                .unwrap_or("unknown initialization error")
-                        )
-                    })?;
+                let web_engine = self.web_engine.as_ref().ok_or_else(|| {
+                    anyhow!(
+                        "web engine initialization failed: {}",
+                        self.web_engine_init_error
+                            .as_deref()
+                            .unwrap_or("unknown initialization error")
+                    )
+                })?;
                 let content = web_engine.read_url(&url).await?;
                 Ok(ExecutionReport {
                     action: "read_url".to_string(),
@@ -469,7 +484,8 @@ impl ActionExecutor {
                 })
             }
             ActionKind::CaptureScreen => {
-                self.capture_screen_now(action.parameters.target.as_deref()).await
+                self.capture_screen_now(action.parameters.target.as_deref())
+                    .await
             }
             ActionKind::RunAndObserve => {
                 let command = required_non_empty(action.parameters.command.as_deref(), "command")?;
@@ -482,9 +498,12 @@ impl ActionExecutor {
                 self.run_and_observe(&command, delay_secs, &target).await
             }
             ActionKind::McpConnect => {
-                let server_id = required_non_empty(action.parameters.server_id.as_deref(), "server_id")?;
-                let command = required_non_empty(action.parameters.mcp_command.as_deref(), "mcp_command")?;
-                let args = action.parameters.mcp_args.unwrap_or_default();
+                let server_id =
+                    required_non_empty(action.parameters.server_id.as_deref(), "server_id")?;
+                let command =
+                    required_non_empty(action.parameters.mcp_command.as_deref(), "mcp_command")?;
+                let args =
+                    self.enforce_sqlite_mcp_args(action.parameters.mcp_args.unwrap_or_default());
                 let manager = self
                     .mcp_manager
                     .as_ref()
@@ -492,14 +511,29 @@ impl ActionExecutor {
                 let connected = manager
                     .connect(McpServerConfig {
                         id: server_id,
-                        command,
-                        args,
+                        command: command.clone(),
+                        args: args.clone(),
                     })
                     .await?;
+                let discovered_tools = manager.list_tools(&connected).await.unwrap_or_default();
+                let tool_summary = if discovered_tools.is_empty() {
+                    "- (none)".to_string()
+                } else {
+                    discovered_tools
+                        .into_iter()
+                        .map(|t| format!("- {}", t.name))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
                 Ok(ExecutionReport {
                     action: "mcp_connect".to_string(),
                     success: true,
-                    stdout: format!("[MCP] connected server_id={connected}"),
+                    stdout: format!(
+                        "[MCP] connected server_id={connected}\n[MCP] launch={} {}\n[MCP] auto mcp_list_tools after connect:\n{}",
+                        command,
+                        args.join(" "),
+                        tool_summary
+                    ),
                     stderr: String::new(),
                     exit_code: 0,
                     timed_out: false,
@@ -510,7 +544,8 @@ impl ActionExecutor {
                 })
             }
             ActionKind::McpListTools => {
-                let server_id = required_non_empty(action.parameters.server_id.as_deref(), "server_id")?;
+                let server_id =
+                    required_non_empty(action.parameters.server_id.as_deref(), "server_id")?;
                 let manager = self
                     .mcp_manager
                     .as_ref()
@@ -527,7 +562,10 @@ impl ActionExecutor {
                 Ok(ExecutionReport {
                     action: "mcp_list_tools".to_string(),
                     success: true,
-                    stdout: out.trim_end().to_string(),
+                    stdout: format!(
+                        "{}\n[MCP] SQLite read-database sequence: connect -> mcp_list_tools -> mcp_call_tool(query)",
+                        out.trim_end()
+                    ),
                     stderr: String::new(),
                     exit_code: 0,
                     timed_out: false,
@@ -538,7 +576,8 @@ impl ActionExecutor {
                 })
             }
             ActionKind::McpCallTool => {
-                let server_id = required_non_empty(action.parameters.server_id.as_deref(), "server_id")?;
+                let server_id =
+                    required_non_empty(action.parameters.server_id.as_deref(), "server_id")?;
                 let tool = required_non_empty(action.parameters.tool.as_deref(), "tool")?;
                 let manager = self
                     .mcp_manager
@@ -561,7 +600,8 @@ impl ActionExecutor {
                 })
             }
             ActionKind::McpDisconnect => {
-                let server_id = required_non_empty(action.parameters.server_id.as_deref(), "server_id")?;
+                let server_id =
+                    required_non_empty(action.parameters.server_id.as_deref(), "server_id")?;
                 let manager = self
                     .mcp_manager
                     .as_ref()
@@ -673,10 +713,11 @@ impl ActionExecutor {
 
     async fn capture_screen_now(&self, target: Option<&str>) -> Result<ExecutionReport> {
         let target = target.unwrap_or("focused_window").to_string();
-        let captured =
-            tokio::task::spawn_blocking(move || screen_awareness::capture_from_target(Some(&target)))
-                .await
-                .map_err(|e| anyhow!("screen capture task join error: {e}"))??;
+        let captured = tokio::task::spawn_blocking(move || {
+            screen_awareness::capture_from_target(Some(&target))
+        })
+        .await
+        .map_err(|e| anyhow!("screen capture task join error: {e}"))??;
         let filename = screen_awareness::default_filename();
         let full_path = self.resolve_screenshot_path(&filename);
         ensure_parent_dir(&full_path).await?;
@@ -685,7 +726,12 @@ impl ActionExecutor {
             tokio::fs::write(&full_path, &captured.png_bytes),
         )
         .await
-        .map_err(|_| anyhow!("capture_screen timed out after {}s", FILE_ACTION_TIMEOUT_SECS))?
+        .map_err(|_| {
+            anyhow!(
+                "capture_screen timed out after {}s",
+                FILE_ACTION_TIMEOUT_SECS
+            )
+        })?
         .with_context(|| format!("failed to save screenshot {}", full_path.display()))?;
 
         Ok(ExecutionReport {
@@ -926,6 +972,44 @@ impl ActionExecutor {
         self.normalize_generated_script_command(&maybe_non_interactive)
     }
 
+    fn enforce_sqlite_mcp_args(&self, mut args: Vec<String>) -> Vec<String> {
+        let is_sqlite = args
+            .iter()
+            .any(|arg| arg.eq_ignore_ascii_case("mcp-server-sqlite"));
+        if !is_sqlite {
+            return args;
+        }
+        let has_yes = args.iter().any(|arg| arg.eq_ignore_ascii_case("-y"));
+        if !has_yes {
+            args.insert(0, "-y".to_string());
+        }
+        let db_idx = args.iter().position(|arg| arg.eq_ignore_ascii_case("--db"));
+        match db_idx {
+            Some(idx) => {
+                let needs_value = idx + 1 >= args.len()
+                    || args[idx + 1].trim().is_empty()
+                    || args[idx + 1].starts_with('-');
+                if needs_value {
+                    let path = self.find_workspace_db_path();
+                    args.insert(idx + 1, path.to_string_lossy().to_string());
+                }
+            }
+            None => {
+                let path = self.find_workspace_db_path();
+                args.push("--db".to_string());
+                args.push(path.to_string_lossy().to_string());
+            }
+        }
+        args
+    }
+
+    fn find_workspace_db_path(&self) -> PathBuf {
+        if let Some(found) = db_discovery::find_first_db_file(&self.workspace_root) {
+            return found;
+        }
+        self.workspace_root.join("chat.db")
+    }
+
     fn normalize_generated_script_command(&self, cmd: &str) -> String {
         let trimmed = cmd.trim();
         if trimmed.is_empty() {
@@ -981,7 +1065,12 @@ impl ActionExecutor {
         let temp_md_path = self.workspace_root.join(temp_name);
         tokio::fs::write(&temp_md_path, markdown_content)
             .await
-            .with_context(|| format!("failed writing temporary markdown {}", temp_md_path.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed writing temporary markdown {}",
+                    temp_md_path.display()
+                )
+            })?;
 
         let mut cmd = Command::new("pandoc");
         cmd.arg(&temp_md_path)
@@ -1003,8 +1092,9 @@ impl ActionExecutor {
                     action: "generate_document".to_string(),
                     success: false,
                     stdout: String::new(),
-                    stderr: "pandoc is not installed. Install pandoc and retry document generation."
-                        .to_string(),
+                    stderr:
+                        "pandoc is not installed. Install pandoc and retry document generation."
+                            .to_string(),
                     exit_code: 127,
                     timed_out: false,
                     screenshot_png_bytes: None,
@@ -1243,7 +1333,16 @@ fn normalize_rel_path(raw: &str) -> String {
 fn is_top_level_workspace_dir(path: &str) -> bool {
     matches!(
         path,
-        "src" | "tests" | "benches" | "examples" | "docs" | "assets" | "scripts" | "exports" | "logs" | ".github"
+        "src"
+            | "tests"
+            | "benches"
+            | "examples"
+            | "docs"
+            | "assets"
+            | "scripts"
+            | "exports"
+            | "logs"
+            | ".github"
     ) || path.starts_with("src/")
         || path.starts_with("tests/")
         || path.starts_with("benches/")
@@ -1511,7 +1610,10 @@ fn escape_pdf_text(input: &str) -> String {
 }
 
 fn action_requires_delete_safety(action: &AgentAction) -> bool {
-    if matches!(action.action, ActionKind::RunCmd | ActionKind::RunAndObserve) {
+    if matches!(
+        action.action,
+        ActionKind::RunCmd | ActionKind::RunAndObserve
+    ) {
         let cmd = action
             .parameters
             .command

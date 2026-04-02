@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
-use rust_mcp_sdk::mcp_client::{ClientHandler, ClientRuntime, McpClientOptions, client_runtime};
+use anyhow::{anyhow, Result};
+use rust_mcp_sdk::mcp_client::{client_runtime, ClientHandler, ClientRuntime, McpClientOptions};
 use rust_mcp_sdk::schema::{
-    CallToolRequestParams, ClientCapabilities, ContentBlock, Implementation, InitializeRequestParams,
-    LATEST_PROTOCOL_VERSION,
+    CallToolRequestParams, ClientCapabilities, ContentBlock, Implementation,
+    InitializeRequestParams, LATEST_PROTOCOL_VERSION,
 };
 use rust_mcp_sdk::{McpClient, StdioTransport, ToMcpClientHandler, TransportOptions};
 use serde_json::{Map, Value};
@@ -265,7 +265,10 @@ fn format_content_block(block: &ContentBlock) -> String {
             format!("[audio content mime={}]", audio.mime_type)
         }
         ContentBlock::ResourceLink(resource) => {
-            format!("[resource link uri={} name={}]", resource.uri, resource.name)
+            format!(
+                "[resource link uri={} name={}]",
+                resource.uri, resource.name
+            )
         }
         ContentBlock::EmbeddedResource(resource) => match &resource.resource {
             rust_mcp_sdk::schema::EmbeddedResourceResource::TextResourceContents(text) => format!(

@@ -181,10 +181,9 @@ impl Storage {
                     self.paths.quota_cache_path.display()
                 )
             })?;
-        let parsed = serde_json::from_slice::<std::collections::HashMap<String, StoredQuotaMetrics>>(
-            &bytes,
-        )
-        .context("failed to parse quota cache JSON")?;
+        let parsed =
+            serde_json::from_slice::<std::collections::HashMap<String, StoredQuotaMetrics>>(&bytes)
+                .context("failed to parse quota cache JSON")?;
         Ok(Some(parsed))
     }
 }
@@ -243,11 +242,9 @@ fn build_file_tree_sync(path: &std::path::Path) -> Result<FileNode> {
         entries.push((entry_path, is_dir, name));
     }
 
-    entries.sort_by(|a, b| {
-        match b.1.cmp(&a.1) {
-            std::cmp::Ordering::Equal => a.2.cmp(&b.2),
-            other => other,
-        }
+    entries.sort_by(|a, b| match b.1.cmp(&a.1) {
+        std::cmp::Ordering::Equal => a.2.cmp(&b.2),
+        other => other,
     });
 
     for (entry_path, is_dir, name) in entries {

@@ -4,8 +4,8 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use notify::{RecursiveMode, Watcher};
 use tokio::sync::mpsc;
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 
 /// Debounced workspace watcher loop.
 ///
