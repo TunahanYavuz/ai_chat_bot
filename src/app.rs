@@ -4539,9 +4539,9 @@ impl eframe::App for ChatApp {
         if self.show_left_sidebar {
             egui::SidePanel::left("sidebar")
                 .resizable(true)
+                .min_width(150.0)
+                .max_width(480.0)
                 .default_width(260.0)
-                .min_width(180.0)
-                .max_width(420.0)
                 .frame(
                     egui::Frame::new()
                         .fill(BG_SURFACE)
@@ -4549,7 +4549,7 @@ impl eframe::App for ChatApp {
                 )
                 .show(ctx, |ui| {
                     ui.label(
-                        RichText::new("🤖 AI Chat Bot")
+                        RichText::new("AI Chat Bot")
                             .font(FontId::proportional(18.0))
                             .color(TEXT_PRIMARY)
                             .strong(),
@@ -4590,6 +4590,7 @@ impl eframe::App for ChatApp {
                         ScrollArea::vertical()
                             .max_height(list_max_height)
                             .show(ui, |ui| {
+                                let available_width = ui.available_width();
                                 for (idx, session_id, name, is_current) in &sessions_snapshot {
                                     ui.push_id(session_id, |ui| {
                                         ui.horizontal(|ui| {
@@ -4597,16 +4598,16 @@ impl eframe::App for ChatApp {
                                                 RichText::new(format!("💬 {name}"))
                                                     .color(LIGHT_TEXT),
                                             )
-                                            .fill(if *is_current {
-                                                GOLD_DARK
-                                            } else {
-                                                SKY_BLUE_DARK
-                                            })
-                                            .min_size(Vec2::new(
-                                                (ui.available_width() - DELETE_CHAT_BUTTON_WIDTH)
-                                                    .max(MIN_CHAT_BUTTON_WIDTH),
-                                                28.0,
-                                            ));
+                                                .fill(if *is_current {
+                                                    GOLD_DARK
+                                                } else {
+                                                    SKY_BLUE_DARK
+                                                })
+                                                .min_size(Vec2::new(
+                                                    (available_width - DELETE_CHAT_BUTTON_WIDTH)
+                                                        .max(MIN_CHAT_BUTTON_WIDTH),
+                                                    28.0,
+                                                ));
                                             if ui.add(btn).clicked() {
                                                 pending_select = Some(*idx);
                                             }
@@ -4714,7 +4715,7 @@ impl eframe::App for ChatApp {
                             let apply_custom_model = (custom_id_response.changed()
                                 && custom_id_response.lost_focus())
                                 || (custom_id_response.has_focus()
-                                    && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+                                && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                             if apply_custom_model {
                                 self.activate_model_selection();
                             }
