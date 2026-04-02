@@ -721,9 +721,17 @@ pub struct ChatApp {
     autonomous_schedules: Vec<AutonomousSchedule>,
     autonomous_time_input: String,
     autonomous_prompt_input: String,
+    repaint_requested: bool,
 }
 
 impl ChatApp {
+    fn try_send_event_now(tx: &tokio::sync::mpsc::Sender<AppEvent>, event: AppEvent) {
+        if tx.is_closed() {
+            return;
+        }
+        let _ = tx.try_send(event);
+    }
+
     fn ai_task_terminal_name(command: &str) -> String {
         let command_name = command
             .split_whitespace()
@@ -1842,18 +1850,23 @@ impl ChatApp {
     fn terminate_terminal(&mut self, terminal_id: &str) {
         if let Some(term) = self.terminals.iter_mut().find(|t| t.id == terminal_id) {
             if let Some(pid) = term.pid {
-                #[cfg(unix)]
-                {
-                    let _ = std::process::Command::new("kill")
-                        .arg(pid.to_string())
-                        .output();
-                }
-                #[cfg(windows)]
-                {
-                    let _ = std::process::Command::new("taskkill")
-                        .args(["/PID", &pid.to_string(), "/T", "/F"])
-                        .output();
-                }
+                let pid_s = pid.to_string();
+                self.tokio_rt.spawn(async move {
+                    #[cfg(unix)]
+                    {
+                        let _ = tokio::process::Command::new("kill")
+                            .args(["-TERM", &pid_s])
+                            .status()
+                            .await;
+                    }
+                    #[cfg(windows)]
+                    {
+                        let _ = tokio::process::Command::new("taskkill")
+                            .args(["/PID", &pid_s, "/T", "/F"])
+                            .status()
+                            .await;
+                    }
+                });
             }
             term.terminated = true;
             term.running = false;
@@ -1885,11 +1898,14 @@ impl ChatApp {
             let tid_chunks = tid.clone();
             let outcome = executor
                 .execute_command_streaming(&command, move |is_stdout, line| {
-                    let _ = tx_chunks.blocking_send(AppEvent::TerminalChunk {
-                        terminal_id: tid_chunks.clone(),
-                        line,
-                        is_stdout,
-                    });
+                    ChatApp::try_send_event_now(
+                        &tx_chunks,
+                        AppEvent::TerminalChunk {
+                            terminal_id: tid_chunks.clone(),
+                            line,
+                            is_stdout,
+                        },
+                    );
                 })
                 .await;
             match outcome {
@@ -2255,6 +2271,7 @@ impl ChatApp {
             autonomous_schedules: vec![],
             autonomous_time_input: "08:00".to_string(),
             autonomous_prompt_input: String::new(),
+            repaint_requested: false,
         };
 
         if let Some(idx) = app
@@ -2943,11 +2960,14 @@ impl ChatApp {
                         let tx_chunks = event_tx.clone();
                         action_executor = action_executor.with_terminal_output_sink(Arc::new(
                             move |is_stdout, line| {
-                                let _ = tx_chunks.blocking_send(AppEvent::TerminalChunk {
-                                    terminal_id: terminal_id.clone(),
-                                    line,
-                                    is_stdout,
-                                });
+                                ChatApp::try_send_event_now(
+                                    &tx_chunks,
+                                    AppEvent::TerminalChunk {
+                                        terminal_id: terminal_id.clone(),
+                                        line,
+                                        is_stdout,
+                                    },
+                                );
                             },
                         ));
                     }
@@ -4031,6 +4051,7 @@ impl ChatApp {
                 AppEvent::SwarmStatus { request_id, status } => {
                     if self.active_requests.contains_key(&request_id) {
                         self.swarm_status = status;
+                        self.repaint_requested = true;
                     }
                 }
                 AppEvent::SwarmWorkflowStep {
@@ -4040,6 +4061,7 @@ impl ChatApp {
                 } => {
                     if self.active_requests.contains_key(&request_id) {
                         self.begin_workflow_step(&request_id, title, details);
+                        self.repaint_requested = true;
                     }
                 }
                 AppEvent::VisionStaged { request_id, image } => {
@@ -4059,6 +4081,7 @@ impl ChatApp {
                             approval_id,
                             request,
                         });
+                        self.repaint_requested = true;
                     }
                 }
                 AppEvent::ModelsLoaded(model_ids) => {
@@ -4175,6 +4198,7 @@ impl ChatApp {
                     if let Some(session_idx) = continue_session {
                         self.dispatch_agent_requests(session_idx);
                     }
+                    self.repaint_requested = true;
                 }
                 AppEvent::TerminalChunk {
                     terminal_id,
@@ -4191,6 +4215,7 @@ impl ChatApp {
                             term.output.push('\n');
                         }
                     }
+                    self.repaint_requested = true;
                 }
                 AppEvent::OpenAiTerminal {
                     terminal_id,
@@ -4217,6 +4242,7 @@ impl ChatApp {
                     term.output.push_str(TERMINAL_RUNNING_MARKER);
                     self.terminals.push(term);
                     self.active_terminal_id = Some(terminal_id);
+                    self.repaint_requested = true;
                 }
                 AppEvent::InitialSessionsLoaded { sessions, error } => {
                     if let Some(err) = error {
@@ -4835,8 +4861,9 @@ impl eframe::App for ChatApp {
         self.process_workspace_refresh_signals();
         self.ingest_dropped_files(ctx);
         self.tick_notifications(ctx.input(|i| i.stable_dt));
-        if !self.active_requests.is_empty() {
+        if !self.active_requests.is_empty() || self.repaint_requested {
             ctx.request_repaint();
+            self.repaint_requested = false;
         }
 
         if self.setup_wizard.is_some() {

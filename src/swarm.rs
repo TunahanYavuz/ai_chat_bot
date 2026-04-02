@@ -162,6 +162,7 @@ DEPENDENCY AWARENESS:
 - Before executing any command that requires a third-party CLI (e.g., pandoc/python3/node/npx), you MUST check availability first with `command -v <tool>` or `which <tool>`.
 - If missing, autonomously install using the host package manager (e.g., `sudo pacman -S --noconfirm`, `sudo apt-get install -y`, or `cargo install` where applicable), then re-check, then continue.
 - Keep installs non-interactive and explicit.
+- If Host OS is Windows and you use `winget`, you MUST append: `--silent --force --accept-package-agreements --accept-source-agreements`.
 
 FAILURE HANDLING:
 - If a command fails, analyze stderr/stdout, classify cause, and propose/execute the next corrective action.
@@ -188,6 +189,7 @@ CODING RULES:
 
 DEPENDENCY AWARENESS (PLANNING):
 - If your proposed implementation relies on a third-party CLI dependency, explicitly include a SystemAdmin-prep action in plan context (tool check + install) before code change execution.
+- If Host OS is Windows and a `winget` install is required, ensure the command includes: `--silent --force --accept-package-agreements --accept-source-agreements`.
 
 FAILURE HANDLING:
 - If prior execution logs show failures, reason from stderr/stdout and adapt patch strategy.

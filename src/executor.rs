@@ -716,77 +716,8 @@ impl ActionExecutor {
                 })
                 .await;
         }
-        let normalized_cmd = self.normalize_command_for_safe_execution(cmd);
-        let mut command = if cfg!(target_os = "windows") {
-            let mut c = Command::new("cmd");
-            c.args(["/C", &normalized_cmd]);
-            c
-        } else {
-            let mut c = Command::new("sh");
-            c.args(["-c", &normalized_cmd]);
-            c
-        };
-
-        command
-            .current_dir(&self.workspace_root)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-
-        let timeout_enabled = !should_skip_timeout_for_ui_app(cmd);
-        let output = if timeout_enabled {
-            match timeout(
-                Duration::from_secs(TERMINAL_ACTION_TIMEOUT_SECS),
-                command.output(),
-            )
+        self.execute_command_streaming(cmd, |_is_stdout, _line| {})
             .await
-            {
-                Ok(result) => result
-                    .with_context(|| format!("failed to execute command: {normalized_cmd}"))?,
-                Err(_) => {
-                    return Ok(ExecutionReport {
-                        action: "run_cmd".to_string(),
-                        success: false,
-                        stdout: String::new(),
-                        stderr: format!(
-                            "[timeout] command exceeded {}s: {}",
-                            TERMINAL_ACTION_TIMEOUT_SECS, normalized_cmd
-                        ),
-                        exit_code: TIMEOUT_EXIT_CODE,
-                        timed_out: true,
-                        screenshot_png_bytes: None,
-                        screenshot_source: None,
-                        screenshot_width: None,
-                        screenshot_height: None,
-                    });
-                }
-            }
-        } else {
-            command
-                .output()
-                .await
-                .with_context(|| format!("failed to execute command: {normalized_cmd}"))?
-        };
-
-        let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let exit_code = output.status.code().unwrap_or(-1);
-
-        if exit_code == 0 && stdout.trim().is_empty() {
-            stdout = EMPTY_COMMAND_SUCCESS_MSG.to_string();
-        }
-
-        Ok(ExecutionReport {
-            action: "run_cmd".to_string(),
-            success: exit_code == 0,
-            stdout,
-            stderr,
-            exit_code,
-            timed_out: false,
-            screenshot_png_bytes: None,
-            screenshot_source: None,
-            screenshot_width: None,
-            screenshot_height: None,
-        })
     }
 
     pub async fn execute_command_streaming<F>(
@@ -795,7 +726,7 @@ impl ActionExecutor {
         mut on_chunk: F,
     ) -> Result<ExecutionReport>
     where
-        F: FnMut(bool, String) + Send + 'static,
+        F: FnMut(bool, String) + Send,
     {
         let normalized_cmd = self.normalize_command_for_safe_execution(cmd);
         let mut command = if cfg!(target_os = "windows") {
@@ -829,8 +760,8 @@ impl ActionExecutor {
                 loop {
                     match reader.next_line().await {
                         Ok(Some(line)) => {
-                            if let Err(e) = stdout_tx.send((true, line.clone())) {
-                                eprintln!("failed to send stdout chunk to terminal UI channel: {e}");
+                            if !stdout_tx.is_closed() {
+                                let _ = stdout_tx.send((true, line.clone()));
                             }
                             output.push_str(&line);
                             output.push('\n');
@@ -838,8 +769,8 @@ impl ActionExecutor {
                         Ok(None) => break,
                         Err(e) => {
                             let msg = format!("[stdout read error] {e}");
-                            if let Err(e) = stdout_tx.send((false, msg.clone())) {
-                                eprintln!("failed to send stdout read error to terminal UI channel: {e}");
+                            if !stdout_tx.is_closed() {
+                                let _ = stdout_tx.send((false, msg.clone()));
                             }
                             output.push_str(&msg);
                             output.push('\n');
@@ -858,8 +789,8 @@ impl ActionExecutor {
                 loop {
                     match reader.next_line().await {
                         Ok(Some(line)) => {
-                            if let Err(e) = stderr_tx.send((false, line.clone())) {
-                                eprintln!("failed to send stderr chunk to terminal UI channel: {e}");
+                            if !stderr_tx.is_closed() {
+                                let _ = stderr_tx.send((false, line.clone()));
                             }
                             output.push_str(&line);
                             output.push('\n');
@@ -867,8 +798,8 @@ impl ActionExecutor {
                         Ok(None) => break,
                         Err(e) => {
                             let msg = format!("[stderr read error] {e}");
-                            if let Err(e) = stderr_tx.send((false, msg.clone())) {
-                                eprintln!("failed to send stderr read error to terminal UI channel: {e}");
+                            if !stderr_tx.is_closed() {
+                                let _ = stderr_tx.send((false, msg.clone()));
                             }
                             output.push_str(&msg);
                             output.push('\n');
@@ -1064,15 +995,68 @@ impl ActionExecutor {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let output = cmd.output().await;
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let _ = tokio::fs::remove_file(&temp_md_path).await;
+                return Ok(ExecutionReport {
+                    action: "generate_document".to_string(),
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "pandoc is not installed. Install pandoc and retry document generation."
+                        .to_string(),
+                    exit_code: 127,
+                    timed_out: false,
+                    screenshot_png_bytes: None,
+                    screenshot_source: None,
+                    screenshot_width: None,
+                    screenshot_height: None,
+                });
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&temp_md_path).await;
+                return Err(anyhow!(e)).with_context(|| {
+                    format!(
+                        "failed to execute pandoc for document generation at {}",
+                        output_path.display()
+                    )
+                });
+            }
+        };
+
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let stdout_task = tokio::spawn(async move {
+            let mut output = String::new();
+            if let Some(stdout) = stdout_pipe {
+                let mut reader = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+            }
+            output
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut output = String::new();
+            if let Some(stderr) = stderr_pipe {
+                let mut reader = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = reader.next_line().await {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+            }
+            output
+        });
+        let wait_result = child.wait().await;
         let _ = tokio::fs::remove_file(&temp_md_path).await;
 
-        match output {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-                let exit_code = output.status.code().unwrap_or(-1);
-                if output.status.success() {
+        match wait_result {
+            Ok(status) => {
+                let stdout = stdout_task.await.unwrap_or_default();
+                let stderr = stderr_task.await.unwrap_or_default();
+                let exit_code = status.code().unwrap_or(-1);
+                if status.success() {
                     Ok(ExecutionReport {
                         action: "generate_document".to_string(),
                         success: true,
@@ -1104,19 +1088,6 @@ impl ActionExecutor {
                     })
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ExecutionReport {
-                action: "generate_document".to_string(),
-                success: false,
-                stdout: String::new(),
-                stderr: "pandoc is not installed. Install pandoc and retry document generation."
-                    .to_string(),
-                exit_code: 127,
-                timed_out: false,
-                screenshot_png_bytes: None,
-                screenshot_source: None,
-                screenshot_width: None,
-                screenshot_height: None,
-            }),
             Err(e) => Err(anyhow!(e)).with_context(|| {
                 format!(
                     "failed to execute pandoc for document generation at {}",
