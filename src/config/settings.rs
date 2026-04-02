@@ -284,7 +284,7 @@ impl Default for Settings {
             screen_awareness_enabled: false,
             mcp_enabled: false,
             mcp_launch_command: "npx".to_string(),
-            mcp_launch_args: vec!["-y".to_string(), "@modelcontextprotocol/server-everything".to_string()],
+            mcp_launch_args: vec!["-y".to_string(), "mcp-server-sqlite".to_string()],
             rag_top_k_limit: default_rag_top_k_limit(),
             rag_similarity_threshold: default_rag_similarity_threshold(),
         }

@@ -1119,6 +1119,24 @@ fn make_install_command_non_interactive(cmd: &str) -> String {
         return trimmed.to_string();
     }
     let lower = trimmed.to_ascii_lowercase();
+    let host_os = std::env::consts::OS;
+
+    if host_os == "windows" && is_winget_install_command(trimmed) {
+        let mut rebuilt = trimmed.to_string();
+        if !contains_flag(trimmed, "--silent") {
+            rebuilt.push_str(" --silent");
+        }
+        if !contains_flag(trimmed, "--force") {
+            rebuilt.push_str(" --force");
+        }
+        if !contains_flag(trimmed, "--accept-package-agreements") {
+            rebuilt.push_str(" --accept-package-agreements");
+        }
+        if !contains_flag(trimmed, "--accept-source-agreements") {
+            rebuilt.push_str(" --accept-source-agreements");
+        }
+        return rebuilt;
+    }
 
     if is_pacman_install_command(trimmed) {
         let mut rebuilt = trimmed.to_string();
@@ -1129,6 +1147,10 @@ fn make_install_command_non_interactive(cmd: &str) -> String {
             rebuilt.push_str(" --needed");
         }
         return rebuilt;
+    }
+
+    if is_pamac_install_command(trimmed) && !contains_flag(trimmed, "--no-confirm") {
+        return format!("{trimmed} --no-confirm");
     }
 
     if (lower.contains("apt-get install")
@@ -1180,6 +1202,30 @@ fn is_pacman_short_sync_flag(arg: &str) -> bool {
     }
     // Exclude query/list flags that are not install/upgrade operations.
     !(arg.starts_with("-Ss") || arg.starts_with("-Si") || arg.starts_with("-Sl"))
+}
+
+fn is_winget_install_command(cmd: &str) -> bool {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.is_empty() {
+        return false;
+    }
+    parts[0].eq_ignore_ascii_case("winget")
+        && parts
+            .iter()
+            .skip(1)
+            .any(|arg| arg.eq_ignore_ascii_case("install"))
+}
+
+fn is_pamac_install_command(cmd: &str) -> bool {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.is_empty() {
+        return false;
+    }
+    parts[0].eq_ignore_ascii_case("pamac")
+        && parts
+            .iter()
+            .skip(1)
+            .any(|arg| arg.eq_ignore_ascii_case("install"))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1383,7 +1429,10 @@ fn build_minimal_pdf(title: &str, content: &str) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_pacman_install_command, make_install_command_non_interactive};
+    use super::{
+        is_pacman_install_command, is_pamac_install_command, is_winget_install_command,
+        make_install_command_non_interactive,
+    };
 
     #[test]
     fn keeps_empty_command_unchanged() {
@@ -1436,6 +1485,20 @@ mod tests {
         assert!(is_pacman_install_command("pacman --sync python"));
         assert!(!is_pacman_install_command("pacman -Ss pandoc"));
         assert!(!is_pacman_install_command("pacman -h"));
+    }
+
+    #[test]
+    fn winget_install_detection_supports_common_forms() {
+        assert!(is_winget_install_command("winget install nodejs"));
+        assert!(is_winget_install_command("winget INSTALL OpenJS.NodeJS"));
+        assert!(!is_winget_install_command("winget search nodejs"));
+    }
+
+    #[test]
+    fn pamac_install_detection_supports_common_forms() {
+        assert!(is_pamac_install_command("pamac install nodejs"));
+        assert!(is_pamac_install_command("pamac INSTALL python"));
+        assert!(!is_pamac_install_command("pamac search nodejs"));
     }
 }
 

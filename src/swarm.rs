@@ -17,7 +17,9 @@ const MCP_PROTOCOL: &str = r#"MCP PROTOCOL:
 - Prefer mcp_list_tools before first mcp_call_tool on a new server_id.
 - Keep server_id stable within a workflow for reusable context.
 - Do not emit MCP actions when MCP is disabled in runtime settings.
-- You have native access to external tools via MCP. DO NOT write Python/Bash scripts for database queries, file reading, or API fetching if an MCP tool is available. Call the tool directly."#;
+- You have native access to external tools via MCP. DO NOT write Python/Bash scripts for database queries, file reading, or API fetching if an MCP tool is available. Call the tool directly.
+- For database tasks, always prefer registered MCP database tools over custom scripts.
+- If MCP package/launch fails with 404/Not Found, autonomously research the correct package name and retry MCP launch with the corrected package."#;
 
 const DIRECTORY_ENFORCEMENT_PROTOCOL: &str = r#"DIRECTORY ENFORCEMENT PROTOCOL:
 - Keep the workspace root clean. Do NOT place auxiliary/generated artifacts in root.
@@ -54,9 +56,10 @@ const SECURITY_GUARDRAILS_PROTOCOL: &str = r#"SECURITY GUARDRAILS:
 
 const DEPENDENCY_AWARENESS_PROTOCOL: &str = r#"DEPENDENCY AWARENESS PROTOCOL:
 - Before any command that depends on a third-party CLI (examples: pandoc, python3, node, npx), first verify tool presence using `command -v <tool>` (or `which <tool>`).
-- If missing, install autonomously using the host package manager before continuing (examples: `sudo pacman -S --noconfirm <tool>`, `sudo apt-get install -y <tool>`, `cargo install <crate>` when appropriate).
+- If missing, install autonomously using the host package manager before continuing (examples: `sudo pacman -S --noconfirm --needed <tool>`, `pamac install --no-confirm <tool>`, `sudo apt-get install -y <tool>`, `cargo install <crate>` when appropriate).
 - Re-verify after installation and only then run the primary task command.
-- Keep install commands non-interactive."#;
+- Keep install commands non-interactive.
+- On Windows, `winget` installs must include: `--silent --force --accept-package-agreements --accept-source-agreements`."#;
 
 const SELF_HEALING_PROTOCOL: &str = r#"AUTONOMOUS SELF-HEALING PROTOCOL:
 - If command execution fails with non-zero exit code and useful stderr/stdout evidence, do not give up immediately.
@@ -68,6 +71,7 @@ const SELF_HEALING_PROTOCOL: &str = r#"AUTONOMOUS SELF-HEALING PROTOCOL:
 - Always inspect terminal evidence first, then adapt command syntax/paths/permissions and retry with bounded safe attempts.
 - The user must be able to observe this recovery loop live in terminal output; do not hide retries.
 - Keep retries bounded and safe; prefer minimal command changes.
+- Standard bound: retry up to 3 autonomous attempts when correction evidence exists.
 - Persist learned syntax guidance via RAG memory when available."#;
 
 pub fn host_os_prompt_header() -> String {
