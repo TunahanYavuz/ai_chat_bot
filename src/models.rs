@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use reqwest::header::HeaderMap;
 
 /// Reasoning level used by models that support tiered thinking controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +159,14 @@ pub struct ProviderRequestOptions {
     pub max_tokens: Option<u32>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderQuotaSnapshot {
+    pub remaining_tokens: Option<u64>,
+    pub limit_tokens: Option<u64>,
+    pub remaining_requests: Option<u64>,
+    pub limit_requests: Option<u64>,
+}
+
 pub trait ProviderAdapter: Send + Sync {
     fn chat_endpoint(&self, base_url: &str) -> String;
     fn models_endpoint(&self, base_url: &str) -> String;
@@ -171,6 +180,28 @@ pub trait ProviderAdapter: Send + Sync {
     fn stream_done(&self, data: &str) -> bool;
     fn stream_delta_text(&self, data: &str) -> Option<String>;
     fn parse_non_stream_text(&self, body: &serde_json::Value) -> Option<String>;
+    fn parse_quota_from_headers(&self, headers: &HeaderMap) -> Option<ProviderQuotaSnapshot>;
+    fn parse_quota_from_body(&self, body: &serde_json::Value) -> Option<ProviderQuotaSnapshot>;
+    fn merge_quota(
+        &self,
+        header_quota: Option<ProviderQuotaSnapshot>,
+        body_quota: Option<ProviderQuotaSnapshot>,
+    ) -> Option<ProviderQuotaSnapshot> {
+        let mut out = header_quota.or(body_quota.clone())?;
+        if let Some(body) = body_quota {
+            out.remaining_tokens = out.remaining_tokens.or(body.remaining_tokens);
+            out.limit_tokens = out.limit_tokens.or(body.limit_tokens);
+            out.remaining_requests = out.remaining_requests.or(body.remaining_requests);
+            out.limit_requests = out.limit_requests.or(body.limit_requests);
+        }
+        Some(out)
+    }
+    fn fetch_account_status(
+        &self,
+        client: &reqwest::Client,
+        api_key: &str,
+        base_url: &str,
+    ) -> futures_util::future::BoxFuture<'static, anyhow::Result<Option<ProviderQuotaSnapshot>>>;
 }
 
 #[derive(Debug, Default)]
@@ -242,6 +273,95 @@ impl ProviderAdapter for OpenAiCompatibleAdapter {
             .and_then(|msg| msg.get("content"))
             .and_then(|content| content.as_str())
             .map(|s| s.to_string())
+    }
+
+    fn parse_quota_from_headers(&self, headers: &HeaderMap) -> Option<ProviderQuotaSnapshot> {
+        fn u64_header(headers: &HeaderMap, key: &str) -> Option<u64> {
+            headers
+                .get(key)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+        }
+        let remaining_tokens = u64_header(headers, "x-ratelimit-remaining-tokens")
+            .or_else(|| u64_header(headers, "x-ratelimit-remaining-token"))
+            .or_else(|| u64_header(headers, "x-ratelimit-remaining"));
+        let limit_tokens = u64_header(headers, "x-ratelimit-limit-tokens")
+            .or_else(|| u64_header(headers, "x-ratelimit-limit-token"))
+            .or_else(|| u64_header(headers, "x-ratelimit-limit"));
+        let remaining_requests =
+            u64_header(headers, "x-ratelimit-remaining-requests").or_else(|| {
+                u64_header(headers, "x-ratelimit-remaining-request")
+            });
+        let limit_requests = u64_header(headers, "x-ratelimit-limit-requests")
+            .or_else(|| u64_header(headers, "x-ratelimit-limit-request"));
+        if remaining_tokens.is_none()
+            && limit_tokens.is_none()
+            && remaining_requests.is_none()
+            && limit_requests.is_none()
+        {
+            return None;
+        }
+        Some(ProviderQuotaSnapshot {
+            remaining_tokens,
+            limit_tokens,
+            remaining_requests,
+            limit_requests,
+        })
+    }
+
+    fn parse_quota_from_body(&self, body: &serde_json::Value) -> Option<ProviderQuotaSnapshot> {
+        let usage = body.get("usage");
+        let rate = body.get("rate_limit").or_else(|| body.get("rateLimit"));
+        let remaining_tokens = rate
+            .and_then(|r| r.get("remaining_tokens").or_else(|| r.get("remainingTokens")))
+            .and_then(|v| v.as_u64());
+        let limit_tokens = rate
+            .and_then(|r| r.get("limit_tokens").or_else(|| r.get("limitTokens")))
+            .and_then(|v| v.as_u64());
+        let remaining_requests = rate
+            .and_then(|r| r.get("remaining_requests").or_else(|| r.get("remainingRequests")))
+            .and_then(|v| v.as_u64());
+        let limit_requests = rate
+            .and_then(|r| r.get("limit_requests").or_else(|| r.get("limitRequests")))
+            .and_then(|v| v.as_u64());
+        if usage.is_none()
+            && remaining_tokens.is_none()
+            && limit_tokens.is_none()
+            && remaining_requests.is_none()
+            && limit_requests.is_none()
+        {
+            return None;
+        }
+        Some(ProviderQuotaSnapshot {
+            remaining_tokens,
+            limit_tokens,
+            remaining_requests,
+            limit_requests,
+        })
+    }
+
+    fn fetch_account_status(
+        &self,
+        client: &reqwest::Client,
+        api_key: &str,
+        base_url: &str,
+    ) -> futures_util::future::BoxFuture<'static, anyhow::Result<Option<ProviderQuotaSnapshot>>> {
+        let api_key = api_key.to_string();
+        let base_url = base_url.to_string();
+        let client = client.clone();
+        Box::pin(async move {
+            let adapter = OpenAiCompatibleAdapter;
+            let url = adapter.models_endpoint(&base_url);
+            let mut request = client.get(&url);
+            for (k, v) in adapter.auth_headers(&api_key) {
+                request = request.header(k, v);
+            }
+            let response = request.send().await?;
+            let header_quota = adapter.parse_quota_from_headers(response.headers());
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            let body_quota = adapter.parse_quota_from_body(&body);
+            Ok(adapter.merge_quota(header_quota, body_quota))
+        })
     }
 }
 
@@ -324,6 +444,87 @@ impl ProviderAdapter for AnthropicAdapter {
             .and_then(|part| part.get("text"))
             .and_then(|t| t.as_str())
             .map(|s| s.to_string())
+    }
+
+    fn parse_quota_from_headers(&self, headers: &HeaderMap) -> Option<ProviderQuotaSnapshot> {
+        fn u64_header(headers: &HeaderMap, key: &str) -> Option<u64> {
+            headers
+                .get(key)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+        }
+        let remaining_tokens = u64_header(headers, "anthropic-ratelimit-tokens-remaining");
+        let limit_tokens = u64_header(headers, "anthropic-ratelimit-tokens-limit");
+        let remaining_requests = u64_header(headers, "anthropic-ratelimit-requests-remaining");
+        let limit_requests = u64_header(headers, "anthropic-ratelimit-requests-limit");
+        if remaining_tokens.is_none()
+            && limit_tokens.is_none()
+            && remaining_requests.is_none()
+            && limit_requests.is_none()
+        {
+            return None;
+        }
+        Some(ProviderQuotaSnapshot {
+            remaining_tokens,
+            limit_tokens,
+            remaining_requests,
+            limit_requests,
+        })
+    }
+
+    fn parse_quota_from_body(&self, body: &serde_json::Value) -> Option<ProviderQuotaSnapshot> {
+        let usage = body.get("usage");
+        let rate = body.get("rate_limit").or_else(|| body.get("rateLimit"));
+        let remaining_tokens = rate
+            .and_then(|r| r.get("tokens_remaining").or_else(|| r.get("remaining_tokens")))
+            .and_then(|v| v.as_u64());
+        let limit_tokens = rate
+            .and_then(|r| r.get("tokens_limit").or_else(|| r.get("limit_tokens")))
+            .and_then(|v| v.as_u64());
+        let remaining_requests = rate
+            .and_then(|r| r.get("requests_remaining").or_else(|| r.get("remaining_requests")))
+            .and_then(|v| v.as_u64());
+        let limit_requests = rate
+            .and_then(|r| r.get("requests_limit").or_else(|| r.get("limit_requests")))
+            .and_then(|v| v.as_u64());
+        if usage.is_none()
+            && remaining_tokens.is_none()
+            && limit_tokens.is_none()
+            && remaining_requests.is_none()
+            && limit_requests.is_none()
+        {
+            return None;
+        }
+        Some(ProviderQuotaSnapshot {
+            remaining_tokens,
+            limit_tokens,
+            remaining_requests,
+            limit_requests,
+        })
+    }
+
+    fn fetch_account_status(
+        &self,
+        client: &reqwest::Client,
+        api_key: &str,
+        base_url: &str,
+    ) -> futures_util::future::BoxFuture<'static, anyhow::Result<Option<ProviderQuotaSnapshot>>> {
+        let api_key = api_key.to_string();
+        let base_url = base_url.to_string();
+        let client = client.clone();
+        Box::pin(async move {
+            let adapter = AnthropicAdapter;
+            let url = adapter.models_endpoint(&base_url);
+            let mut request = client.get(&url);
+            for (k, v) in adapter.auth_headers(&api_key) {
+                request = request.header(k, v);
+            }
+            let response = request.send().await?;
+            let header_quota = adapter.parse_quota_from_headers(response.headers());
+            let body: serde_json::Value = response.json().await.unwrap_or_default();
+            let body_quota = adapter.parse_quota_from_body(&body);
+            Ok(adapter.merge_quota(header_quota, body_quota))
+        })
     }
 }
 

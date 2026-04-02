@@ -20,13 +20,13 @@ use crate::executor::{
 };
 use crate::mcp_client::McpManager;
 use crate::models::{
-    get_model_capability, reasoning_config_for_model, ModelReasoningConfig, ReasoningCapability,
-    ThinkingMode,
+    get_model_capability, reasoning_config_for_model, ModelReasoningConfig, ProviderQuotaSnapshot,
+    ReasoningCapability, ThinkingMode,
 };
 use crate::parser::ActionKind;
 use crate::rag_engine::{EmbeddingProvider, RagConfig, RagEngine};
 use crate::setup::SetupWizard;
-use crate::storage::{ChatSession, Storage, StoredMessage, StoredRole};
+use crate::storage::{ChatSession, Storage, StoredMessage, StoredQuotaMetrics, StoredRole};
 use crate::swarm::{get_system_prompt, parse_router_plan, AgentRole, RoutedTask};
 use crate::telemetry::collect_telemetry_cached;
 use crate::watcher::run_workspace_watcher;
@@ -140,6 +140,14 @@ pub enum AppEvent {
     ResponseComplete(String),
     ResponseError(String, String),
     ModelsLoaded(Vec<RemoteModelInfo>),
+    QuotaTelemetryUpdated {
+        provider_key: String,
+        snapshot: ProviderQuotaSnapshot,
+    },
+    QuotaCacheLoaded {
+        cache: HashMap<String, StoredQuotaMetrics>,
+        error: Option<String>,
+    },
     TerminalFinished {
         terminal_id: String,
         stdout: String,
@@ -347,6 +355,56 @@ impl QuotaManager {
         if let Some(m) = self.per_provider.get_mut(provider_key) {
             m.request_count = m.request_count.saturating_add(1);
             m.tokens_used = m.tokens_used.saturating_add(estimated_tokens);
+        }
+    }
+
+    fn apply_remote_snapshot(&mut self, provider_key: &str, snapshot: &ProviderQuotaSnapshot) {
+        self.ensure_provider(provider_key);
+        if let Some(m) = self.per_provider.get_mut(provider_key) {
+            if let (Some(limit), Some(remaining)) = (snapshot.limit_tokens, snapshot.remaining_tokens)
+            {
+                let bounded_limit = limit.max(1);
+                m.max_tokens = bounded_limit;
+                m.tokens_used = bounded_limit.saturating_sub(remaining.min(bounded_limit));
+            }
+            if let (Some(limit), Some(remaining)) =
+                (snapshot.limit_requests, snapshot.remaining_requests)
+            {
+                let bounded_limit = limit.max(1);
+                m.max_requests = bounded_limit;
+                m.request_count = bounded_limit.saturating_sub(remaining.min(bounded_limit));
+            }
+        }
+    }
+
+    fn to_stored_map(&self) -> HashMap<String, StoredQuotaMetrics> {
+        self.per_provider
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    StoredQuotaMetrics {
+                        tokens_used: v.tokens_used,
+                        request_count: v.request_count,
+                        max_tokens: v.max_tokens,
+                        max_requests: v.max_requests,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn apply_cached_map(&mut self, cache: &HashMap<String, StoredQuotaMetrics>) {
+        for (provider_key, stored) in cache {
+            self.per_provider.insert(
+                provider_key.clone(),
+                QuotaMetrics {
+                    tokens_used: stored.tokens_used,
+                    request_count: stored.request_count,
+                    max_tokens: stored.max_tokens.max(1),
+                    max_requests: stored.max_requests.max(1),
+                },
+            );
         }
     }
 
@@ -1228,6 +1286,18 @@ impl ChatApp {
         });
     }
 
+    fn persist_quota_cache_async(&self) {
+        let Some(storage) = self.storage.clone() else {
+            return;
+        };
+        let snapshot = self.quota_manager.to_stored_map();
+        self.tokio_rt.spawn(async move {
+            if let Err(e) = storage.save_quota_cache(&snapshot).await {
+                eprintln!("Failed to persist quota cache: {e}");
+            }
+        });
+    }
+
     fn spawn_initial_data_load(&self) {
         let tx = self.event_tx.clone();
         let db_path = self.db_path.clone();
@@ -1317,6 +1387,33 @@ impl ChatApp {
                         let _ = tx
                             .send(AppEvent::StoredSessionLoaded {
                                 session: None,
+                                error: Some(e.to_string()),
+                            })
+                            .await;
+                    }
+                }
+            });
+        }
+
+        if let Some(storage) = self.storage.clone() {
+            let tx = self.event_tx.clone();
+            self.tokio_rt.spawn(async move {
+                match storage.load_quota_cache().await {
+                    Ok(Some(cache)) => {
+                        let _ = tx.send(AppEvent::QuotaCacheLoaded { cache, error: None }).await;
+                    }
+                    Ok(None) => {
+                        let _ = tx
+                            .send(AppEvent::QuotaCacheLoaded {
+                                cache: HashMap::new(),
+                                error: None,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(AppEvent::QuotaCacheLoaded {
+                                cache: HashMap::new(),
                                 error: Some(e.to_string()),
                             })
                             .await;
@@ -2247,8 +2344,23 @@ impl ChatApp {
         let tx = self.event_tx.clone();
         self.tokio_rt.spawn(async move {
             let client = crate::api::OpenAIClient::with_provider(&provider_key, &api_key, &base_url);
-            let model_ids: Vec<crate::api::openai::RemoteModelInfo> =
-                client.list_models().await.unwrap_or_default();
+            let (model_ids, list_quota): (Vec<crate::api::openai::RemoteModelInfo>, Option<ProviderQuotaSnapshot>) =
+                client.list_models_with_quota().await.unwrap_or((Vec::new(), None));
+            if let Some(snapshot) = list_quota {
+                let _ = tx
+                    .send(AppEvent::QuotaTelemetryUpdated {
+                        provider_key: provider_key.clone(),
+                        snapshot,
+                    })
+                    .await;
+            } else if let Ok(Some(snapshot)) = client.fetch_account_status().await {
+                let _ = tx
+                    .send(AppEvent::QuotaTelemetryUpdated {
+                        provider_key: provider_key.clone(),
+                        snapshot,
+                    })
+                    .await;
+            }
             let _ = tx.send(AppEvent::ModelsLoaded(model_ids)).await;
         });
     }
@@ -2467,6 +2579,20 @@ impl ChatApp {
                     reasoning_capability,
                     tiered_reasoning_level.as_ref(),
                     binary_reasoning_enabled,
+                    {
+                        let tx = event_tx.clone();
+                        move |provider_key, snapshot| {
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let _ = tx
+                                    .send(AppEvent::QuotaTelemetryUpdated {
+                                        provider_key,
+                                        snapshot,
+                                    })
+                                    .await;
+                            });
+                        }
+                    },
                     |_| {},
                 )
                 .await;
@@ -2549,6 +2675,20 @@ impl ChatApp {
                         reasoning_capability,
                         tiered_reasoning_level.as_ref(),
                         binary_reasoning_enabled,
+                        {
+                            let tx = event_tx.clone();
+                            move |provider_key, snapshot| {
+                                let tx = tx.clone();
+                                tokio::spawn(async move {
+                                    let _ = tx
+                                        .send(AppEvent::QuotaTelemetryUpdated {
+                                            provider_key,
+                                            snapshot,
+                                        })
+                                        .await;
+                                });
+                            }
+                        },
                         |_| {},
                     )
                     .await
@@ -2587,6 +2727,20 @@ impl ChatApp {
                             reasoning_capability,
                             tiered_reasoning_level.as_ref(),
                             binary_reasoning_enabled,
+                            {
+                                let tx = event_tx.clone();
+                                move |provider_key, snapshot| {
+                                    let tx = tx.clone();
+                                    tokio::spawn(async move {
+                                        let _ = tx
+                                            .send(AppEvent::QuotaTelemetryUpdated {
+                                                provider_key,
+                                                snapshot,
+                                            })
+                                            .await;
+                                    });
+                                }
+                            },
                             |_| {},
                         )
                         .await
@@ -2903,6 +3057,20 @@ impl ChatApp {
                         reasoning_capability,
                         tiered_reasoning_level.as_ref(),
                         binary_reasoning_enabled,
+                        {
+                            let tx = event_tx.clone();
+                            move |provider_key, snapshot| {
+                                let tx = tx.clone();
+                                tokio::spawn(async move {
+                                    let _ = tx
+                                        .send(AppEvent::QuotaTelemetryUpdated {
+                                            provider_key,
+                                            snapshot,
+                                        })
+                                        .await;
+                                });
+                            }
+                        },
                         |_stream_chunk| {},
                     )
                     .await
@@ -3716,6 +3884,22 @@ impl ChatApp {
                         }
                     }
                     self.refresh_model_access_outline();
+                }
+                AppEvent::QuotaTelemetryUpdated {
+                    provider_key,
+                    snapshot,
+                } => {
+                    self.quota_manager
+                        .apply_remote_snapshot(&provider_key, &snapshot);
+                    self.persist_quota_cache_async();
+                }
+                AppEvent::QuotaCacheLoaded { cache, error } => {
+                    if let Some(err) = error {
+                        self.activity_log
+                            .push(format!("Failed to load quota cache: {err}"));
+                    } else if !cache.is_empty() {
+                        self.quota_manager.apply_cached_map(&cache);
+                    }
                 }
                 AppEvent::TerminalFinished {
                     terminal_id,

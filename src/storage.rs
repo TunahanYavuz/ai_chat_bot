@@ -40,6 +40,7 @@ pub struct StoragePaths {
     pub config_dir: PathBuf,
     pub data_dir: PathBuf,
     pub latest_session_path: PathBuf,
+    pub quota_cache_path: PathBuf,
 }
 
 impl StoragePaths {
@@ -57,10 +58,12 @@ impl StoragePaths {
             .with_context(|| format!("failed to create data dir {}", data_dir.display()))?;
 
         let latest_session_path = data_dir.join("latest_session.json");
+        let quota_cache_path = data_dir.join("quota_cache.json");
         Ok(Self {
             config_dir,
             data_dir,
             latest_session_path,
+            quota_cache_path,
         })
     }
 }
@@ -77,6 +80,14 @@ pub struct FileNode {
     pub path: String,
     pub is_dir: bool,
     pub children: Vec<FileNode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StoredQuotaMetrics {
+    pub tokens_used: u64,
+    pub request_count: u64,
+    pub max_tokens: u64,
+    pub max_requests: u64,
 }
 
 impl Storage {
@@ -129,6 +140,51 @@ impl Storage {
             })?;
         let parsed = serde_json::from_slice::<ChatSession>(&bytes)
             .context("failed to parse session JSON")?;
+        Ok(Some(parsed))
+    }
+
+    pub async fn save_quota_cache(
+        &self,
+        cache: &std::collections::HashMap<String, StoredQuotaMetrics>,
+    ) -> Result<()> {
+        let serialized =
+            serde_json::to_vec_pretty(cache).context("failed to serialize quota cache")?;
+        let tmp_path = self
+            .paths
+            .data_dir
+            .join(format!("quota_cache_{}.json.tmp", Uuid::new_v4()));
+        fs::write(&tmp_path, &serialized)
+            .await
+            .with_context(|| format!("failed to write temp quota cache {}", tmp_path.display()))?;
+        fs::rename(&tmp_path, &self.paths.quota_cache_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to replace quota cache file {}",
+                    self.paths.quota_cache_path.display()
+                )
+            })?;
+        Ok(())
+    }
+
+    pub async fn load_quota_cache(
+        &self,
+    ) -> Result<Option<std::collections::HashMap<String, StoredQuotaMetrics>>> {
+        if !self.paths.quota_cache_path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&self.paths.quota_cache_path)
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to read quota cache file {}",
+                    self.paths.quota_cache_path.display()
+                )
+            })?;
+        let parsed = serde_json::from_slice::<std::collections::HashMap<String, StoredQuotaMetrics>>(
+            &bytes,
+        )
+        .context("failed to parse quota cache JSON")?;
         Ok(Some(parsed))
     }
 }
