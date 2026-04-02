@@ -133,6 +133,7 @@ pub struct ActionExecutor {
     web_engine: Option<WebEngine>,
     web_engine_init_error: Option<String>,
     mcp_manager: Option<Arc<McpManager>>,
+    terminal_output_sink: Option<Arc<dyn Fn(bool, String) + Send + Sync>>,
 }
 
 impl ActionExecutor {
@@ -146,7 +147,16 @@ impl ActionExecutor {
             web_engine,
             web_engine_init_error,
             mcp_manager,
+            terminal_output_sink: None,
         }
+    }
+
+    pub fn with_terminal_output_sink(
+        mut self,
+        sink: Arc<dyn Fn(bool, String) + Send + Sync>,
+    ) -> Self {
+        self.terminal_output_sink = Some(sink);
+        self
     }
 
     /// Executes one action or yields an approval request depending on execution policy.
@@ -581,6 +591,7 @@ impl ActionExecutor {
     ) -> Result<ExecutionReport> {
         let command_for_spawn = cmd.to_string();
         let workspace = self.workspace_root.clone();
+        let terminal_sink = self.terminal_output_sink.clone();
         let spawn_join = tokio::spawn(async move {
             let mut command = if cfg!(target_os = "windows") {
                 let mut c = Command::new("cmd");
@@ -593,11 +604,40 @@ impl ActionExecutor {
             };
             command
                 .current_dir(workspace)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            let mut child = command.spawn().map_err(|e| e.to_string())?;
+            let stdout_pipe = child.stdout.take();
+            let stderr_pipe = child.stderr.take();
+            tokio::spawn(async move {
+                let stdout_sink = terminal_sink.clone();
+                let stderr_sink = terminal_sink.clone();
+                let stdout_reader = async move {
+                    if let Some(stdout) = stdout_pipe {
+                        let mut reader = BufReader::new(stdout).lines();
+                        while let Ok(Some(line)) = reader.next_line().await {
+                            if let Some(sink) = &stdout_sink {
+                                sink(true, line);
+                            }
+                        }
+                    }
+                };
+                let stderr_reader = async move {
+                    if let Some(stderr) = stderr_pipe {
+                        let mut reader = BufReader::new(stderr).lines();
+                        while let Ok(Some(line)) = reader.next_line().await {
+                            if let Some(sink) = &stderr_sink {
+                                sink(false, line);
+                            }
+                        }
+                    }
+                };
+                let child_wait = async move {
+                    let _ = child.wait().await;
+                };
+                let _ = tokio::join!(stdout_reader, stderr_reader, child_wait);
+            });
+            Ok::<(), String>(())
         });
         match spawn_join.await {
             Ok(Ok(())) => {}
@@ -669,6 +709,13 @@ impl ActionExecutor {
     }
 
     async fn execute_command(&self, cmd: &str) -> Result<ExecutionReport> {
+        if let Some(sink) = self.terminal_output_sink.clone() {
+            return self
+                .execute_command_streaming(cmd, move |is_stdout, line| {
+                    sink(is_stdout, line);
+                })
+                .await;
+        }
         let normalized_cmd = self.normalize_command_for_safe_execution(cmd);
         let mut command = if cfg!(target_os = "windows") {
             let mut c = Command::new("cmd");

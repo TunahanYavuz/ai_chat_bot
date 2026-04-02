@@ -64,6 +64,9 @@ const SELF_HEALING_PROTOCOL: &str = r#"AUTONOMOUS SELF-HEALING PROTOCOL:
   1) search_web using the failing tool + exact error text,
   2) read_url for authoritative docs/changelog pages,
   3) update the fix plan, then retry with corrected command.
+- STALL GUARD: If terminal output includes "Permission denied", "command not found", or equivalent platform variants, you MUST trigger self-healing immediately instead of only reporting failure.
+- Always inspect terminal evidence first, then adapt command syntax/paths/permissions and retry with bounded safe attempts.
+- The user must be able to observe this recovery loop live in terminal output; do not hide retries.
 - Keep retries bounded and safe; prefer minimal command changes.
 - Persist learned syntax guidance via RAG memory when available."#;
 
@@ -244,6 +247,8 @@ RULES:
 - If commands/actions failed, analyze stderr context and provide the most likely root cause and safest next action.
 - If evidence is incomplete, state what is missing explicitly.
 - Never include runnable actions in Synthesizer output; actions must remain empty.
+- DIRECTIVE: If execution output contains structured/tabular data (SQL results, CSV rows, JSON lists, or log tables), you MUST render that data as a clean Markdown table in MESSAGE. Do not only summarize.
+- FORMATTING: Use standard Markdown table syntax (| Col 1 | Col 2 |), preserve raw values faithfully, and keep headers/columns readable and aligned.
 
 {UNIVERSAL_NLU_PROTOCOL}
 
