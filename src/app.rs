@@ -2928,9 +2928,28 @@ impl ChatApp {
                     } else {
                         None
                     };
-                    let command_for_terminal = action.parameters.command.clone();
-                    let command_action =
-                        matches!(action.action, ActionKind::RunCmd | ActionKind::RunAndObserve);
+                    let command_for_terminal = match action.action {
+                        ActionKind::RunCmd | ActionKind::RunAndObserve => {
+                            action.parameters.command.clone()
+                        }
+                        ActionKind::McpConnect => {
+                            let cmd = action.parameters.mcp_command.clone().unwrap_or_default();
+                            let args = action.parameters.mcp_args.clone().unwrap_or_default();
+                            let joined = args.join(" ");
+                            if cmd.trim().is_empty() {
+                                None
+                            } else if joined.trim().is_empty() {
+                                Some(cmd)
+                            } else {
+                                Some(format!("{cmd} {joined}"))
+                            }
+                        }
+                        _ => None,
+                    };
+                    let command_action = matches!(
+                        action.action,
+                        ActionKind::RunCmd | ActionKind::RunAndObserve | ActionKind::McpConnect
+                    );
                     let ai_terminal_id = if command_action {
                         Some(Uuid::new_v4().to_string())
                     } else {
@@ -6061,7 +6080,7 @@ impl eframe::App for ChatApp {
                                         ScrollArea::horizontal()
                                             .auto_shrink([false, false])
                                             .id_salt("vision_staging_filmstrip")
-                                            .max_height(80.0)
+                                            .max_height(100.0)
                                             .show(ui, |ui| {
                                                 ui.horizontal(|ui| {
                                                     for idx in 0..self.vision_staging.images.len() {
