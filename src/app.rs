@@ -2828,8 +2828,23 @@ impl ChatApp {
             let mut swarm_memory = String::new();
             let mut final_parts: Vec<String> = Vec::new();
             let mut auto_approve_enabled = false;
+            let mut swarm_step_index = 0usize;
 
             for step in queue {
+                // Mandatory inter-agent cooldown to prevent API rate limiting.
+                if swarm_step_index > 0 {
+                    let cooldown_ms = 1500u64;
+                    let _ = event_tx
+                        .send(AppEvent::SwarmStatus {
+                            request_id: req_id.clone(),
+                            status: format!(
+                                "⏳ API Rate Limit active. Pausing for {cooldown_ms}ms to prevent throttling..."
+                            ),
+                        })
+                        .await;
+                    tokio::time::sleep(tokio::time::Duration::from_millis(cooldown_ms)).await;
+                }
+                swarm_step_index += 1;
                 let Some(role) = AgentRole::from_plan_name(&step.agent) else {
                     continue;
                 };

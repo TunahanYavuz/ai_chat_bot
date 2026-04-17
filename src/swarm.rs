@@ -1,4 +1,23 @@
 use serde::Deserialize;
+use std::sync::OnceLock;
+
+static AI_RULES_CONTENT: OnceLock<String> = OnceLock::new();
+
+/// Reads `AI_RULES.md` from the working directory once and caches the result.
+/// If the file is missing or unreadable, logs a warning and returns an empty string.
+fn load_ai_rules() -> &'static str {
+    AI_RULES_CONTENT.get_or_init(|| {
+        match std::fs::read_to_string("AI_RULES.md") {
+            Ok(content) => content,
+            Err(e) => {
+                eprintln!(
+                    "[WARN] AI_RULES.md not found or unreadable: {e}. Proceeding with default context."
+                );
+                String::new()
+            }
+        }
+    })
+}
 
 const UNIVERSAL_NLU_PROTOCOL: &str = r#"GLOBAL NLU PROTOCOL: The user may command you in ANY language (Turkish, Spanish, etc.). You must understand their intent and reply in their language in the 'MESSAGE:' block. HOWEVER, your internal reasoning and the JSON `EXECUTION_BLOCK` MUST remain strictly in English. Never translate OS commands (e.g., use `mkdir`, not `klasör_aç`) or JSON keys."#;
 const TRANSLATION_INTERCEPTOR_PROTOCOL: &str = r#"TRANSLATION INTERCEPTOR PROTOCOL:
@@ -133,6 +152,14 @@ pub struct RoutedTask {
 }
 
 pub fn get_system_prompt(role: &AgentRole) -> String {
+    // Dynamically loaded AI_RULES.md is prepended for the three primary executor roles.
+    let rules = load_ai_rules();
+    let rules_prefix = if rules.is_empty() {
+        String::new()
+    } else {
+        format!("{rules}\n\n")
+    };
+
     let base = match role {
         AgentRole::Router => r#"You are Router, the deterministic planning gateway of a multi-agent swarm.
 You do not execute tools or write code. You only produce the execution route.
@@ -243,8 +270,15 @@ FAILURE HANDLING:
 - Do not stop at generic failure text; provide next best research action."#
             .to_string(),
     };
+
+    // Rules prefix is applied to Router, SystemAdmin, and CodeArchitect only (not WebResearcher).
+    let effective_base = match role {
+        AgentRole::WebResearcher => base,
+        _ => format!("{rules_prefix}{base}"),
+    };
+
     format!(
-        "{base}\n\n{UNIVERSAL_NLU_PROTOCOL}\n\n{TRANSLATION_INTERCEPTOR_PROTOCOL}\n\n{STRICT_JSON_ACTION_SCHEMA}\n\n{ERROR_RECOVERY_PROTOCOL}\n\n{SECURITY_GUARDRAILS_PROTOCOL}\n\n{DEPENDENCY_AWARENESS_PROTOCOL}\n\n{SELF_HEALING_PROTOCOL}\n\n{VISUAL_QA_PROTOCOL}\n\n{WEB_SYNTHESIS_PROTOCOL}\n\n{MCP_PROTOCOL}\n\n{SQLITE_MCP_PROTOCOL}\n\n{DIRECTORY_ENFORCEMENT_PROTOCOL}"
+        "{effective_base}\n\n{UNIVERSAL_NLU_PROTOCOL}\n\n{TRANSLATION_INTERCEPTOR_PROTOCOL}\n\n{STRICT_JSON_ACTION_SCHEMA}\n\n{ERROR_RECOVERY_PROTOCOL}\n\n{SECURITY_GUARDRAILS_PROTOCOL}\n\n{DEPENDENCY_AWARENESS_PROTOCOL}\n\n{SELF_HEALING_PROTOCOL}\n\n{VISUAL_QA_PROTOCOL}\n\n{WEB_SYNTHESIS_PROTOCOL}\n\n{MCP_PROTOCOL}\n\n{SQLITE_MCP_PROTOCOL}\n\n{DIRECTORY_ENFORCEMENT_PROTOCOL}"
     )
 }
 
