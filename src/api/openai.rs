@@ -181,27 +181,62 @@ impl OpenAIClient {
             .build_chat_payload(model, &payload_messages, &opts);
 
         let url = self.adapter.chat_endpoint(&self.base_url);
-        let mut request = self.client.post(&url);
-        for (k, v) in self.adapter.auth_headers(&self.api_key) {
-            request = request.header(k, v);
-        }
-        let response = request.json(&payload).send().await?;
-        let header_quota = self.adapter.parse_quota_from_headers(response.headers());
 
-        if !response.status().is_success() {
+        const MAX_RETRIES: u32 = 3;
+        let mut retry_delay_secs = 2u64;
+
+        for attempt in 0..=MAX_RETRIES {
+            let mut request = self.client.post(&url);
+            for (k, v) in self.adapter.auth_headers(&self.api_key) {
+                request = request.header(k, v);
+            }
+            let response = request.json(&payload).send().await?;
             let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!("API error {}: {}", status, body));
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            {
+                if attempt >= MAX_RETRIES {
+                    let body = response.text().await.unwrap_or_default();
+                    return Err(anyhow!(
+                        "API error {} after {} retries: {}",
+                        status,
+                        MAX_RETRIES,
+                        body
+                    ));
+                }
+                let wait_secs = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(retry_delay_secs);
+                eprintln!(
+                    "[RateLimit] Status {status}. Pausing for {wait_secs}s (attempt {}/{MAX_RETRIES})...",
+                    attempt + 1
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs)).await;
+                retry_delay_secs = retry_delay_secs.saturating_mul(2);
+                continue;
+            }
+
+            let header_quota = self.adapter.parse_quota_from_headers(response.headers());
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                return Err(anyhow!("API error {}: {}", status, body));
+            }
+
+            let parsed: serde_json::Value = response.json().await?;
+            let body_quota = self.adapter.parse_quota_from_body(&parsed);
+            let merged_quota = self.adapter.merge_quota(header_quota, body_quota);
+            let text = self
+                .adapter
+                .parse_non_stream_text(&parsed)
+                .unwrap_or_default();
+            return Ok((text, merged_quota));
         }
 
-        let parsed: serde_json::Value = response.json().await?;
-        let body_quota = self.adapter.parse_quota_from_body(&parsed);
-        let merged_quota = self.adapter.merge_quota(header_quota, body_quota);
-        let text = self
-            .adapter
-            .parse_non_stream_text(&parsed)
-            .unwrap_or_default();
-        Ok((text, merged_quota))
+        Err(anyhow!("Unexpected end of retry loop"))
     }
 
     pub async fn chat_completion(
@@ -259,11 +294,51 @@ impl OpenAIClient {
             .build_chat_payload(model, &payload_messages, &options);
 
         let url = self.adapter.chat_endpoint(&self.base_url);
-        let mut req = self.client.post(&url);
-        for (k, v) in self.adapter.auth_headers(&self.api_key) {
-            req = req.header(k, v);
-        }
-        let response = req.json(&payload).send().await?;
+
+        const MAX_RETRIES: u32 = 3;
+        let mut retry_delay_secs = 2u64;
+
+        let response = loop {
+            let mut req = self.client.post(&url);
+            for (k, v) in self.adapter.auth_headers(&self.api_key) {
+                req = req.header(k, v);
+            }
+            let resp = req.json(&payload).send().await?;
+            let status = resp.status();
+
+            if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+            {
+                let wait_secs = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(retry_delay_secs);
+
+                // Check retries before consuming the response body.
+                let attempts_exhausted = retry_delay_secs > 2u64.pow(MAX_RETRIES);
+                if attempts_exhausted {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(anyhow!(
+                        "API error {} after {} retries: {}",
+                        status,
+                        MAX_RETRIES,
+                        body
+                    ));
+                }
+
+                eprintln!(
+                    "[RateLimit] Status {status}. Pausing for {wait_secs}s before retry..."
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs)).await;
+                retry_delay_secs = retry_delay_secs.saturating_mul(2);
+                continue;
+            }
+
+            break resp;
+        };
+
         let header_quota = self.adapter.parse_quota_from_headers(response.headers());
         if let Some(snapshot) = header_quota.clone() {
             on_quota(self.provider_key.clone(), snapshot);
