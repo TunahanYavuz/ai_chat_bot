@@ -8,7 +8,7 @@ use egui::{
 use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
 use egui_twemoji::EmojiLabel;
 use serde::Deserialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -48,6 +48,21 @@ fn truncate_for_search(input: &str, max_chars: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+fn normalize_compact_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn trim_text_tail(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    text.chars().skip(total - max_chars).collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,6 +156,9 @@ const AUTONOMOUS_TRIGGER_KEYWORDS: [&str; 6] = [
 ];
 const SELF_HEALING_QUERY_MAX_CHARS: usize = 320;
 const SELF_HEALING_DOC_EXCERPT_MAX_CHARS: usize = 1600;
+const SUCCESS_LEARNING_SNIPPET_MAX_CHARS: usize = 1200;
+const SWARM_MEMORY_MAX_CHARS: usize = 24_000;
+const MAX_ROUTED_TASKS: usize = 8;
 const VISION_STAGING_PANEL_MAX_HEIGHT: f32 = 140.0;
 const STALL_SIGNATURE_PERMISSION_DENIED: &str = "permission denied";
 const STALL_SIGNATURE_COMMAND_NOT_FOUND: &str = "command not found";
@@ -2805,7 +2823,7 @@ impl ChatApp {
                 )
                 .await;
 
-            let mut queue = match router_result {
+            let queue = match router_result {
                 Ok(raw) => parse_router_plan(&raw),
                 Err(e) => {
                     let _ = event_tx
@@ -2818,12 +2836,7 @@ impl ChatApp {
                 }
             };
 
-            if queue.is_empty() {
-                queue.push(RoutedTask {
-                    agent: AgentRole::CodeArchitect.as_str().to_string(),
-                    task: technical_intent_en.clone(),
-                });
-            }
+            let queue = Self::compact_routed_queue(queue, &technical_intent_en);
 
             let mut swarm_memory = String::new();
             let mut final_parts: Vec<String> = Vec::new();
@@ -2909,24 +2922,33 @@ impl ChatApp {
                 {
                     Ok(resp) => resp,
                     Err(e) => {
-                        swarm_memory.push_str(&format!("\n[{} error]\n{}\n", role.as_str(), e));
+                        Self::push_swarm_memory(
+                            &mut swarm_memory,
+                            &format!("\n[{} error]\n{}\n", role.as_str(), e),
+                        );
                         continue;
                     }
                 };
 
                 let mut parsed = crate::parser::parse_response(&role_raw);
                 if parsed.json_schema_drift {
-                    swarm_memory.push_str(&format!(
-                        "\n[{} parse error]\n{}\n",
-                        role.as_str(),
-                        parsed
-                            .json_parse_error
-                            .as_deref()
-                            .unwrap_or("Unknown parser error")
-                    ));
-                    swarm_memory.push_str("\n[System feedback injected]\n");
-                    swarm_memory.push_str(crate::parser::parser_self_correction_feedback());
-                    swarm_memory.push('\n');
+                    Self::push_swarm_memory(
+                        &mut swarm_memory,
+                        &format!(
+                            "\n[{} parse error]\n{}\n",
+                            role.as_str(),
+                            parsed
+                                .json_parse_error
+                                .as_deref()
+                                .unwrap_or("Unknown parser error")
+                        ),
+                    );
+                    Self::push_swarm_memory(&mut swarm_memory, "\n[System feedback injected]\n");
+                    Self::push_swarm_memory(
+                        &mut swarm_memory,
+                        crate::parser::parser_self_correction_feedback(),
+                    );
+                    Self::push_swarm_memory(&mut swarm_memory, "\n");
 
                     let mut retry_messages = role_messages.clone();
                     retry_messages.push(ChatMessage::text(
@@ -2962,21 +2984,26 @@ impl ChatApp {
                         Ok(retry_raw) => {
                             let retry_parsed = crate::parser::parse_response(&retry_raw);
                             if retry_parsed.json_schema_drift {
-                                swarm_memory.push_str(&format!(
-                                    "\n[{} retry parse error]\n{}\n",
-                                    role.as_str(),
-                                    retry_parsed
-                                        .json_parse_error
-                                        .as_deref()
-                                        .unwrap_or("Unknown parser error")
-                                ));
+                                Self::push_swarm_memory(
+                                    &mut swarm_memory,
+                                    &format!(
+                                        "\n[{} retry parse error]\n{}\n",
+                                        role.as_str(),
+                                        retry_parsed
+                                            .json_parse_error
+                                            .as_deref()
+                                            .unwrap_or("Unknown parser error")
+                                    ),
+                                );
                                 continue;
                             }
                             parsed = retry_parsed;
                         }
                         Err(e) => {
-                            swarm_memory
-                                .push_str(&format!("\n[{} retry error]\n{}\n", role.as_str(), e));
+                            Self::push_swarm_memory(
+                                &mut swarm_memory,
+                                &format!("\n[{} retry error]\n{}\n", role.as_str(), e),
+                            );
                             continue;
                         }
                     }
@@ -2993,7 +3020,10 @@ impl ChatApp {
                 }
 
                 if let Some(err) = parsed.json_parse_error.as_deref() {
-                    swarm_memory.push_str(&format!("\n[{} parse error]\n{}\n", role.as_str(), err));
+                    Self::push_swarm_memory(
+                        &mut swarm_memory,
+                        &format!("\n[{} parse error]\n{}\n", role.as_str(), err),
+                    );
                 }
 
                 let filtered_actions: Vec<crate::parser::AgentAction> = parsed
@@ -3013,19 +3043,12 @@ impl ChatApp {
                             !matches!(a.action, ActionKind::RunCmd | ActionKind::RunAndObserve)
                                 || shell_enabled
                         }
-                        AgentRole::WebResearcher => matches!(
-                            a.action,
-                            ActionKind::SearchWeb
-                                | ActionKind::ReadUrl
-                                | ActionKind::CaptureScreen
-                                | ActionKind::RunAndObserve
-                                | ActionKind::McpConnect
-                                | ActionKind::McpListTools
-                                | ActionKind::McpCallTool
-                                | ActionKind::McpDisconnect
-                        ),
+                        AgentRole::WebResearcher => {
+                            matches!(a.action, ActionKind::SearchWeb | ActionKind::ReadUrl)
+                        }
                         AgentRole::Router => {
-                            swarm_memory.push_str(
+                            Self::push_swarm_memory(
+                                &mut swarm_memory,
                                 "\n[Router warning]\nRouter emitted actions unexpectedly; actions were ignored.\n",
                             );
                             false
@@ -3037,13 +3060,15 @@ impl ChatApp {
                     .into_iter()
                     .filter_map(|mut action| match action.action {
                         ActionKind::CaptureScreen if !screen_awareness_enabled => {
-                            swarm_memory.push_str(
+                            Self::push_swarm_memory(
+                                &mut swarm_memory,
                                 "\n[Screen Awareness blocked]\ncapture_screen ignored because Screen Awareness is disabled in settings.\n",
                             );
                             None
                         }
                         ActionKind::RunAndObserve if !screen_awareness_enabled => {
-                            swarm_memory.push_str(
+                            Self::push_swarm_memory(
+                                &mut swarm_memory,
                                 "\n[Screen Awareness blocked]\nrun_and_observe ignored because Screen Awareness is disabled in settings.\n",
                             );
                             None
@@ -3054,7 +3079,8 @@ impl ChatApp {
                         | ActionKind::McpDisconnect
                             if !mcp_enabled =>
                         {
-                            swarm_memory.push_str(
+                            Self::push_swarm_memory(
+                                &mut swarm_memory,
                                 "\n[MCP blocked]\nMCP action ignored because MCP integration is disabled in settings.\n",
                             );
                             None
@@ -3086,14 +3112,17 @@ impl ChatApp {
                     .collect();
 
                 if filtered_actions.is_empty() {
-                    swarm_memory.push_str(&format!(
-                        "\n[{}]\nNo executable actions.\n",
-                        role.as_str()
-                    ));
+                    Self::push_swarm_memory(
+                        &mut swarm_memory,
+                        &format!("\n[{}]\nNo executable actions.\n", role.as_str()),
+                    );
                     continue;
                 }
 
-                swarm_memory.push_str(&format!("\n[{} execution]\n", role.as_str()));
+                Self::push_swarm_memory(
+                    &mut swarm_memory,
+                    &format!("\n[{} execution]\n", role.as_str()),
+                );
                 for action in filtered_actions {
                     let original_command = if matches!(role, AgentRole::SystemAdmin | AgentRole::CodeArchitect) {
                         action.parameters.command.clone()
@@ -3265,12 +3294,51 @@ impl ChatApp {
                                             ),
                                         })
                                         .await;
-                                    swarm_memory.push_str(&format!(
-                                        "action={} success={} exit_code={} timed_out={}\nstdout:\n{}\nstderr:\n{}\n",
-                                        report.action, report.success, report.exit_code, report.timed_out, report.stdout, report.stderr
-                                    ));
+                                    Self::push_swarm_memory(
+                                        &mut swarm_memory,
+                                        &format!(
+                                            "action={} success={} exit_code={} timed_out={}\nstdout:\n{}\nstderr:\n{}\n",
+                                            report.action, report.success, report.exit_code, report.timed_out, report.stdout, report.stderr
+                                        ),
+                                    );
+                                    if report.action == "run_cmd" && report.success {
+                                        if let (Some(original_cmd), Some(rag_client)) =
+                                            (original_command.clone(), shared_rag_client.clone())
+                                        {
+                                            let mut learn_cfg =
+                                                RagConfig::with_workspace(working_dir.clone(), 1536);
+                                            learn_cfg.top_k = rag_top_k_limit;
+                                            learn_cfg.similarity_threshold = rag_similarity_threshold;
+                                            let provider = OpenAIEmbeddingProvider {
+                                                api_key: api_key.clone(),
+                                                base_url: base_url.clone(),
+                                                model: "text-embedding-3-small".to_string(),
+                                            };
+                                            if let Ok(learn_engine) =
+                                                RagEngine::new(learn_cfg, provider, rag_client).await
+                                            {
+                                                let _ = learn_engine
+                                                    .upsert_learning_snippet(
+                                                        &format!(
+                                                            "successful command {}",
+                                                            role.as_str()
+                                                        ),
+                                                        &format!(
+                                                            "command: {}\nstdout:\n{}",
+                                                            original_cmd,
+                                                            trim_text_tail(
+                                                                &report.stdout,
+                                                                SUCCESS_LEARNING_SNIPPET_MAX_CHARS
+                                                            )
+                                                        ),
+                                                    )
+                                                    .await;
+                                            }
+                                        }
+                                    }
                                     if report.timed_out {
-                                        swarm_memory.push_str(
+                                        Self::push_swarm_memory(
+                                            &mut swarm_memory,
                                             "[synthesizer_timeout_hint]\nA command timed out. Analyze partial output, identify root cause, and propose an autonomous retry/fix strategy.\n",
                                         );
                                     }
@@ -3293,7 +3361,8 @@ impl ChatApp {
                                                 details: "Detected permission/tool-not-found error signature. Triggering self-healing protocol (research + retry planning).".to_string(),
                                             })
                                             .await;
-                                        swarm_memory.push_str(
+                                        Self::push_swarm_memory(
+                                            &mut swarm_memory,
                                             "[stall_guard]\nDetected Permission Denied / Command Not Found signature in terminal output. Self-healing protocol must run.\n",
                                         );
                                     }
@@ -3364,12 +3433,15 @@ impl ChatApp {
                                                     )
                                                     .await;
                                             }
-                                            swarm_memory.push_str(&format!(
-                                                "[self_heal_research]\nretry={retry_idx}\nquery={}\nsource={}\nsummary={}\n",
-                                                heal_query,
-                                                doc_url,
-                                                truncate_for_search(&results[0].snippet, 300)
-                                            ));
+                                            Self::push_swarm_memory(
+                                                &mut swarm_memory,
+                                                &format!(
+                                                    "[self_heal_research]\nretry={retry_idx}\nquery={}\nsource={}\nsummary={}\n",
+                                                    heal_query,
+                                                    doc_url,
+                                                    truncate_for_search(&results[0].snippet, 300)
+                                                ),
+                                            );
                                         }
                                     }
                                 }
@@ -3394,10 +3466,13 @@ impl ChatApp {
                                             details: format!("{reason}\naction={:?}", action.action),
                                         })
                                         .await;
-                                    swarm_memory.push_str(&format!(
-                                        "action authorization denied: {:?}\nreason: {}\n",
-                                        action.action, reason
-                                    ));
+                                    Self::push_swarm_memory(
+                                        &mut swarm_memory,
+                                        &format!(
+                                            "action authorization denied: {:?}\nreason: {}\n",
+                                            action.action, reason
+                                        ),
+                                    );
                                 }
                                 ExecutionStatus::AwaitingApproval(req) => {
                                     if let Some(terminal_id) = ai_terminal_id.clone() {
@@ -3432,16 +3507,16 @@ impl ChatApp {
                                     details: e.to_string(),
                                 })
                                 .await;
-                            swarm_memory.push_str(&format!(
-                                "\n[{} execution error]\n{}\n",
-                                role.as_str(),
-                                e
-                            ));
+                            Self::push_swarm_memory(
+                                &mut swarm_memory,
+                                &format!("\n[{} execution error]\n{}\n", role.as_str(), e),
+                            );
                         }
                     }
                 }
             }
 
+            swarm_memory = trim_text_tail(&swarm_memory, SWARM_MEMORY_MAX_CHARS);
             let unread_memory = swarm_memory.trim();
             if !unread_memory.is_empty() {
                 let _ = event_tx
@@ -3507,7 +3582,10 @@ impl ChatApp {
                         }
                     }
                     Err(e) => {
-                        swarm_memory.push_str(&format!("\n[Synthesizer error]\n{}\n", e));
+                        Self::push_swarm_memory(
+                            &mut swarm_memory,
+                            &format!("\n[Synthesizer error]\n{}\n", e),
+                        );
                     }
                 }
             }
@@ -3601,6 +3679,52 @@ impl ChatApp {
         }
     }
 
+    fn compact_routed_queue(queue: Vec<RoutedTask>, fallback_task: &str) -> Vec<RoutedTask> {
+        let mut compacted = Vec::new();
+        let mut seen = HashSet::new();
+        for step in queue {
+            let Some(role) = AgentRole::from_plan_name(step.agent.trim()) else {
+                continue;
+            };
+            let task = normalize_compact_whitespace(step.task.trim());
+            if task.is_empty() {
+                continue;
+            }
+            let key = format!("{}::{}", role.as_str(), task);
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.insert(key);
+            compacted.push(RoutedTask {
+                agent: role.as_str().to_string(),
+                task,
+            });
+            if compacted.len() >= MAX_ROUTED_TASKS {
+                break;
+            }
+        }
+        if compacted.is_empty() {
+            let fallback = normalize_compact_whitespace(fallback_task);
+            let fallback = if fallback.is_empty() {
+                "Handle the latest user request safely and minimally.".to_string()
+            } else {
+                fallback
+            };
+            compacted.push(RoutedTask {
+                agent: AgentRole::CodeArchitect.as_str().to_string(),
+                task: fallback,
+            });
+        }
+        compacted
+    }
+
+    fn push_swarm_memory(swarm_memory: &mut String, chunk: &str) {
+        swarm_memory.push_str(chunk);
+        if swarm_memory.chars().count() > SWARM_MEMORY_MAX_CHARS {
+            *swarm_memory = trim_text_tail(swarm_memory, SWARM_MEMORY_MAX_CHARS);
+        }
+    }
+
     fn try_extract_schedule_from_user_message(&self, text: &str) -> Option<(String, String)> {
         let lower = text.to_ascii_lowercase();
         if !AUTONOMOUS_TRIGGER_KEYWORDS
@@ -3628,21 +3752,38 @@ impl ChatApp {
     }
 
     fn add_autonomous_schedule(&mut self, time_24h: String, prompt: String) {
-        if Self::parse_time_hhmm(&time_24h).is_none() {
+        let normalized_time = time_24h.trim().to_string();
+        let normalized_prompt = prompt.trim().to_string();
+        if Self::parse_time_hhmm(&normalized_time).is_none() {
             self.notify(
                 "Invalid schedule time. Use HH:MM (24h).",
                 NotificationKind::Error,
             );
             return;
         }
-        if prompt.trim().is_empty() {
+        if normalized_prompt.is_empty() {
             self.notify("Schedule prompt cannot be empty.", NotificationKind::Error);
+            return;
+        }
+        let normalized_prompt_key =
+            normalize_compact_whitespace(&normalized_prompt).to_ascii_lowercase();
+        if let Some(existing) = self.autonomous_schedules.iter_mut().find(|job| {
+            job.time_24h == normalized_time
+                && normalize_compact_whitespace(&job.prompt).to_ascii_lowercase()
+                    == normalized_prompt_key
+        }) {
+            existing.enabled = true;
+            self.persist_autonomous_schedules_to_settings();
+            self.notify(
+                "Matching schedule already exists; re-enabled existing schedule.",
+                NotificationKind::Info,
+            );
             return;
         }
         self.autonomous_schedules.push(AutonomousSchedule {
             id: Uuid::new_v4().to_string(),
-            time_24h,
-            prompt,
+            time_24h: normalized_time,
+            prompt: normalized_prompt,
             enabled: true,
             last_run_date_utc: None,
         });
