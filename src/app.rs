@@ -47,22 +47,22 @@ fn truncate_for_search(input: &str, max_chars: usize) -> String {
     for ch in input.chars().take(max_chars) {
         out.push(ch);
     }
-
-    fn normalize_compact_whitespace(input: &str) -> String {
-        input.split_whitespace().collect::<Vec<_>>().join(" ")
-    }
-
-    fn trim_text_tail(text: &str, max_chars: usize) -> String {
-        if max_chars == 0 {
-            return String::new();
-        }
-        let total = text.chars().count();
-        if total <= max_chars {
-            return text.to_string();
-        }
-        text.chars().skip(total - max_chars).collect()
-    }
     out
+}
+
+fn normalize_compact_whitespace(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn trim_text_tail(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let total = text.chars().count();
+    if total <= max_chars {
+        return text.to_string();
+    }
+    text.chars().skip(total - max_chars).collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -3765,7 +3765,8 @@ impl ChatApp {
             self.notify("Schedule prompt cannot be empty.", NotificationKind::Error);
             return;
         }
-        let normalized_prompt_key = normalize_compact_whitespace(&normalized_prompt).to_ascii_lowercase();
+        let normalized_prompt_key =
+            normalize_compact_whitespace(&normalized_prompt).to_ascii_lowercase();
         if let Some(existing) = self.autonomous_schedules.iter_mut().find(|job| {
             job.time_24h == normalized_time
                 && normalize_compact_whitespace(&job.prompt).to_ascii_lowercase()
